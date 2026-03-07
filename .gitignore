@@ -1,0 +1,18 @@
+# IDE specific
+.clangd
+
+# build directories
+build/
+build_*/
+compile_commands.json
+
+# python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# python packaging
+*.egg-info/
+dist/
+
+.cache*
