@@ -1,13 +1,14 @@
 #pragma once
 #include <optional>
 #include <cuda.h>
-#include <moe_cuda/kernels/common/common.hpp>
+
 #include <runtime/utils.h>
 #include <moe_cuda/dtype.h>
 #include <runtime/parallel.h>
 #include <moe_cuda/error.hpp>
 #include <runtime/cumem.h>
 #include <jit/utils/lazy_init.hpp>
+#include <jit/utils/common.hpp>
 #include <runtime/tensor.h>
 #ifdef MOE_CUDA_USE_MPI
 #include <mpi.h>
@@ -15,6 +16,8 @@
 #endif
 
 namespace moe_cuda {
+
+    
 
 #ifdef MOE_CUDA_USE_MPI
 // System page size for padding
@@ -78,10 +81,10 @@ class All2All {
             this->world_size = global_group.size;
             uint32_t num_dp_groups = this->world_size / this->dp_size;
 
-            this->num_local_experts = ti_ceil_div(this->num_experts, this->world_size);
+            this->num_local_experts = host_ceil_div(this->num_experts, this->world_size);
 
             // recv buffer size
-            uint32_t avg_tokens_per_expert = ti_ceil_div(
+            uint32_t avg_tokens_per_expert = host_ceil_div(
                 max_num_tokens * num_experts_per_token, num_experts
             ) * 1.2;
             uint32_t max_private_tokens;
@@ -98,7 +101,7 @@ class All2All {
 
             // first min is to ensure there are at most num_tokens * num_local_experts, the maximum possible upper bound where all tokens get mapped to this rank
             // the next max is to ensure at least num_local_experts * expert_padding is on each rank - this is the lower bound of expert tokens mapped to this device
-            max_recv_tokens += ti_align(std::max(
+            max_recv_tokens += host_align(std::max(
                 std::min(num_tokens * num_experts_per_token 
                     + this->num_local_experts * (expert_padding - 1), 
               this->num_local_experts * num_tokens),
@@ -111,22 +114,22 @@ class All2All {
             this->_num_routed_mapping = _num_routed_handle.map(this->device);
             
             // siz send buffer sizes + token_dim (combing optional scale factors)
-            uint32_t token_dim_dispatch = ti_align(hidden_dim * get_type_size(in_dtype), 16) + 16;
+            uint32_t token_dim_dispatch = host_align(hidden_dim * get_type_size(in_dtype), 16) + 16;
             if (hidden_dim_scale.has_value() && scale_dtype.has_value()) {
                 
-                token_dim_dispatch += ti_align(hidden_dim_scale.value() * get_type_size(scale_dtype.value()), 16);
+                token_dim_dispatch += host_align(hidden_dim_scale.value() * get_type_size(scale_dtype.value()), 16);
 
                 HOST_ASSERT(scale_dtype.value() == c10::ScalarType::Float, "Only float scales supported");
             }
 
             // combine token dim is just the hidden dim, since the outputs of MoE kernels are unquantized
 
-            uint32_t token_dim_combine = ti_align(hidden_dim * get_type_size(in_dtype), 16);
+            uint32_t token_dim_combine = host_align(hidden_dim * get_type_size(in_dtype), 16);
             uint32_t token_dim = std::max(token_dim_combine, token_dim_dispatch);
 
 
             
-            uint32_t send_buffer_bytes = ti_align(max_recv_tokens * token_dim, PAGE_SIZE);
+            uint32_t send_buffer_bytes = host_align(max_recv_tokens * token_dim, PAGE_SIZE);
             this->_send_buffer_handle = CUMemAllocHandle (send_buffer_bytes, device, CUMemHandleKind::FileDescriptor);
             this->_send_buffer_mapping = _send_buffer_handle.map(this->device);
 

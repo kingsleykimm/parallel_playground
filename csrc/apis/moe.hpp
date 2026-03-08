@@ -8,7 +8,7 @@
 namespace moe_cuda {
 namespace api {
 
-inline void fp8_gemm(std::pair<at::Tensor&, at::Tensor&> act,
+inline void fp8_gemm_nt(std::pair<at::Tensor&, at::Tensor&> act,
                      std::pair<at::Tensor&, at::Tensor&> weight,
                      at::Tensor& output,
                      GemmType gemm_type,
@@ -19,19 +19,23 @@ inline void fp8_gemm(std::pair<at::Tensor&, at::Tensor&> act,
         HOST_ASSERT(act.first.dim() < 3, "A tensor for FP8 GEMM must have less than three dims");
     }
 
-    at::Tensor sfa_mn_major = transform_sf_layout_mn(act.second, stream);
+
+
+    auto sfa_mn_major = act.second.transpose(-1, -2);
 
     if (gemm_type == GemmType::Normal) {
-        sm90_fp8_gemm_1d2d(act.first, weight.first, sfa_mn_major, weight.second, output, compiled_dims, stream);
-    } else if (gemm_type == GemmType::MGroupedContiguous) {
-        HOST_ASSERT(grouped_layout != nullptr, "grouped_layout cannot be null for grouped FP8 GEMM");
-        sm90_fp8_grouped_gemm_1d2d_contiguous(
-            act.first, weight.first, sfa_mn_major, weight.second, output, compiled_dims, grouped_layout, stream);
-    } else if (gemm_type == GemmType::MGroupedMasked) {
-        HOST_ASSERT(grouped_layout != nullptr, "grouped_layout cannot be null for grouped FP8 GEMM");
-        sm90_fp8_grouped_gemm_1d2d_masked(
-            act.first, weight.first, sfa_mn_major, weight.second, output, compiled_dims, grouped_layout, stream);
-    } else {
+        sm90_fp8_gemm_1d2d_nt(act.first, weight.first, sfa_mn_major, weight.second, output, stream);
+    }
+    //  else if (gemm_type == GemmType::MGroupedContiguous) {
+    //     HOST_ASSERT(grouped_layout != nullptr, "grouped_layout cannot be null for grouped FP8 GEMM");
+    //     sm90_fp8_grouped_gemm_1d2d_contiguous(
+    //         act.first, weight.first, sfa_mn_major, weight.second, output, compiled_dims, grouped_layout, stream);
+    // } else if (gemm_type == GemmType::MGroupedMasked) {
+    //     HOST_ASSERT(grouped_layout != nullptr, "grouped_layout cannot be null for grouped FP8 GEMM");
+    //     sm90_fp8_grouped_gemm_1d2d_masked(
+    //         act.first, weight.first, sfa_mn_major, weight.second, output, compiled_dims, grouped_layout, stream);
+    // }
+    else {
         HOST_ASSERT(false, "Batched FP8 GEMM is not implemented");
     }
 }

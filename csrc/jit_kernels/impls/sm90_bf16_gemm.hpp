@@ -97,11 +97,11 @@ at::Tensor& D, const std::string& compiled_dims, cudaStream_t& stream) {
     // Major::K is a misnomer here, but it should be interpreted as row-major
     size_t non_contig_D_stride = major_of(D) == Major::K ? D.stride(-2) : D.stride(-1);
     CUtensorMap a_tensor_map = make_tma_a_desc(A, major_of(A), 1, gemm_config.block_m, gemm_config.block_k, 
-        non_contig_A_stride, gemm_config.smem_config.swizzle_a_mode, ti_align(gemm_config.block_k, 64));
+        non_contig_A_stride, gemm_config.smem_config.swizzle_a_mode, host_align(gemm_config.block_k, 64));
     CUtensorMap b_tensor_map = make_tma_b_desc(B, major_of(B), 1, gemm_config.block_n, gemm_config.block_k,
-         non_contig_B_stride, gemm_config.smem_config.swizzle_b_mode, ti_align(gemm_config.block_k, 64));
+         non_contig_B_stride, gemm_config.smem_config.swizzle_b_mode, host_align(gemm_config.block_k, 64));
     CUtensorMap d_tensor_map = make_tma_d_desc(D, major_of(D), 1, gemm_config.block_m, gemm_config.block_n,
-         non_contig_D_stride, gemm_config.smem_config.swizzle_cd_mode, ti_align(gemm_config.block_n, 64));
+         non_contig_D_stride, gemm_config.smem_config.swizzle_cd_mode, host_align(gemm_config.block_n, 64));
     LaunchConfig launch_config = {
         dim3(gemm_config.num_math_threads + gemm_config.num_tma_threads, 1, 1),
         dim3(gemm_config.num_sms),
@@ -147,13 +147,13 @@ inline void sm90_bf16_grouped_gemm_contiguous(at::Tensor& A, at::Tensor& B,
     size_t non_contig_B_stride = major_of(B) == Major::K ? B.stride(-2) : B.stride(-1);
     size_t non_contig_D_stride = major_of(D) == Major::K ? D.stride(0) : D.stride(1);
     CUtensorMap a_tensor_map = make_tma_a_desc(A, major_of(A), 1, gemm_config.block_m, gemm_config.block_k,
-        non_contig_A_stride, gemm_config.smem_config.swizzle_a_mode, ti_align(gemm_config.block_k, 64));
+        non_contig_A_stride, gemm_config.smem_config.swizzle_a_mode, host_align(gemm_config.block_k, 64));
         CUtensorMap b_tensor_map = make_tma_b_desc(B, major_of(B), num_groups, gemm_config.block_n, gemm_config.block_k,
-            non_contig_B_stride, gemm_config.smem_config.swizzle_b_mode, ti_align(gemm_config.block_k, 64));
+            non_contig_B_stride, gemm_config.smem_config.swizzle_b_mode, host_align(gemm_config.block_k, 64));
     CUtensorMap d_tensor_map = make_tma_d_desc(D, major_of(D), 1, gemm_config.block_m, gemm_config.block_n,
-            non_contig_D_stride, gemm_config.smem_config.swizzle_cd_mode, ti_align(gemm_config.block_n, 64));    
-    // uint32_t num_blocks = ti_ceil_div(M, gemm_config.block_m) * ti_ceil_div(N, gemm_config.block_n);
-    // num_blocks = ti_align(num_blocks, gemm_config.num_tma_multicast);
+            non_contig_D_stride, gemm_config.smem_config.swizzle_cd_mode, host_align(gemm_config.block_n, 64));    
+    // uint32_t num_blocks = host_ceil_div(M, gemm_config.block_m) * host_ceil_div(N, gemm_config.block_n);
+    // num_blocks = host_align(num_blocks, gemm_config.num_tma_multicast);
     LaunchConfig launch_config = {
         dim3(gemm_config.num_math_threads + gemm_config.num_tma_threads, 1, 1),
         dim3(gemm_config.num_sms),
@@ -198,11 +198,11 @@ inline void sm90_bf16_grouped_gemm_masked(at::Tensor& A, at::Tensor& B,
             device_prop->get_num_sms());
         
         CUtensorMap a_tensor_map = make_tma_a_desc_3d(A, major_of(A), num_groups, gemm_config.block_m, gemm_config.block_k,
-            gemm_config.smem_config.swizzle_a_mode, ti_align(gemm_config.block_k, 64));
+            gemm_config.smem_config.swizzle_a_mode, host_align(gemm_config.block_k, 64));
         CUtensorMap b_tensor_map = make_tma_b_desc_3d(B, major_of(B), num_groups, gemm_config.block_n, gemm_config.block_k,
-                gemm_config.smem_config.swizzle_b_mode, ti_align(gemm_config.block_k, 64));
+                gemm_config.smem_config.swizzle_b_mode, host_align(gemm_config.block_k, 64));
         CUtensorMap d_tensor_map = make_tma_d_desc_3d(D, major_of(D), num_groups, gemm_config.block_m, gemm_config.block_n,
-             gemm_config.smem_config.swizzle_cd_mode, ti_align(gemm_config.block_n, 64));    
+             gemm_config.smem_config.swizzle_cd_mode, host_align(gemm_config.block_n, 64));    
 
         LaunchConfig launch_config = {
             dim3(gemm_config.num_math_threads + gemm_config.num_tma_threads, 1, 1),
@@ -260,14 +260,14 @@ inline void sm90_bf16_batched_gemm(at::Tensor& A, at::Tensor& B,
     auto [A_inner, A_outer] = get_inner_outer_dims (major_of(A), gemm_config.block_m, gemm_config.block_k);
     auto [B_inner, B_outer] = get_inner_outer_dims (major_of(B), gemm_config.block_n, gemm_config.block_k);
     CUtensorMap a_tensor_map = make_tma_3d_desc(
-        A, K, M, BS, non_contig_A_stride_1, non_contig_A_stride_0, A_inner, A_outer, 1, gemm_config.smem_config.swizzle_a_mode, ti_align(A_inner, 64)
+        A, K, M, BS, non_contig_A_stride_1, non_contig_A_stride_0, A_inner, A_outer, 1, gemm_config.smem_config.swizzle_a_mode, host_align(A_inner, 64)
     );
     CUtensorMap b_tensor_map = make_tma_3d_desc(
-        B, K, N, BS, non_contig_B_stride_1, non_contig_B_stride_0, B_inner, B_outer, 1, gemm_config.smem_config.swizzle_b_mode, ti_align(B_inner, 64)
+        B, K, N, BS, non_contig_B_stride_1, non_contig_B_stride_0, B_inner, B_outer, 1, gemm_config.smem_config.swizzle_b_mode, host_align(B_inner, 64)
     );
 
     CUtensorMap d_tensor_map = make_tma_3d_desc(
-        D, N, M, BS, non_contig_D_stride_1, non_contig_D_stride_0, gemm_config.block_n, gemm_config.block_m, 1, gemm_config.smem_config.swizzle_cd_mode, ti_align(gemm_config.block_n, 64)
+        D, N, M, BS, non_contig_D_stride_1, non_contig_D_stride_0, gemm_config.block_n, gemm_config.block_m, 1, gemm_config.smem_config.swizzle_cd_mode, host_align(gemm_config.block_n, 64)
     );
 
 

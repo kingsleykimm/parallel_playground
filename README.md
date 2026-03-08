@@ -1,10 +1,6 @@
 # parallel_playground (moe_cuda)
 
-Minimal MoE CUDA extraction focused on:
-- FP8 GEMM (`sm90_fp8_gemm_1d2d`)
-- BF16 GEMM (`sm90_bf16_gemm`)
-- JIT runtime/compiler core
-- all2all dispatch/combine
+Worklog of optimizing FP8/BF16 MoE Pipelines on H100
 
 ## Build
 
@@ -45,8 +41,3 @@ export JIT_CACHE_DIR="/tmp/.moe_cuda"
 export JIT_USE_NVRTC=1
 ```
 
-## Tests
-
-- `test_bf16_gemm`
-- `test_fp8`
-- `test_all2all`

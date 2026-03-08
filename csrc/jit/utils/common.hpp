@@ -7,7 +7,21 @@
 #include <runtime/utils.h>
 #include <jit/utils/files.hpp>
 
-#include <moe_cuda/kernels/common/common.hpp>
+
+template <typename TA, typename TB> __host__  TA host_ceil_div(TA a, TB b) { return (a + b - 1) / b; }
+
+// align a to b
+template <typename TA, typename TB> __host__ TA host_align(TA a, TB b) { return host_ceil_div(a, b) * b; }
+
+template <typename TA, typename TB> __host__  constexpr TA constexpr_host_ceil_div(TA a, TB b) {
+  return (a + b - 1) / b;
+}
+
+// align a to b
+template <typename TA, typename TB> __host__ constexpr TA constexpr_host_align(TA a, TB b) {
+  return constexpr_host_ceil_div(a, b) * b;
+}
+
 
 
 
@@ -67,7 +81,7 @@ inline bool is_multicast_legal(
     bool require_divisible
 ) {
     bool divisible = !require_divisible ||
-        ti_ceil_div(shape_dim, block_dim) % num_multicast == 0;
+        host_ceil_div(shape_dim, block_dim) % num_multicast == 0;
     return divisible && num_sms % num_multicast == 0;
 }
 
@@ -343,11 +357,11 @@ static CUtensorMapDataType convert_to_cudtype(c10::ScalarType dtype) {
     // be 16 byte aligned furthermore the size of the data transfer must also be a
     // multiple of 16 bytes
     uint32_t num_elements = 16 / get_type_size(dtype_of(t));
-    uint32_t aligned_global_mn = ti_align(global_mn, (int)num_elements);
+    uint32_t aligned_global_mn = host_align(global_mn, (int)num_elements);
     // global_k is already in scale-block units (K/block_k for FP32, K/(block_k/4) for NVFP4)
     // so we should NOT divide by block_k again
     return make_tma_2d_desc(t, aligned_global_mn,
-                            ti_ceil_div(global_k, block_k) * (dtype_of(t) == c10::ScalarType::Float ? 1 : 4) * num_groups, // already in k_blocks, just multiply by num_groups
+                            host_ceil_div(global_k, block_k) * (dtype_of(t) == c10::ScalarType::Float ? 1 : 4) * num_groups, // already in k_blocks, just multiply by num_groups
                             aligned_global_mn, block_mn, 1, 0, 0);
   }
 
@@ -360,7 +374,7 @@ inline std::vector<int> prepare_chunk_indices(
     alignas(8) std::vector<int> chunks(cu_seqlens.size() - 1);
     for (int i = 1; i < cu_seqlens.size(); i++) {
         int length = cu_seqlens[i] - cu_seqlens[i-1];
-        chunks[i - 1] = ti_ceil_div(length, chunk_size);
+        chunks[i - 1] = host_ceil_div(length, chunk_size);
     }
     std::vector<int> chunk_indices;
 
@@ -383,7 +397,7 @@ inline std::vector<int> prepare_cu_chunks(
   alignas(8) std::vector<int> chunks(cu_seqlens.size() - 1); // batch_size
     for (int i = 1; i < cu_seqlens.size(); i++) {
         int length = cu_seqlens[i] - cu_seqlens[i-1];
-        chunks[i - 1] = ti_ceil_div(length, chunk_size);
+        chunks[i - 1] = host_ceil_div(length, chunk_size);
     }
   std::vector<int> cu_chunks; // (batch_size + 1)
   cu_chunks.push_back(0);

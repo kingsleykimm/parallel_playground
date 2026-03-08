@@ -1,6 +1,4 @@
 #pragma once
-#include <cute/arch/mma_sm100_desc.hpp>
-#include <cute/stride.hpp>
 #include <moe_cuda/dtype.h>
 #include <moe_cuda/types.h>
 #include <runtime/tensor.h>
@@ -43,7 +41,7 @@ struct SM90Arch {
 
   static std::pair<int, int> get_num_threads(uint32_t & block_m) {
     return std::make_pair(
-        128, (block_m <= 64 ? 1 : 2) * 128
+        32, (block_m <= 64 ? 1 : 2) * 128
     ); // returns (numTMAThreads, numWGMMAThreads)
   }
 
@@ -116,7 +114,7 @@ struct SM90Arch {
     // block_k is set to 128 for 1D2D scaled kernels
     // also must be aligned to 128 bytes for TMA
     const int num_b_scales = (block_k % block_n != 0) ? 2 : 1;
-    return ti_align((block_m + num_b_scales) * sizeof(float), 128);
+    return host_align((block_m + num_b_scales) * sizeof(float), 128);
   }
 
   // uint64_t * producer and consumer -> 8 bytes * 2
@@ -132,7 +130,7 @@ struct SM90Arch {
   static int get_smem_cd_size(const uint32_t & block_m, const uint32_t & block_n,
   c10::ScalarType cd_type) {
     // for TMA / GMMA swizzling : max swizzle mode is 128, with 8 row / column atoms
-    return ti_align(
+    return host_align(
       block_m * block_n * get_type_size(cd_type), 1024
     );
   }

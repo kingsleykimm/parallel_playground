@@ -75,7 +75,7 @@ if(NOT Torch_FOUND AND FETCH_LIBTORCH AND NOT HAS_VALID_TORCH_DIR)
     FetchContent_Declare(libtorch_prebuilt URL "${_libtorch_url}" DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
     FetchContent_GetProperties(libtorch_prebuilt)
     if(NOT libtorch_prebuilt_POPULATED)
-        FetchContent_Populate(libtorch_prebuilt)
+        FetchContent_MakeAvailable(libtorch_prebuilt)
     endif()
     set(Torch_DIR "${libtorch_prebuilt_SOURCE_DIR}/share/cmake/Torch" CACHE PATH "Torch CMake config path" FORCE)
     list(PREPEND CMAKE_PREFIX_PATH "${libtorch_prebuilt_SOURCE_DIR}")
@@ -100,28 +100,30 @@ if(Torch_FOUND AND DEFINED Torch_DIR)
 endif()
 
 # CUTLASS
-set(SUBMODULE_CUTLASS_INCLUDE "${CMAKE_SOURCE_DIR}/third-party/cutlass/include")
-if(EXISTS "${SUBMODULE_CUTLASS_INCLUDE}/cutlass" AND EXISTS "${SUBMODULE_CUTLASS_INCLUDE}/cute")
-    set(CUTLASS_INCLUDE "${SUBMODULE_CUTLASS_INCLUDE}")
-    message(STATUS "Using CUTLASS submodule headers from ${CUTLASS_INCLUDE}")
-else()
-    FetchContent_Declare(
-        cutlass
-        GIT_REPOSITORY https://github.com/NVIDIA/cutlass.git
-        GIT_TAG v3.8.0
-        GIT_SHALLOW TRUE
-    )
-    FetchContent_GetProperties(cutlass)
-    if(NOT cutlass_POPULATED)
-        FetchContent_Populate(cutlass)
-    endif()
-    set(CUTLASS_INCLUDE ${cutlass_SOURCE_DIR}/include)
-    message(STATUS "Using FetchContent CUTLASS headers from ${CUTLASS_INCLUDE}")
-endif()
+# set(SUBMODULE_CUTLASS_INCLUDE "${CMAKE_SOURCE_DIR}/third-party/cutlass/include")
+# if(EXISTS "${SUBMODULE_CUTLASS_INCLUDE}/cutlass" AND EXISTS "${SUBMODULE_CUTLASS_INCLUDE}/cute")
+#     set(CUTLASS_INCLUDE "${SUBMODULE_CUTLASS_INCLUDE}")
+#     message(STATUS "Using CUTLASS submodule headers from ${CUTLASS_INCLUDE}")
+# else()
+#     FetchContent_Declare(
+#         cutlass
+#         GIT_REPOSITORY https://github.com/NVIDIA/cutlass.git
+#         GIT_TAG v3.8.0
+#         GIT_SHALLOW TRUE
+#     )
+#     FetchContent_GetProperties(cutlass)
+#     if(NOT cutlass_POPULATED)
+#         FetchContent_Populate(cutlass)
+#     endif()
+#     set(CUTLASS_INCLUDE ${cutlass_SOURCE_DIR}/include)
+#     message(STATUS "Using FetchContent CUTLASS headers from ${CUTLASS_INCLUDE}")
+# endif()
 
 set (SUBMODULE_TK_INCLUDE "${CMAKE_SOURCE_DIR}/third-party/ThunderKittens/include")
+set (SUBMODULE_TK_PROTOTYPE "${CMAKE_SOURCE_DIR}/third-party/ThunderKittens/prototype")
 if (EXISTS ${SUBMODULE_TK_INCLUDE})
     set (TK_INCLUDE ${SUBMODULE_TK_INCLUDE})
+    set (TK_PROTOTYPE_INCLUDE ${SUBMODULE_TK_PROTOTYPE})
     message(STATUS "Using ThunderKittens submodule headers from ${TK_INCLUDE}")
 else()
     FetchContent_Declare(
@@ -134,6 +136,7 @@ else()
         FetchContent_Populate(ThunderKittens)
     endif()
     set(TK_INCLUDE ${ThunderKittens_SOURCE_DIR}/include)
+    set(TK_PROTOTYPE_INCLUDE ${ThunderKittens_SOURCE_DIR}/prototype)
     message(STATUS "Using FetchContent ThunderKittens headers from ${TK_INCLUDE}")
 endif()
 
@@ -220,14 +223,16 @@ endif()
 add_library(moe_cuda_lib STATIC
     src/moe_ops.cu
     csrc/apis/moe_forward.cpp
+    csrc/jit_kernels/fp8_tk_globals_factory.cu
 )
 
 target_include_directories(moe_cuda_lib
     PUBLIC
         ${CMAKE_SOURCE_DIR}/moe_cuda/include
         ${CMAKE_SOURCE_DIR}/csrc
-        ${CUTLASS_INCLUDE}
+        # ${CUTLASS_INCLUDE}
         ${TK_INCLUDE}
+        ${TK_PROTOTYPE_INCLUDE}
         ${TORCH_INCLUDE_DIRS}
         ${CUDAToolkit_INCLUDE_DIRS}
 )
@@ -246,6 +251,11 @@ target_link_libraries(moe_cuda_lib PUBLIC
 )
 
 target_compile_definitions(moe_cuda_lib PUBLIC FMT_USE_INT128=0)
+
+# ThunderKittens globals factory needs KITTENS_HOPPER for TMA/WGMMA support
+set_source_files_properties(csrc/jit_kernels/fp8_tk_globals_factory.cu PROPERTIES
+    COMPILE_DEFINITIONS "KITTENS_HOPPER"
+)
 target_compile_definitions(moe_cuda_lib PUBLIC MOE_CUDA_USE_MPI=1)
 
 set_target_properties(moe_cuda_lib PROPERTIES
@@ -285,7 +295,7 @@ if(BUILD_TESTS)
             ${CMAKE_SOURCE_DIR}/moe_cuda/include
             ${CMAKE_SOURCE_DIR}/csrc
             ${CMAKE_SOURCE_DIR}/test/test_cpp
-            ${CUTLASS_INCLUDE}
+            # ${CUTLASS_INCLUDE}
             ${TK_INCLUDE}
             ${TORCH_INCLUDE_DIRS}
             ${CUDAToolkit_INCLUDE_DIRS}
@@ -311,7 +321,7 @@ if(BUILD_TESTS)
         ${CMAKE_SOURCE_DIR}/moe_cuda/include
         ${CMAKE_SOURCE_DIR}/csrc
         ${CMAKE_SOURCE_DIR}/test/test_cpp
-        ${CUTLASS_INCLUDE}
+        # ${CUTLASS_INCLUDE}
         ${TORCH_INCLUDE_DIRS}
         ${CUDAToolkit_INCLUDE_DIRS}
     )

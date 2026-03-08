@@ -1,239 +1,105 @@
 #pragma once
+#include "jit_kernels/heuristics/heuristics.hpp"
+#include "moe_cuda/types.h"
 #include <runtime/format.hpp>
 #include <runtime/device.hpp>
 #include <jit/runtime.hpp>
 #include <jit/compiler.hpp>
-#include <runtime/tensor.h>
 #include <jit/utils/culib.hpp>
+#include <jit_kernels/tk_globals_factory.h>
+#include <cassert>
 #include <jit_kernels/heuristics/heuristics.hpp>
 
-class SM90_FP8_GEMM1D2D_Runtime : LaunchRuntime<SM90_FP8_GEMM1D2D_Runtime> {
-    public:
-        
-        struct Args {
-            uint32_t num_groups;
-            uint32_t M, N, K;
-            const std::string& compiled_dims;
-            Major sfbMajor;
-            CUtensorMap a_tensor_map;
-            CUtensorMap b_tensor_map;
-            CUtensorMap d_tensor_map;
-            CUtensorMap sfa_tensor_map;
-            float * sfb;
-            int * grouped_layout;
-            GemmConfig gemm_config;
-            GemmType gemm_type;
-            LaunchConfig launch_config;
-        };
+class SM90_FP8_GEMM1D2D_TK_Runtime : LaunchRuntime<SM90_FP8_GEMM1D2D_TK_Runtime> {
+public:
+    struct Args {
+        uint32_t M, N, K;
+        void *A, *B, *C, *scale_a, *scale_b;
+        int bm, bn, bk, super_m;
+        int num_consumer_warps, num_producer_warps;
+        int num_stages;
+        int smem_size;
+        LaunchConfig launch_config;
+    };
 
-        static std::string generate_impl(const Args& args) {
-            const std::string code = fmt::format(R"(
-            #include <moe_cuda/kernels/sm90_fp8_gemm_1d2d.cuh>
+    static std::string generate_impl(const Args& args) {
+        // JIT code uses template instantiation — no #defines needed.
+        // NVRTC compiles this to produce a cubin with the kernel entry point.
+        return fmt::format(R"(
+#include <moe_cuda/kernels/sm90_fp8_gemm_1d2d_tk.cuh>
 
-            using namespace moe_cuda::kernels::sm90_fp8_gemm_impl;
+using mmt_jit = matmul_template<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>;
 
-            static void __instantiate_kernel() {{
-                
-            auto kernel_ptr = reinterpret_cast<void *>(&sm90_fp8_gemm_1d2d<
-            {},
-            {}, {}, {},
-            {}, {}, {},
-            static_cast<Major>({}),
-            {}, {},
-            {}, {},
-            static_cast<GemmType>({}), {},
-            {}, {}, {},
-            {}, {}
-            >);
-            }}
-            )", 
-            args.num_groups,
-            get_compiled_dim(args.compiled_dims, 'm', args.M), get_compiled_dim(args.compiled_dims, 'n', args.N), get_compiled_dim(args.compiled_dims, 'k', args.K),
-            args.gemm_config.block_m, args.gemm_config.block_n, args.gemm_config.block_k,
-            static_cast<int>(args.sfbMajor),
-            args.gemm_config.num_math_threads, args.gemm_config.num_tma_threads,
-            args.gemm_config.tma_multicast_a, args.gemm_config.num_tma_multicast,
-            static_cast<int>(args.gemm_type), args.gemm_config.num_sms,
-            args.gemm_config.smem_config.swizzle_a_mode, args.gemm_config.smem_config.swizzle_b_mode, args.gemm_config.smem_config.swizzle_cd_mode,
-            args.gemm_config.num_stages, args.gemm_type == GemmType::Batched ? 1 : 0
-            );
-            return code;
-        }
+static void __instantiate_kernel() {{
+    auto ptr = reinterpret_cast<void*>(
+        &kittens::prototype::lcf::kernel<mmt_jit>);
+}}
+)", args.M, args.N, args.K, args.bm, args.bn, args.bk, args.num_consumer_warps, args.num_producer_warps, args.num_stages, 
+args.smem_size,
+args.super_m);
+    }
 
-        static void launch_impl(KernelHandle& kernel, const LaunchConfigHandle& launch_config, const Args& args) {
-            CUDA_CHECK(launch_kernel(kernel, launch_config,
-                args.M, args.N, args.K,
-                args.a_tensor_map, args.sfa_tensor_map, args.b_tensor_map, args.d_tensor_map,
-                args.sfb, args.grouped_layout));
-        }
+    static void launch_impl(KernelHandle& kernel, const LaunchConfigHandle& launch_config, const Args& args) {
+        // Build globals via pre-compiled factory
+        size_t gsize = tk_globals_size(args.bm, args.bn, args.bk);
+        alignas(128) char globals_buf[2048];
+        assert(gsize <= sizeof(globals_buf));
+        // copies the tk factory struct (containing matmul_layout::globals) into globals_buf
+        tk_build_globals(args.bm, args.bn, args.bk, globals_buf,
+            args.A, args.B, args.C, args.scale_a, args.scale_b,
+            args.M, args.N, args.K);
+
+        // Launch via cuLaunchKernelEx with globals as kernelParams[0] - this is the only argument required for LCF
+        void* kernelParams[] = { globals_buf };
+        CUDA_CHECK(cuLaunchKernelEx(&launch_config, kernel, kernelParams, nullptr));
+    }
 };
 
-// when calling any of these methods, it is assumed sfa and sfb are row-major
-inline void sm90_fp8_gemm_1d2d(at::Tensor& A, at::Tensor& B, at::Tensor& sfa, at::Tensor & sfb,
-at::Tensor& D, const std::string& compiled_dims, cudaStream_t& stream) {
-    
-    // for grouped gemms:
-    // the expert weight will always have the shape (groups, N, K)
-    // for MGroupedContiguous : the expert tokens are concatenated into a single tensor, in blocks of 128 (GEMM M Block size)
-    // for MGroupedMasked : the expert tokens are grouped into blocked chunks, for the CUDA graph, so they are fied sizes
-    // for Batched : each batch is a group
+
+// persistent kernel style
+inline void sm90_fp8_gemm_1d2d_nt(at::Tensor& A, at::Tensor& B,
+    at::Tensor& scale_a, at::Tensor& scale_b,
+    at::Tensor& D, cudaStream_t& stream) {
+
     uint32_t M = A.size(0);
     uint32_t N = B.size(0);
-    uint32_t K = B.size(-1);
+    uint32_t K = B.size(1);
 
-    GemmConfig gemm_config = search_configs(
-        GemmType::Normal, 
-        M, N, K, 
-        1,
-        major_of(A), major_of(B), major_of(D),
-        dtype_of(A), dtype_of(D), 
-        device_prop->get_num_sms());
+    // Default tile config
+    // TK lcf kernel uses (NUM_CONSUMER_WARPS + NUM_PRODUCER_WARPS) * 32 threads
+    // NUM_CONSUMER_WARPS=8, NUM_PRODUCER_WARPS=1 (default) => 9 warps => 288 threads
+    int num_threads = 288;
+    int num_sms = 132;
+    // MAX_SHARED_MEMORY - 1024 (same as the standalone TK kernel)
+
+    auto gemm_config = search_configs(GemmType::Normal, M, N, K, 1, Major::K, Major::K, Major::K, A.scalar_type(), 
+        D.scalar_type(), device_prop->get_num_sms());
     
-    
-    size_t non_contig_A_stride = major_of(A) == Major::K ? A.stride(-2) : A.stride(-1);
-    size_t non_contig_B_stride = major_of(B) == Major::K ? B.stride(-2) : B.stride(-1);
-    // Major::K is a misnomer here, but it should be interpreted as row-major
-    size_t non_contig_D_stride = major_of(D) == Major::K ? D.stride(-2) : D.stride(-1);
-    CUtensorMap a_tensor_map = make_tma_a_desc(A, major_of(A), 1, gemm_config.block_m, gemm_config.block_k, 
-        non_contig_A_stride, gemm_config.smem_config.swizzle_a_mode, ti_align(gemm_config.block_k, 64));
-    CUtensorMap b_tensor_map = make_tma_b_desc(B, major_of(B), 1, gemm_config.block_n, gemm_config.block_k,
-         non_contig_B_stride, gemm_config.smem_config.swizzle_b_mode, ti_align(gemm_config.block_k, 64));
-    CUtensorMap d_tensor_map = make_tma_d_desc(D, major_of(D), 1, gemm_config.block_m, gemm_config.block_n,
-         non_contig_D_stride, gemm_config.smem_config.swizzle_cd_mode, ti_align(gemm_config.block_n, 64));
-    CUtensorMap sfa_tensor_map = make_tma_sf_desc(sfa, major_of(sfa), 1, M, K, gemm_config.block_m, gemm_config.block_k);
+    int num_consumer_warps = gemm_config.num_math_threads / 32;
+    int num_producer_warps = gemm_config.num_tma_threads / 32;
+
+
+    int super_m = 8; // set to this for now , DG uses 8 or 16
+
     LaunchConfig launch_config = {
-        dim3(gemm_config.num_math_threads + gemm_config.num_tma_threads, 1, 1),
-        dim3(gemm_config.num_sms),
+        dim3(num_threads, 1, 1),
+        dim3(num_sms),
         stream,
-        gemm_config.smem_config.smem_size,
-        gemm_config.num_tma_multicast
+         gemm_config.smem_config.smem_size,
+        1  // no multicast/clustering
     };
-    
-    const SM90_FP8_GEMM1D2D_Runtime::Args args = {
-        1,
+
+    const SM90_FP8_GEMM1D2D_TK_Runtime::Args args = {
         M, N, K,
-        compiled_dims,
-        major_of(sfb),
-        a_tensor_map, b_tensor_map, d_tensor_map, sfa_tensor_map,
-        sfb.data_ptr<float>(), nullptr, 
-        gemm_config, GemmType::Normal,
+        A.data_ptr(), B.data_ptr(), D.data_ptr(),
+        scale_a.data_ptr(), scale_b.data_ptr(),
+        (int)gemm_config.block_m, (int)gemm_config.block_n, (int)gemm_config.block_k, super_m,
+        num_consumer_warps, num_producer_warps, gemm_config.num_stages,
+        gemm_config.smem_config.smem_size,
         launch_config,
     };
-    // set up launch config shape
-    const std::string& code = LaunchRuntime<SM90_FP8_GEMM1D2D_Runtime>::generate(args);
-    std::shared_ptr<KernelRuntime> runtime = compiler->build("sm90_fp8_gemm_1d2d_normal", code);
-    LaunchRuntime<SM90_FP8_GEMM1D2D_Runtime>::launch(runtime, args);
+
+    const std::string& code = LaunchRuntime<SM90_FP8_GEMM1D2D_TK_Runtime>::generate(args);
+    std::shared_ptr<KernelRuntime> runtime = compiler->build("sm90_fp8_gemm_1d2d_tk", code);
+    LaunchRuntime<SM90_FP8_GEMM1D2D_TK_Runtime>::launch(runtime, args);
 }
-
-// for moe implementations, it is more efficient to use a permute operation to group ALL the tokens across ALL sequences under groups
-inline void sm90_fp8_grouped_gemm_1d2d_contiguous(at::Tensor& A, at::Tensor& B, at::Tensor& sfa, at::Tensor& sfb,
-    at::Tensor& D, std::string compiled_dims, int * grouped_layout, cudaStream_t&  stream) {
-    HOST_ASSERT(grouped_layout != nullptr, "Need a group layout for grouped cases");
-    uint32_t M = A.size(0); // == (batch_size * max_seq_length)
-    uint32_t N = B.size(-2);
-    uint32_t K = B.size(-1);
-
-    const uint32_t aligned_k = ti_align(K, 128);
-
-    uint32_t num_groups = B.size(0);
-
-    GemmConfig gemm_config = search_configs(
-        GemmType::MGroupedContiguous, 
-        M, N, K, 
-        1, // num_groups is already included
-        major_of(A), major_of(B), major_of(D),
-        dtype_of(A), dtype_of(D), 
-        device_prop->get_num_sms());
-    
-    size_t non_contig_A_stride = major_of(A) == Major::K ? A.stride(0) : A.stride(1);
-    // B is 3D (num_groups, N, K): stride(-2) = stride(1) = K gives the row stride,
-    // NOT stride(0) = N*K which is the group stride and would cause illegal TMA addresses
-    // Major::K is a misnomer here, but it should be interpreted as row-major
-    size_t non_contig_B_stride = major_of(B) == Major::K ? B.stride(-2) : B.stride(-1);
-    size_t non_contig_D_stride = major_of(D) == Major::K ? D.stride(-2) : D.stride(-1);
-    CUtensorMap a_tensor_map = make_tma_a_desc(A, major_of(A), 1, gemm_config.block_m, gemm_config.block_k,
-        non_contig_A_stride, gemm_config.smem_config.swizzle_a_mode, ti_align(gemm_config.block_k, 64));
-    CUtensorMap b_tensor_map = make_tma_b_desc(B, major_of(B), num_groups, gemm_config.block_n, gemm_config.block_k,
-            non_contig_B_stride, gemm_config.smem_config.swizzle_b_mode, ti_align(gemm_config.block_k, 64));
-    CUtensorMap d_tensor_map = make_tma_d_desc(D, major_of(D), 1, gemm_config.block_m, gemm_config.block_n,
-            non_contig_D_stride, gemm_config.smem_config.swizzle_cd_mode, ti_align(gemm_config.block_n, 64));    
-    CUtensorMap sfa_tensor_map = make_tma_sf_desc(sfa, major_of(sfa), 1, M, K, gemm_config.block_m, gemm_config.block_k);
-    // uint32_t num_blocks = ti_ceil_div(M, gemm_config.block_m) * ti_ceil_div(N, gemm_config.block_n);
-    // num_blocks = ti_align(num_blocks, gemm_config.num_tma_multicast);
-    LaunchConfig launch_config = {
-        dim3(gemm_config.num_math_threads + gemm_config.num_tma_threads, 1, 1),
-        dim3(gemm_config.num_sms),
-        stream,
-        gemm_config.smem_config.smem_size,
-        gemm_config.num_tma_multicast
-    };
-    
-    const SM90_FP8_GEMM1D2D_Runtime::Args args = {
-        1,
-        M, N, aligned_k,
-        compiled_dims,
-        major_of(sfb),
-        a_tensor_map, b_tensor_map, d_tensor_map, sfa_tensor_map,
-        sfb.data_ptr<float>(), grouped_layout, 
-        gemm_config, GemmType::MGroupedContiguous,
-        launch_config
-    };
-    // set up launch config shape
-    const std::string& code = LaunchRuntime<SM90_FP8_GEMM1D2D_Runtime>::generate(args);
-    std::shared_ptr<KernelRuntime> runtime = compiler->build("sm90_fp8_grouped_gemm_1d2d_contiguous", code);
-    LaunchRuntime<SM90_FP8_GEMM1D2D_Runtime>::launch(runtime, args);
-}
-inline void sm90_fp8_grouped_gemm_1d2d_masked(at::Tensor& A, at::Tensor& B, at::Tensor& sfa, at::Tensor& sfb,
-    at::Tensor& D, std::string compiled_dims, int * grouped_layout, cudaStream_t& stream) {
-        // input is (num_groups, max_m, k)
-        // B is (num_groups, n, k)
-        // D is (num_groups, max_m, n)
-        HOST_ASSERT(grouped_layout != nullptr, "Need a group layout for grouped cases");
-        uint32_t num_groups = A.size(0);
-        uint32_t M = A.size(-2); // == (batch_size * max_seq_length)
-        uint32_t N = B.size(-2);
-        uint32_t K = B.size(-1);
-    
-        const uint32_t & aligned_k = ti_align(K, 128);
-    
-        GemmConfig gemm_config = search_configs(
-            GemmType::MGroupedMasked, 
-            M, N, K, 
-            num_groups,
-            major_of(A), major_of(B), major_of(D),
-            dtype_of(A), dtype_of(D), 
-            device_prop->get_num_sms());
-        
-        
-        CUtensorMap a_tensor_map = make_tma_a_desc_3d(A, major_of(A), num_groups, gemm_config.block_m, gemm_config.block_k,
-            gemm_config.smem_config.swizzle_a_mode, ti_align(gemm_config.block_k, 64));
-        CUtensorMap b_tensor_map = make_tma_b_desc_3d(B, major_of(B), num_groups, gemm_config.block_n, gemm_config.block_k,
-                gemm_config.smem_config.swizzle_b_mode, ti_align(gemm_config.block_k, 64));
-        CUtensorMap d_tensor_map = make_tma_d_desc_3d(D, major_of(D), num_groups, gemm_config.block_m, gemm_config.block_n,
-             gemm_config.smem_config.swizzle_cd_mode, ti_align(gemm_config.block_n, 64));    
-        CUtensorMap sfa_tensor_map = make_tma_sf_desc(sfa, major_of(sfa), num_groups, M, K, gemm_config.block_m, gemm_config.block_k);
-
-        LaunchConfig launch_config = {
-            dim3(gemm_config.num_math_threads + gemm_config.num_tma_threads, 1, 1),
-            dim3(gemm_config.num_sms),
-            stream,
-            gemm_config.smem_config.smem_size,
-            gemm_config.num_tma_multicast
-        };
-        
-        const SM90_FP8_GEMM1D2D_Runtime::Args args = {
-            num_groups,
-            M, N, aligned_k,
-            compiled_dims,
-            major_of(sfb),
-            a_tensor_map, b_tensor_map, d_tensor_map, sfa_tensor_map,
-            sfb.data_ptr<float>(), grouped_layout, 
-            gemm_config, GemmType::MGroupedMasked,
-            launch_config
-        };
-        // set up launch config shape
-        const std::string& code = LaunchRuntime<SM90_FP8_GEMM1D2D_Runtime>::generate(args);    
-        std::shared_ptr<KernelRuntime> runtime = compiler->build("sm90_fp8_grouped_gemm_1d2d_masked", code);
-        LaunchRuntime<SM90_FP8_GEMM1D2D_Runtime>::launch(runtime, args);
-}
-

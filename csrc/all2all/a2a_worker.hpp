@@ -1,8 +1,9 @@
 #pragma once
 #include <cstdint>
 #include <driver_types.h>
+#include <functional>
 #include <optional>
-#include <moe_cuda/kernels/common/common.hpp>
+#include <vector>
 #include <moe_cuda/error.hpp>
 /* 
 Worker state to perform auxiliary functilns while kernels are running, separated from kernel frontends
@@ -98,7 +99,7 @@ class WorkerState {
         // initialize buffers on devie that are needed by kernels
 
         // worker one alloc
-        uint32_t num_local_experts = ti_ceil_div(num_experts, world_size);
+        uint32_t num_local_experts = (num_experts + world_size - 1) / world_size;
 
         CUDA_CHECK(cudaSetDevice(device));
         size_t worker_malloc_size = 0;
@@ -144,7 +145,7 @@ class WorkerState {
     // this entire method sets up all the different padding metadata to ensure that we can keep the receiving buffers of each rank contiguous
     void process_routing_info() {
         uint32_t num_dp_groups = this->world_size / this->dp_size;
-        uint32_t experts_per_rank = ti_ceil_div(this->num_experts, this->world_size);
+        uint32_t experts_per_rank = (this->num_experts + this->world_size - 1) / this->world_size;
 
         uint32_t first_local_expert = this->rank * experts_per_rank;
         uint32_t last_local_expert = std::min(
@@ -219,7 +220,7 @@ class WorkerState {
         uint32_t base_expert_offset = 0;
 
         for (auto count : tokens_per_expert) {
-            uint32_t padded_expert_count = ti_align(count, this->expert_padding);
+            uint32_t padded_expert_count = ((count + this->expert_padding - 1) / this->expert_padding) * this->expert_padding;
             padded_offsets.push_back(base_expert_offset);
             base_expert_offset += padded_expert_count;
         }

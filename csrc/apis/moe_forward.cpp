@@ -21,7 +21,7 @@ void bf16_gemm(
     kernels::bf16_gemm(A, B, C, D, gemm_type, compiled_dims, grouped_layout, stream);
 }
 
-void fp8_gemm(
+void fp8_gemm_nt(
     std::pair<at::Tensor&, at::Tensor&> act,
     std::pair<at::Tensor&, at::Tensor&> weight,
     at::Tensor& output,
@@ -29,7 +29,7 @@ void fp8_gemm(
     const std::string& compiled_dims,
     int* grouped_layout,
     cudaStream_t& stream) {
-    kernels::fp8_gemm(act, weight, output, gemm_type, compiled_dims, grouped_layout, stream);
+    kernels::fp8_gemm_nt(act, weight, output, gemm_type, compiled_dims, grouped_layout, stream);
 }
 
 #ifdef MOE_CUDA_USE_MPI

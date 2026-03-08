@@ -14,7 +14,7 @@
 namespace moe_cuda {
 namespace kernels {
 
-void fp8_gemm(
+void fp8_gemm_nt(
     std::pair<at::Tensor&, at::Tensor&> act,
     std::pair<at::Tensor&, at::Tensor&> weight,
     at::Tensor& output,

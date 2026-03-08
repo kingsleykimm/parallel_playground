@@ -26,8 +26,8 @@ Major major_a, Major major_b, const int & num_stages) {
     const int& smem_a_size_per_stage = load_block_m * load_block_k * ab_size;
     const int& smem_b_size_per_stage = load_block_n * load_block_k * ab_size;
 
-    const int& shape_k_scales = ti_ceil_div(k, block_k);
-    const int& smem_sf_size_per_stage = ti_align(block_m * sizeof(float) + shape_k_scales * sizeof(float) * (block_k % block_n != 0 ? 2 : 1), 16);
+    const int& shape_k_scales = host_ceil_div(k, block_k);
+    const int& smem_sf_size_per_stage = host_align(block_m * sizeof(float) + shape_k_scales * sizeof(float) * (block_k % block_n != 0 ? 2 : 1), 16);
 
     const int& smem_barrier_size_per_stage = SM90Arch::get_barrier_size();
 
@@ -36,7 +36,7 @@ Major major_a, Major major_b, const int & num_stages) {
     smem_size += (smem_a_size_per_stage +
                 smem_b_size_per_stage +
                 smem_sf_size_per_stage +
-                smem_barrier_size_per_stage) * num_stages;
+                smem_barrier_size_per_stage) * num_stages + 1024;
 
     return SharedMemoryConfig {
         .smem_size = smem_size,
@@ -63,11 +63,11 @@ inline GemmConfig search_configs(
 
     // first determine the best block_m and block_n
     auto get_num_blocks = [&](const uint32_t block_m, const uint32_t block_n) -> uint32_t {
-        return ti_ceil_div(M, block_m) * ti_ceil_div(N, block_n) * num_groups;
+        return host_ceil_div(M, block_m) * host_ceil_div(N, block_n) * num_groups;
     };
     // number of sm iterations in persistent kernel
     auto get_num_sm_waves = [&](const uint32_t block_m, const uint32_t block_n, const uint32_t num_sms_arg) -> uint32_t {
-        return ti_ceil_div(get_num_blocks(block_m, block_n), num_sms_arg);
+        return host_ceil_div(get_num_blocks(block_m, block_n), num_sms_arg);
     };
 
     auto get_last_wave_util = [&](const uint32_t block_m, const uint32_t block_n) -> uint32_t {
@@ -158,8 +158,8 @@ inline GemmConfig search_configs(
         smem_config = get_smem_config(gemm_type, AB_type, CD_type, M, N,
             K, best_block_m, best_block_n, block_k, AMajor, BMajor, num_stages);
 
-        // use the largest stage possible that fits in smem capacity
-        if (smem_config.smem_size <= smem_capacity) {
+        // use the largest stage possible that fits in smem capacity, 1024 for padding
+        if (smem_config.smem_size  <= smem_capacity) {
             best_num_stages = num_stages;
             break;
         }
@@ -167,10 +167,10 @@ inline GemmConfig search_configs(
 
     int min_sms = num_sms;
     if (SM90Arch::should_minimize_sms()) {
-        min_sms = ti_ceil_div(
-            ti_ceil_div(M, best_block_m) * ti_ceil_div(N, best_block_n) * num_groups, best_num_waves
+        min_sms = host_ceil_div(
+            host_ceil_div(M, best_block_m) * host_ceil_div(N, best_block_n) * num_groups, best_num_waves
         );
-        min_sms = ti_align(min_sms, num_tma_multicast);
+        min_sms = host_align(min_sms, num_tma_multicast);
         if (min_sms > num_sms) {
             HOST_ERROR("While trying to minimize SMs in FP8 Heuristic");
         }
@@ -210,7 +210,7 @@ inline std::tuple<int, int, int> get_transpose_config(
         int padded_sf_k = sf_k + (sf_k + 1) % 2;
         int smem_size = block_mn * padded_sf_k * get_type_size(dtype);
         
-        int usage = ti_ceil_div(mn, block_mn); // this is the number of blocks used
+        int usage = host_ceil_div(mn, block_mn); // this is the number of blocks used
         // we want high intra-sm occupancy,
         // but also high grid occupancy
         

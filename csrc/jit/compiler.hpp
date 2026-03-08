@@ -12,6 +12,37 @@
 #include <jit/utils/lazy_init.hpp>
 #include <fstream>
 #include <regex>
+// Returns -isystem flags for the GCC C++ stdlib include paths, by running
+// `gcc -v -x c++ /dev/null -fsyntax-only` and parsing its include search list.
+// Returns -I flags for the GCC C++ stdlib include paths, filtered to standard
+// system locations only (skips module-system or environment-injected paths).
+static std::string get_gcc_system_include_flags() {
+    auto [exit_code, output] = run_command("gcc -v -x c++ /dev/null -fsyntax-only 2>&1");
+    if (exit_code != 0 && output.empty()) return "";
+
+    std::string flags;
+    bool in_search = false;
+    std::istringstream ss(output);
+    std::string line;
+    while (std::getline(ss, line)) {
+        if (line.find("#include <...> search starts here") != std::string::npos) {
+            in_search = true;
+            continue;
+        }
+        if (in_search) {
+            if (line.find("End of search list") != std::string::npos) break;
+            auto start = line.find_first_not_of(" \t");
+            if (start == std::string::npos) continue;
+            auto path = line.substr(start);
+            // skip paths injected by module systems or environments —
+            // only keep standard system locations
+            if (path.rfind("/usr", 0) != 0 && path.rfind("/lib", 0) != 0) continue;
+            flags += fmt::format("-I{} ", path);
+        }
+    }
+    return flags;
+}
+
 class Compiler {
     public :
         // root path of the repository
@@ -23,7 +54,7 @@ class Compiler {
         static std::string get_library_version() {
             std::vector<char> buffer;
 
-            for (const auto& entry : all_files_in_dir(library_include_path)) {
+            for (const auto& entry : all_files_in_dir(library_include_path / "moe_cuda")) {
                 std::ifstream stream(entry, std::ios::binary);
                 HOST_ASSERT(stream.is_open(), "file not open");
                 buffer.insert(buffer.end(), 
@@ -64,7 +95,7 @@ class Compiler {
             }
             signature = "unknown";
             flags = fmt::format("-std=c++{} --diag-suppress=177 --ptxas-options=--register-usage-level=10",
-                                        get_env<int>("JIT_CPP_STD", 17));
+                                        get_env<int>("JIT_CPP_STD", 20));
             // flags += " -Xcompiler -rdynamic -lineinfo";
         };
 
@@ -156,11 +187,36 @@ class NVCC_Compiler : public Compiler {
         signature = fmt::format("NVCC-{}-{}", major, minor);
         const auto arch = device_prop->get_major_minor();
 
-        // append to base compiler flags
-        flags = fmt::format("{} -I{} -arch=sm_{} --fPIC "
+        // ThunderKittens include paths: TK_ROOT override, then common repo-relative candidates.
+        std::string extra_includes;
+        auto tk_root_env = get_env<std::string>("TK_ROOT", "");
+        std::vector<fs::path> tk_candidates;
+        if (!tk_root_env.empty()) {
+            tk_candidates.emplace_back(tk_root_env);
+        }
+        tk_candidates.push_back(library_root_path / "third-party" / "ThunderKittens");
+        tk_candidates.push_back(library_root_path.parent_path() / "third-party" / "ThunderKittens");
+        for (const auto& tk_root : tk_candidates) {
+            if (fs::exists(tk_root / "include" / "kittens.cuh") &&
+                fs::exists(tk_root / "prototype" / "prototype.cuh")) {
+                extra_includes = fmt::format("-I{} -I{} -DKITTENS_HOPPER ",
+                    (tk_root / "include").string(), (tk_root / "prototype").string());
+                break;
+            }
+        }
+        const auto gcc_system_includes = get_gcc_system_include_flags();
+        auto [gcc_exit, gcc_path] = run_command("which gcc");
+        if (gcc_exit == 0 && !gcc_path.empty()) {
+            gcc_path.erase(gcc_path.find_last_not_of(" \t\n\r") + 1);
+        }
+        const auto compiler_bindir = (gcc_exit == 0 && !gcc_path.empty())
+            ? fmt::format("--compiler-bindir={} ", gcc_path) : "";
+
+        flags = fmt::format("{} -I{} {} {} {} -arch=sm_{} "
                                 "--compiler-options=-fPIC,-O3,-fconcepts,-Wno-abi "
-                                "-cubin -O3 --expt-related-constexpr --expt-extended-lambda", 
-                                flags, library_include_path.c_str(), device_prop->get_arch(true));
+                                "-cubin -O3 --expt-relaxed-constexpr --expt-extended-lambda",
+                                flags, library_include_path.c_str(), extra_includes,
+                                gcc_system_includes, compiler_bindir, device_prop->get_arch(true));
     };
 
     void compile(const std::string& code, const fs::path kernel_dir_path, const fs::path tmp_cubin_path) const override {
@@ -195,6 +251,32 @@ public:
         std::string include_dirs;
         include_dirs += fmt::format("-I{} ", library_include_path.string());
         include_dirs += fmt::format("-I{} ", (cuda_home / "include").string());
+        include_dirs += get_gcc_system_include_flags();
+        include_dirs += "-DKITTENS_HOPPER ";
+
+        // ThunderKittens include paths (kittens.cuh + prototype.cuh):
+        // TK_ROOT override, then common repo-relative candidates.
+        auto tk_root_env = get_env<std::string>("TK_ROOT", "");
+        std::vector<fs::path> tk_candidates;
+        if (!tk_root_env.empty()) {
+            tk_candidates.emplace_back(tk_root_env);
+        }
+        tk_candidates.push_back(library_root_path / "third-party" / "ThunderKittens");
+        tk_candidates.push_back(library_root_path.parent_path() / "third-party" / "ThunderKittens");
+
+        bool tk_found = false;
+        for (const auto& tk_root : tk_candidates) {
+            if (fs::exists(tk_root / "include" / "kittens.cuh") &&
+                fs::exists(tk_root / "prototype" / "prototype.cuh")) {
+                include_dirs += fmt::format("-I{} ", (tk_root / "include").string());
+                include_dirs += fmt::format("-I{} ", (tk_root / "prototype").string());
+                tk_found = true;
+                break;
+            }
+        }
+        if (!tk_found && get_env<int>("JIT_DEBUG", 0)) {
+            printf("Warning: ThunderKittens headers not found for NVRTC include paths\n");
+        }
 
         // Add PCH support for 12.8 and above
         std::string pch_flags;

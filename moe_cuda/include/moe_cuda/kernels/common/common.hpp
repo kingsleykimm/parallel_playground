@@ -1,11 +1,7 @@
-// the methods here don't depend on the cuda runtime or cuda::std libraries, which is a requirement of any JIT kernel
+// // the methods here don't depend on the cuda runtime or cuda::std libraries, which is a requirement of any JIT kernel
 
 #pragma once
-#include <cute/swizzle.hpp>
-#include <cute/config.hpp>
-#include <cute/atom/mma_traits_sm90_gmma.hpp>
-#include "cute/util/type_traits.hpp"
-
+#include <kittens.cuh>
 
 template <uint32_t kNumBits, typename unit_ptr_t> 
 struct VEC_LOAD {
@@ -24,7 +20,7 @@ struct VEC_LOAD {
             return (uint16_t)0;
         }
         else {
-            CUTE_STATIC_ASSERT(kNumBits > 0, "Invalid vectorization for kNumBits");
+            static_assert(kNumBits > 0, "Invalid vectorization for kNumBits");
         }
     }
     using ptr_type = decltype(base_init());
@@ -48,35 +44,12 @@ struct VEC_LOAD_PTR {
             return (uint16_t)0;
         }
         else {
-            CUTE_STATIC_ASSERT(kNumBits > 0, "Invalid vectorization for kNumBits");
+            static_assert(kNumBits > 0, "Invalid vectorization for kNumBits");
         }
     }
     using ptr_type = decltype(base_init());
 };
 
-
-
-
-
-template<uint32_t kSwizzleMode>
-struct CUTE_SWIZZLE {
-    static auto get_swizzle() {
-        if constexpr (kSwizzleMode == 128) {
-            return cute::Swizzle<3, 4, 3>{};
-        }
-        else if constexpr (kSwizzleMode == 64) {
-            return cute::Swizzle<2, 4, 3>{};
-        }
-        else if constexpr (kSwizzleMode == 32) {
-            return cute::Swizzle<1, 4, 3>{};
-        }
-        else if constexpr (kSwizzleMode == 16 || kSwizzleMode == 0) {
-            return cute::Swizzle<0, 4, 3>{};
-        }
-    }
-
-    using type = decltype(get_swizzle());
-};
 
 template<typename from_t, typename to_t>
 struct VEC_LOAD_CVT {};
@@ -129,13 +102,13 @@ struct VEC_LOAD_CVT<uint32_t, __nv_bfloat16> {
     }
 };
 
-// uint32_t -> __nv_fp8_e4m3 (4 fp8s)
-template<>
-struct VEC_LOAD_CVT<uint32_t, cutlass::float_e4m3_t> {
-    __device__ __forceinline__ static void convert(uint32_t val, cutlass::float_e4m3_t* outs) {
-        *reinterpret_cast<uint32_t*>(outs) = val;
-    }
-};
+// // uint32_t -> __nv_fp8_e4m3 (4 fp8s)
+// template<>
+// struct VEC_LOAD_CVT<uint32_t, cutlass::float_e4m3_t> {
+//     __device__ __forceinline__ static void convert(uint32_t val, cutlass::float_e4m3_t* outs) {
+//         *reinterpret_cast<uint32_t*>(outs) = val;
+//     }
+// };
 
 // ============================================================================
 // uint2 conversions (8 bytes)
@@ -165,13 +138,13 @@ struct VEC_LOAD_CVT<uint2, __nv_bfloat16> {
     }
 };
 
-// uint2 -> __nv_fp8_e4m3 (8 fp8s)
-template<>
-struct VEC_LOAD_CVT<uint2, cutlass::float_e4m3_t> {
-    __device__ __forceinline__ static void convert(uint2 val, cutlass::float_e4m3_t* outs) {
-        *reinterpret_cast<uint2*>(outs) = val;
-    }
-};
+// // uint2 -> __nv_fp8_e4m3 (8 fp8s)
+// template<>
+// struct VEC_LOAD_CVT<uint2, cutlass::float_e4m3_t> {
+//     __device__ __forceinline__ static void convert(uint2 val, cutlass::float_e4m3_t* outs) {
+//         *reinterpret_cast<uint2*>(outs) = val;
+//     }
+// };
 
 // ============================================================================
 // uint4 conversions (16 bytes)
@@ -201,13 +174,13 @@ struct VEC_LOAD_CVT<uint4, __nv_bfloat16> {
     }
 };
 
-// uint4 -> __nv_fp8_e4m3 (16 fp8s)
-template<>
-struct VEC_LOAD_CVT<uint4, cutlass::float_e4m3_t> {
-    __device__ __forceinline__ static void convert(uint4 val, cutlass::float_e4m3_t* outs) {
-        *reinterpret_cast<uint4*>(outs) = val;
-    }
-};
+// // uint4 -> __nv_fp8_e4m3 (16 fp8s)
+// template<>
+// struct VEC_LOAD_CVT<uint4, cutlass::float_e4m3_t> {
+//     __device__ __forceinline__ static void convert(uint4 val, cutlass::float_e4m3_t* outs) {
+//         *reinterpret_cast<uint4*>(outs) = val;
+//     }
+// };
 
 
 // ============================================================================
@@ -319,40 +292,40 @@ struct VEC_LOAD_CVT<__half, uint4> {
     }
 };
 
-template <typename from_t> __forceinline__ __host__ __device__ float to_float(from_t val) {
-    if constexpr (cute::is_same_v<from_t, __nv_bfloat16>) {
-      return __bfloat162float(val);
-    } else if constexpr (cute::is_same_v<from_t, __half>) {
-      return __half2float(val);
-    } else if constexpr (cute::is_same_v<from_t, float>) {
-      return val;
-    } else {
-      static_assert(sizeof(from_t) == 0, "Unsupported type");
-    }
-  }
-  
-  template <typename to_t> __forceinline__ __host__ __device__ to_t from_float(float val) {
-    if constexpr (cute::is_same_v<to_t, __nv_bfloat16>) {
-      return __float2bfloat16(val);
-    } else if constexpr (cute::is_same_v<to_t, __half>) {
-      return __float2half(val);
-    } else if constexpr (cute::is_same_v<to_t, float>) {
-      return val;
-    }
-  }
+// template <typename from_t> __forceinline__ __host__ __device__ float to_float(from_t val) {
+//     if constexpr (cute::is_same_v<from_t, __nv_bfloat16>) {
+//       return __bfloat162float(val);
+//     } else if constexpr (cute::is_same_v<from_t, __half>) {
+//       return __half2float(val);
+//     } else if constexpr (cute::is_same_v<from_t, float>) {
+//       return val;
+//     } else {
+//       static_assert(sizeof(from_t) == 0, "Unsupported type");
+//     }
+//   }
+
+//   template <typename to_t> __forceinline__ __host__ __device__ to_t from_float(float val) {
+//     if constexpr (cute::is_same_v<to_t, __nv_bfloat16>) {
+//       return __float2bfloat16(val);
+//     } else if constexpr (cute::is_same_v<to_t, __half>) {
+//       return __float2half(val);
+//     } else if constexpr (cute::is_same_v<to_t, float>) {
+//       return val;
+//     }
+//   }
 
 // Use ti_ prefix to avoid conflict with cutlass::ceil_div
-template <typename TA, typename TB> CUTE_HOST_DEVICE int ti_ceil_div(TA a, TB b) { return (a + b - 1) / b; }
+template <typename TA, typename TB> __host__ __device__ int ti_ceil_div(TA a, TB b) { return (a + b - 1) / b; }
 
 // align a to b
-template <typename TA, typename TB> CUTE_HOST_DEVICE int ti_align(TA a, TB b) { return ti_ceil_div(a, b) * b; }
+template <typename TA, typename TB> __host__ __device__ int ti_align(TA a, TB b) { return ti_ceil_div(a, b) * b; }
 
-template <typename TA, typename TB> CUTE_HOST_DEVICE constexpr int constexpr_ti_ceil_div(TA a, TB b) {
+template <typename TA, typename TB> __host__ __device__ constexpr int constexpr_ti_ceil_div(TA a, TB b) {
   return (a + b - 1) / b;
 }
 
 // align a to b
-template <typename TA, typename TB> CUTE_HOST_DEVICE constexpr int constexpr_ti_align(TA a, TB b) {
+template <typename TA, typename TB> __host__ __device__ constexpr int constexpr_ti_align(TA a, TB b) {
   return constexpr_ti_ceil_div(a, b) * b;
 }
 
@@ -363,94 +336,94 @@ template<typename TA, typename TB> __host__ __device__ constexpr TA constexpr_mi
 template<typename TA, typename TB> __host__ __device__ TA ti_min(TA a, TB b) {
     return a <= b ? a : b;
 }
-// Helper to apply swizzle with proper 128-bit normalization
-// NVIDIA swizzling operates at 128-bit (16-byte) granularity
-// returns the elem offset, NOT byte offset
-template <typename SwizzleOp, typename dtype_t>
-CUTE_HOST_DEVICE constexpr uint32_t swizzle_offset(SwizzleOp swizzle, uint32_t logical_idx) {
-    constexpr uint32_t kBytesPerSwizzleUnit = 16;  // 128 bits
-    constexpr uint32_t kElemsPerSwizzleUnit = kBytesPerSwizzleUnit / sizeof(dtype_t);
+// // Helper to apply swizzle with proper 128-bit normalization
+// // NVIDIA swizzling operates at 128-bit (16-byte) granularity
+// // returns the elem offset, NOT byte offset
+// template <typename SwizzleOp, typename dtype_t>
+// CUTE_HOST_DEVICE constexpr uint32_t swizzle_offset(SwizzleOp swizzle, uint32_t logical_idx) {
+//     constexpr uint32_t kBytesPerSwizzleUnit = 16;  // 128 bits
+//     constexpr uint32_t kElemsPerSwizzleUnit = kBytesPerSwizzleUnit / sizeof(dtype_t);
 
-    uint32_t swizzle_unit = logical_idx / kElemsPerSwizzleUnit;
-    uint32_t intra_unit_offset = logical_idx % kElemsPerSwizzleUnit;
-    uint32_t physical_unit = swizzle(swizzle_unit);
+//     uint32_t swizzle_unit = logical_idx / kElemsPerSwizzleUnit;
+//     uint32_t intra_unit_offset = logical_idx % kElemsPerSwizzleUnit;
+//     uint32_t physical_unit = swizzle(swizzle_unit);
 
-    return physical_unit * kElemsPerSwizzleUnit + intra_unit_offset;
-}
+//     return physical_unit * kElemsPerSwizzleUnit + intra_unit_offset;
+// }
 
-// Overload for 2D indexing (row, col) with row stride
-template <typename SwizzleOp, typename dtype_t>
-CUTE_HOST_DEVICE constexpr uint32_t swizzle_offset(SwizzleOp swizzle, uint32_t row, uint32_t col, uint32_t row_stride) {
-    return swizzle_offset<SwizzleOp, dtype_t>(swizzle, row * row_stride + col);
-}
+// // Overload for 2D indexing (row, col) with row stride
+// template <typename SwizzleOp, typename dtype_t>
+// CUTE_HOST_DEVICE constexpr uint32_t swizzle_offset(SwizzleOp swizzle, uint32_t row, uint32_t col, uint32_t row_stride) {
+//     return swizzle_offset<SwizzleOp, dtype_t>(swizzle, row * row_stride + col);
+// }
 
-// Compute physical element offset for STSM-stored WGMMA output
-// This matches the layout produced by stmatrix.sync.aligned.m8n8.x2.shared.b16
-// storing WGMMA 64xN accumulators with swizzled layout
-//
-// The STSM layout has:
-// - 4 warps, each handling 16 rows (M=64 / 4 warps)
-// - Within each warp's region: data arranged for bank-conflict-free WGMMA access
-// - 128-byte swizzle atoms (64 bf16 elements per atom width)
-//
-// Parameters:
-//   mat_row, mat_col: logical matrix position
-//   row_stride: number of columns in the matrix (e.g., 64 for 64x64)
-//   kSwizzleMode: swizzle size in bytes (e.g., 128)
-//
-// Returns: physical element offset (NOT byte offset)
-template <typename dtype_t, uint32_t kSwizzleMode, uint32_t BLOCK_M>
-CUTE_HOST_DEVICE constexpr uint32_t stsm_wgmma_offset(uint32_t mat_row, uint32_t mat_col) {
-    constexpr uint32_t kNumBankGroupBytes = 16;
-    constexpr uint32_t kElemsPerBankGroup = kNumBankGroupBytes / sizeof(dtype_t);  // 8 for bf16
-    constexpr uint32_t kRowsPerWarp = 16;  // WGMMA M=64 / 4 warps
-    constexpr uint32_t kSwizzleAtomWidth = kSwizzleMode / sizeof(dtype_t);  // 64 for 128-byte swizzle
-    
-    // Which warp's region contains this row
-    uint32_t warp_idx = mat_row / kRowsPerWarp;
-    uint32_t row_in_warp = mat_row % kRowsPerWarp;
-    
-    // Which swizzle atom (column group) this column is in
-    uint32_t atom_offset = mat_col / kSwizzleAtomWidth;
-    uint32_t col_in_atom = mat_col % kSwizzleAtomWidth;
-    
-    // The stmatrix m8n8.x2 layout arranges data in 8x8 tiles
-    // Within the swizzle atom, find the 8-column tile and position
-    uint32_t tile_col = col_in_atom / kElemsPerBankGroup;  // which 8-element tile (0-7 for 64-wide atom)
-    uint32_t elem_in_tile = col_in_atom % kElemsPerBankGroup;  // position within tile (0-7)
-    
-    // The m8n8 tile layout: 8 rows x 8 cols
-    // Within each warp's 16 rows, we have 2 vertical 8-row groups
-    uint32_t row_tile = row_in_warp / 8;  // 0 or 1
-    uint32_t row_in_tile = row_in_warp % 8;  // 0-7
-    
-    // Compute bank_group_index matching the STSM store pattern
-    // The STSM uses: bank_group_index = in_atom_offset + lane_idx * 8
-    // where lane_idx encodes position within the m8n8 block
-    //
-    // For reading: we reverse this mapping
-    // row (in STSM formula) = bank_group_index / 8 = lane_idx 
-    // col (in STSM formula) = bank_group_index % 8 = in_atom_offset
-    //
-    // The lane_idx in stmatrix corresponds to: row_in_tile + row_tile * 8 + tile_col * 2
-    // (This is the stmatrix thread-to-position mapping)
-    uint32_t stsm_row = row_in_tile + row_tile * 8;  // 0-15 range for rows within warp
-    uint32_t stsm_col = tile_col;  // 0-7 for 8 bank groups
-    
-    // Compute byte offset then convert to element offset
-    // byte_offset = atom_offset * row_stride * kSwizzleMode + 
-    //               warp_idx * kRowsPerWarp * kSwizzleMode +
-    //               stsm_row * kSwizzleMode + 
-    //               stsm_col * kNumBankGroupBytes +
-    //               elem_in_tile * sizeof(dtype_t)
-    uint32_t byte_offset = atom_offset * BLOCK_M * kSwizzleMode +
-                           warp_idx * kRowsPerWarp * kSwizzleMode +
-                           stsm_row * (kSwizzleMode) +
-                           stsm_col * kNumBankGroupBytes +
-                           elem_in_tile * sizeof(dtype_t);
-    
-    return byte_offset / sizeof(dtype_t);
-}
+// // Compute physical element offset for STSM-stored WGMMA output
+// // This matches the layout produced by stmatrix.sync.aligned.m8n8.x2.shared.b16
+// // storing WGMMA 64xN accumulators with swizzled layout
+// //
+// // The STSM layout has:
+// // - 4 warps, each handling 16 rows (M=64 / 4 warps)
+// // - Within each warp's region: data arranged for bank-conflict-free WGMMA access
+// // - 128-byte swizzle atoms (64 bf16 elements per atom width)
+// //
+// // Parameters:
+// //   mat_row, mat_col: logical matrix position
+// //   row_stride: number of columns in the matrix (e.g., 64 for 64x64)
+// //   kSwizzleMode: swizzle size in bytes (e.g., 128)
+// //
+// // Returns: physical element offset (NOT byte offset)
+// template <typename dtype_t, uint32_t kSwizzleMode, uint32_t BLOCK_M>
+// CUTE_HOST_DEVICE constexpr uint32_t stsm_wgmma_offset(uint32_t mat_row, uint32_t mat_col) {
+//     constexpr uint32_t kNumBankGroupBytes = 16;
+//     constexpr uint32_t kElemsPerBankGroup = kNumBankGroupBytes / sizeof(dtype_t);  // 8 for bf16
+//     constexpr uint32_t kRowsPerWarp = 16;  // WGMMA M=64 / 4 warps
+//     constexpr uint32_t kSwizzleAtomWidth = kSwizzleMode / sizeof(dtype_t);  // 64 for 128-byte swizzle
+
+//     // Which warp's region contains this row
+//     uint32_t warp_idx = mat_row / kRowsPerWarp;
+//     uint32_t row_in_warp = mat_row % kRowsPerWarp;
+
+//     // Which swizzle atom (column group) this column is in
+//     uint32_t atom_offset = mat_col / kSwizzleAtomWidth;
+//     uint32_t col_in_atom = mat_col % kSwizzleAtomWidth;
+
+//     // The stmatrix m8n8.x2 layout arranges data in 8x8 tiles
+//     // Within the swizzle atom, find the 8-column tile and position
+//     uint32_t tile_col = col_in_atom / kElemsPerBankGroup;  // which 8-element tile (0-7 for 64-wide atom)
+//     uint32_t elem_in_tile = col_in_atom % kElemsPerBankGroup;  // position within tile (0-7)
+
+//     // The m8n8 tile layout: 8 rows x 8 cols
+//     // Within each warp's 16 rows, we have 2 vertical 8-row groups
+//     uint32_t row_tile = row_in_warp / 8;  // 0 or 1
+//     uint32_t row_in_tile = row_in_warp % 8;  // 0-7
+
+//     // Compute bank_group_index matching the STSM store pattern
+//     // The STSM uses: bank_group_index = in_atom_offset + lane_idx * 8
+//     // where lane_idx encodes position within the m8n8 block
+//     //
+//     // For reading: we reverse this mapping
+//     // row (in STSM formula) = bank_group_index / 8 = lane_idx
+//     // col (in STSM formula) = bank_group_index % 8 = in_atom_offset
+//     //
+//     // The lane_idx in stmatrix corresponds to: row_in_tile + row_tile * 8 + tile_col * 2
+//     // (This is the stmatrix thread-to-position mapping)
+//     uint32_t stsm_row = row_in_tile + row_tile * 8;  // 0-15 range for rows within warp
+//     uint32_t stsm_col = tile_col;  // 0-7 for 8 bank groups
+
+//     // Compute byte offset then convert to element offset
+//     // byte_offset = atom_offset * row_stride * kSwizzleMode +
+//     //               warp_idx * kRowsPerWarp * kSwizzleMode +
+//     //               stsm_row * kSwizzleMode +
+//     //               stsm_col * kNumBankGroupBytes +
+//     //               elem_in_tile * sizeof(dtype_t)
+//     uint32_t byte_offset = atom_offset * BLOCK_M * kSwizzleMode +
+//                            warp_idx * kRowsPerWarp * kSwizzleMode +
+//                            stsm_row * (kSwizzleMode) +
+//                            stsm_col * kNumBankGroupBytes +
+//                            elem_in_tile * sizeof(dtype_t);
+
+//     return byte_offset / sizeof(dtype_t);
+// }
 
 template<uint32_t SMEM_BYTES, uint32_t NUM_THREADS>
 __device__ __forceinline__ void zero_smem(void * smem_ptr, int tidx) {
@@ -528,36 +501,35 @@ constexpr DeviceTypeFInfo kernel_finfo_table[] = {
 
 
 
+// template<typename T>
+// inline const DeviceTypeFInfo& get_finfo_from_typename() {
+//     if constexpr (cute::is_same_v<T, float>) {
+//         return kernel_finfo_table[0];
+//     }
+//     else if constexpr (cute::is_same_v<T, __nv_bfloat16>) {
+//         return kernel_finfo_table[2];
+//     }
+//     else if constexpr (cute::is_same_v<T, cutlass::float_e4m3_t>) {
+//         return kernel_finfo_table[7];
+//     }
+//     else if constexpr (cute::is_same_v<T, uint32_t>) {
+//         return kernel_finfo_table[3];
+//     }
+//     else {
+//         printf("DType is not supported yet");
+//         assert (false);
+//         return kernel_finfo_table[0];
+//     }
+// }
 
-template<typename T>
-inline const DeviceTypeFInfo& get_finfo_from_typename() {
-    if constexpr (cute::is_same_v<T, float>) {
-        return kernel_finfo_table[0];
-    }
-    else if constexpr (cute::is_same_v<T, __nv_bfloat16>) {
-        return kernel_finfo_table[2];
-    }
-    else if constexpr (cute::is_same_v<T, cutlass::float_e4m3_t>) {
-        return kernel_finfo_table[7];
-    }
-    else if constexpr (cute::is_same_v<T, uint32_t>) {
-        return kernel_finfo_table[3];
-    }
-    else {
-        printf("DType is not supported yet");
-        assert (false);
-        return kernel_finfo_table[0];
-    }
-}
 
+// template<typename Func_T>
+// struct PatternVisitor {
+//     Func_T func;
 
-template<typename Func_T>
-struct PatternVisitor {
-    Func_T func;
+//     __host__ __device__ explicit PatternVisitor(Func_T&& func) : func(std::forward<Func_T>(func)) {};
 
-    __host__ __device__ explicit PatternVisitor(Func_T&& func) : func(std::forward<Func_T>(func)) {};
-
-    __host__ __device__ auto operator[] (const uint32_t& i) {
-        return func(i);
-    }
-};
+//     __host__ __device__ auto operator[] (const uint32_t& i) {
+//         return func(i);
+//     }
+// };
