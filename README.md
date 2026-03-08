@@ -1,6 +1,6 @@
 # parallel_playground (moe_cuda)
 
-Worklog of optimizing FP8/BF16 MoE Pipelines on H100
+Worklog of optimizing FP8/BF16 MoE Pipelines on H100 with ThunderKittens. WIP + Experimental
 
 ## Build
 
