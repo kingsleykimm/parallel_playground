@@ -4,7 +4,6 @@
 #include "ATen/core/ivalue_inl.h"
 #include "c10/core/ScalarType.h"
 #include "c10/core/TensorOptions.h"
-#include "moe_cuda/kernels/common/common.hpp"
 #include <moe_cuda/error.hpp>
 #include <moe_cuda/dtype.h>
 #include <c10/core/Device.h>
@@ -275,7 +274,7 @@ inline std::tuple<torch::Tensor, std::vector<size_t>, std::vector<size_t>> gener
     total_rows = 0;
     for (int i = 0; i < num_groups; i++) {
         int actual_m = (int) (dist(gen) * expected_m_per_group);
-        int aligned_m = ti_align(actual_m, 128);
+        int aligned_m = ((actual_m + 127) / 128) * 128;
         actual_ms.push_back(actual_m);
         aligned_ms.push_back(aligned_m);
         total_rows += aligned_m;

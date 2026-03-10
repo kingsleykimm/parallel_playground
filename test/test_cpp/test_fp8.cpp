@@ -24,9 +24,24 @@ struct TestShape {
 };
 
 static const std::vector<TestShape> normal_shapes = {
-    {128, 128, 128, 1, "small"},
-    {256, 512, 256, 1, "medium"},
-    {512, 1024, 512, 1, "large"},
+    {128, 128, 128, 1, "small-square"},
+    {256, 256, 128, 1, "medium-square-small-k"},
+    {256, 256, 256, 1, "medium-square"},
+    {512, 512, 512, 1, "large-square"},
+    {128, 4096, 1024, 1, "llm-narrow-m"},
+    {256, 4096, 1024, 1, "llm-medium-m"},
+    {512, 4096, 1024, 1, "llm-wide-m"},
+    {128, 8192, 1024, 1, "wide-n"},
+    {256, 1024, 256, 1, "small-k"},
+    {256, 1024, 512, 1, "medium-k"},
+    {256, 1024, 1024, 1, "large-k"},
+    {96, 256, 128, 1, "ragged-m-96"},
+    {192, 512, 256, 1, "ragged-m-192"},
+    {320, 512, 256, 1, "ragged-m-320"},
+    {384, 1024, 256, 1, "ragged-m-384"},
+    {640, 512, 512, 1, "ragged-m-640"},
+    {768, 1024, 512, 1, "ragged-m-768"},
+    {160, 4096, 1024, 1, "ragged-llm-m-160"},
 };
 
 #if 0
@@ -50,13 +65,26 @@ struct Config {
     int64_t K = 0;
     int groups = 1;
     bool verbose = false;
-    double max_diff = 0.02;
 };
 
 static const char* type_to_string(GemmType t) {
     switch (t) {
         case GemmType::Normal: return "normal";
         default: return "unknown";
+    }
+}
+
+static const char* output_type_to_string(c10::ScalarType dtype) {
+    switch (dtype) {
+        case c10::ScalarType::Float: return "float";
+        case c10::ScalarType::BFloat16: return "bf16";
+        default: return "unknown";
+    }
+}
+
+static double max_diff_for_output_dtype(c10::ScalarType dtype) {
+    switch (dtype) {
+        default: return 0.001;
     }
 }
 
@@ -80,8 +108,6 @@ static bool parse_args(int argc, char** argv, Config& cfg) {
             cfg.all_shapes = false;
         } else if ((a == "--groups") && i + 1 < argc) {
             cfg.groups = std::stoi(argv[++i]);
-        } else if ((a == "--max-diff") && i + 1 < argc) {
-            cfg.max_diff = std::stod(argv[++i]);
         } else if (a == "--verbose") {
             cfg.verbose = true;
         } else {
@@ -91,9 +117,12 @@ static bool parse_args(int argc, char** argv, Config& cfg) {
     return type_set;
 }
 
-static bool run_normal(int64_t M, int64_t N, int64_t K, double max_diff, bool verbose) {
+static bool run_normal(int64_t M, int64_t N, int64_t K,
+                       c10::ScalarType output_dtype, bool verbose) {
     auto dev = torch::Device(torch::kCUDA);
     auto bf16 = torch::TensorOptions().dtype(torch::kBFloat16).device(dev);
+    auto out_options = torch::TensorOptions().dtype(output_dtype).device(dev);
+    double max_diff = max_diff_for_output_dtype(output_dtype);
 
     float s = 1.0f / std::sqrt(static_cast<float>(K));
     torch::Tensor A = torch::randn({M, K}, bf16) * s;
@@ -103,7 +132,7 @@ static bool run_normal(int64_t M, int64_t N, int64_t K, double max_diff, bool ve
     auto [A_fp8, sfa] = test_utils::quantize_fp8_1d_block(A, Major::K, dev);
     auto [B_fp8, sfb] = test_utils::quantize_fp8_2d_block(B, dev);
 
-    torch::Tensor out = torch::empty({M, N}, bf16);
+    torch::Tensor out = torch::empty({M, N}, out_options);
     at::Tensor A_t = A_fp8;
     at::Tensor B_t = B_fp8;
     at::Tensor sfa_t = sfa;
@@ -121,9 +150,14 @@ static bool run_normal(int64_t M, int64_t N, int64_t K, double max_diff, bool ve
     auto end = std::chrono::high_resolution_clock::now();
     CUDA_CHECK(cudaStreamDestroy(stream));
 
+    if (verbose) {
+        test_utils::inspect_tensor(ref, 25);
+        test_utils::inspect_tensor(out, 25);
+    }
     double diff = calc_diff(ref, out);
     if (verbose) {
         std::cout << "normal shape=" << shape_to_string(out.sizes().vec())
+                  << " out_dtype=" << output_type_to_string(output_dtype)
                   << " kernel_us=" << std::chrono::duration_cast<std::chrono::microseconds>(end - start).count()
                   << " diff=" << diff << "\n";
     }
@@ -253,7 +287,7 @@ int main(int argc, char** argv) {
     Config cfg;
     if (!parse_args(argc, argv, cfg)) {
         std::cerr << "Usage: " << argv[0]
-                  << " --type <normal> [--m M --n N --k K --groups G --max-diff X --verbose]\n";
+                  << " --type <normal> [--m M --n N --k K --groups G --verbose]\n";
         return 1;
     }
 
@@ -269,20 +303,26 @@ int main(int argc, char** argv) {
     int failed = 0;
 
     auto run_one = [&](const TestShape& s) {
-        bool ok = false;
-        if (cfg.type == GemmType::Normal) {
-            ok = run_normal(s.M, s.N, s.K, cfg.max_diff, cfg.verbose);
-        } else {
-            std::cerr << "Unsupported test type in this test binary\n";
-            ok = false;
+        for (c10::ScalarType output_dtype :
+             {c10::ScalarType::Float, c10::ScalarType::BFloat16}) {
+            bool ok = false;
+            if (cfg.type == GemmType::Normal) {
+                ok = run_normal(s.M, s.N, s.K, output_dtype, cfg.verbose);
+            } else {
+                std::cerr << "Unsupported test type in this test binary\n";
+                ok = false;
+            }
+
+            if (ok) ++passed;
+            else ++failed;
+
+            std::cout << (ok ? "[PASSED] " : "[FAILED] ") << type_to_string(cfg.type)
+                      << " M=" << s.M << " N=" << s.N << " K=" << s.K
+                      << " G=" << s.groups
+                      << " C=" << output_type_to_string(output_dtype)
+                      << " max_diff=" << max_diff_for_output_dtype(output_dtype)
+                      << " (" << s.desc << ")\n";
         }
-
-        if (ok) ++passed;
-        else ++failed;
-
-        std::cout << (ok ? "[PASSED] " : "[FAILED] ") << type_to_string(cfg.type)
-                  << " M=" << s.M << " N=" << s.N << " K=" << s.K << " G=" << s.groups
-                  << " (" << s.desc << ")\n";
     };
 
     if (!cfg.all_shapes) {

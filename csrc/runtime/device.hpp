@@ -38,7 +38,11 @@ struct DeviceProps {
         }
 
         size_t get_smem_size() {
-            return get_prop()->sharedMemPerBlock;
+            return get_prop()->sharedMemPerBlockOptin;
+        }
+
+        size_t get_sm_smem_size() {
+            return get_prop()->sharedMemPerMultiprocessor;
         }
 
         // returns portable and nonportable cluster sizes

@@ -228,6 +228,11 @@ class NVCC_Compiler : public Compiler {
         // compile into tmp_cubin_path, and then rename into orig
         std::string command = fmt::format("{} {} -o {} {}", nvcc_path.string(), code_path.string(), tmp_cubin_path.string(), flags);
 
+        if (get_env<int>("JIT_DEBUG", 0) > 0) {
+            printf("Compiling JIT runtime with NVCC options: ");
+            printf("%s", command.c_str());
+            printf("\n");
+        }
         auto [exit_code, output] = run_command(command);
         if (exit_code != 0) {
             printf("NVCC compilation for file %s failed, with output: %s", code_path.string().c_str(), output.c_str());

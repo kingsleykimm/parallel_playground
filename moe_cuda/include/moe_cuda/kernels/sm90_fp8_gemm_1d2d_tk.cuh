@@ -1,26 +1,32 @@
-/*
-  Vanilla FP8 Grouped Gemm
-*/
+/**
+ * @file
+ * @brief: Base Vanilla FP8 GEMM with 1d2d Scaling, assuming K-major inputs and
+ * K-major output. Transpose inputs for major variants
+ **/
 #pragma once
 
-#include "common/common.hpp"
+#include "common/common.cuh"
+#include "common/util.cuh"
 #include "kittens.cuh"
 #include "prototype.cuh"
 using namespace kittens;
 using namespace kittens::prototype;
 using namespace kittens::prototype::lcf;
 
-template <int _BM, int _BN, int _BK> struct matmul_layout {
+template <int _BM, int _BN, int _BK, typename c_dtype> struct matmul_layout {
   static constexpr int BM = _BM, BN = _BN, BK = _BK;
-  static constexpr bool kIsUniformScales = (BN % 128) == 0;
-  using a_tile = st_fp8e4m3<BM, BK>;
+  static constexpr bool kIsUniformScales = (BK % BN) == 0;
+  static_assert(BN >= 32, "TK doesn't support BN < 32 WGMMA");
+  using a_tile =
+      st_fp8e4m3<64, BK>; // this is static, since this has to fit the TK WGMMA
+                          // requirement, see warpgroup.cuh
   using b_tile = st_fp8e4m3<BN, BK>;
-  using c_tile = st<float, BM, BN>;
-  using sfa_tile = sv<float, BM>;
+  using c_tile = st<c_dtype, 64, BN>;
+  using sfa_tile = sv<float, 64>;
   // assume this is k-major here, with shape (N / 128, K / 128)
   using a_layout = gl<fp8e4m3, 1, 1, -1, -1, a_tile>;
   using b_layout = gl<fp8e4m3, 1, 1, -1, -1, b_tile>;
-  using c_layout = gl<float, 1, 1, -1, -1, c_tile>;
+  using c_layout = gl<c_dtype, 1, 1, -1, -1, c_tile>;
 
   // only sfa_tile since this is the only one we do TMA load on
   using scale_a_layout = gl<float, 1, 1, -1, -1, sfa_tile>;
@@ -41,38 +47,39 @@ template <int _BM, int _BN, int _BK> struct matmul_layout {
   struct input_block {
     a_tile a[BM > 64 ? 2 : 1];
     b_tile b;
+    sfa_tile sfa[BM > 64 ? 2 : 1];
   };
 
   struct finish_block {
     c_tile c[BM > 64 ? 2 : 1];
   };
-  struct scratch_block {
-    sfa_tile sfa[BM > 64 ? 2 : 1];
-  };
+  struct scratch_block {};
   struct common_state {
     int2 coord;
   };
   struct consumer_state {
     accum_tile<float> accum;
     accum_tile<float> per_k_accum;
+    int num_former_iters, num_full_iters;
   };
 };
 
 template <int _M, int _N, int _K, int _BM, int _BN, int _BK,
           int NUM_CONSUMER_WARPS_, int NUM_PRODUCER_WARPS_, int NUM_STAGES_,
-          int MAX_SMEM_SIZE, int _SUPER_M = 12>
+          int KERNEL_SMEM_SIZE, typename c_dtype, int _SUPER_M = 12>
 struct matmul_template {
   static constexpr int SUPER_M = _SUPER_M;
   static constexpr int NUM_CONSUMER_WARPS = NUM_CONSUMER_WARPS_;
   static constexpr int NUM_PRODUCER_WARPS = NUM_PRODUCER_WARPS_;
-  static constexpr int NUM_PIPE_STAGES = NUM_STAGES_;
-  static constexpr int MAX_SHARED_MEMORY = MAX_SMEM_SIZE;
+  static constexpr int INPUT_PIPE_STAGES = NUM_STAGES_;
+  static constexpr int MAX_SHARED_MEMORY = KERNEL_SMEM_SIZE;
+  static constexpr int DEBUG = 1;
 
   static_assert(_BN <= 256, "BN is too large");
   static_assert(_BM <= 128, "BM is too large");
 
   static constexpr int NUM_TILES = (_BM + 63) / 64;
-  using layout = matmul_layout<_BM, _BN, _BK>;
+  using layout = matmul_layout<_BM, _BN, _BK, c_dtype>;
 
   template <bool PERSISTENT_GRID = true>
   __host__ static inline dim3 grid(int M, int N, int K) {
@@ -83,8 +90,9 @@ struct matmul_template {
 
   __device__ static inline void common_setup(common_setup_args<layout> args) {
 
-    int Rblocks = args.globals.C.rows() / (NUM_TILES * layout::c_tile::rows),
-        Cblocks = args.globals.C.cols() / layout::c_tile::cols;
+    int Rblocks = ti_ceil_div(args.globals.C.rows(),
+                              NUM_TILES * layout::c_tile::rows),
+        Cblocks = ti_ceil_div(args.globals.C.cols(), layout::c_tile::cols);
     int super_rows = (Rblocks / SUPER_M) * SUPER_M,
         final_rows = Rblocks - super_rows, super_repeat = SUPER_M * Cblocks;
     int task_id = args.task_iter * gridDim.x + blockIdx.x;
@@ -120,8 +128,9 @@ struct matmul_template {
           tma::load_async(args.input.a[i], args.globals.A,
                           {args.common.coord.x + i, args.iter},
                           args.inputs_arrived);
-          tma::load_async(args.scratch.sfa[i], args.globals.scale_a,
-                          {args.common.coord.x + i}, args.input_arrived);
+          tma::load_async(args.input.sfa[i], args.globals.scale_a,
+                          {args.iter, args.common.coord.x + i},
+                          args.inputs_arrived);
         }
         tma::load_async(args.input.b, args.globals.B,
                         {args.common.coord.y, args.iter}, args.inputs_arrived);
@@ -132,7 +141,6 @@ struct matmul_template {
   struct consumer {
 
     using consumers = group<NUM_CONSUMER_WARPS>;
-    static int num_former_iters, num_full_iters;
     static constexpr int shape_k_scales = constexpr_ti_ceil_div(_K, layout::BK);
     static constexpr uint32_t stride_n_sfb = shape_k_scales;
     static constexpr uint32_t stride_k_sfb = 1;
@@ -143,20 +151,28 @@ struct matmul_template {
 
       // need to load in b scales here
       if constexpr (!layout::kIsUniformScales) {
-        num_former_iters = min(
-            layout::BN,
-            (layout::BK - (args.common.coord.y * layout::BN) % layout::BK) / 8);
-        num_full_iters =
-            min(layout::BN, (_N - args.common.coord.y * layout::BN) / 8);
+        args.state.num_former_iters =
+            min(layout::BN, (layout::BK -
+                             (args.common.coord.y * layout::BN) % layout::BK)) /
+            8;
+        args.state.num_full_iters =
+            min(layout::BN, (_N - args.common.coord.y * layout::BN)) / 8;
       } else {
-        num_former_iters = num_full_iters = layout::BN / 8;
+        args.state.num_former_iters = args.state.num_full_iters =
+            layout::BN / 8;
       }
 
       consumers::sync(13);
     }
     __device__ static void compute(consumer_compute_args<layout> args) {
 
+      if constexpr (DEBUG) {
+        if (threadIdx.x == 0 && blockIdx.x == 0) {
+          printf("beginning wgmma \n");
+        }
+      }
       warp::zero(args.state.per_k_accum);
+
       warpgroup::mma_ABt(args.state.per_k_accum,
                          args.input.a[warpgroup::groupid()], args.input.b);
       float *local_sfb =
@@ -168,15 +184,28 @@ struct matmul_template {
 
       move<float>::ldg(b_scale_0, local_sfb);
       if constexpr (!layout::kIsUniformScales) {
-        move<float>::ldg(b_scale_1, local_sfb + (shape_k_scales + args.iter) *
-                                                    stride_k_sfb);
+        if (args.state.num_full_iters > args.state.num_former_iters)
+          move<float>::ldg(b_scale_1,
+                           local_sfb + (shape_k_scales)*stride_k_sfb);
       }
-      warpgroup::mma_async_wait();
 
       // once WGMMA is completed, apply scale promotion from FP22 -> FP32
 
-      warp::mul_row(args.state.per_k_accum, args.state.per_k_accum,
-                    args.scratch.sfa);
+      // col_vec<rt<float, 16, layout::BN>> scale_a;
+      // WGMMA instructions always have that the register tile is row major, so
+      // the scale_a is orthogonal
+      typename decltype(args.state.per_k_accum)::col_vec scale_a_rv;
+      warpgroup::load(scale_a_rv, args.input.sfa[warpgroup::groupid()]);
+      warpgroup::mma_async_wait();
+
+      // if constexpr (DEBUG) {
+      //   if (warpgroup::warpid() == 0 && blockIdx.x == 0 && blockIdx.y == 0 &&
+      //       blockIdx.z == 0) {
+      //     kittens::print(args.state.per_k_accum);
+      //     kittens::print(scale_a_rv);
+      //   }
+      // }
+      warp::mul_row(args.state.per_k_accum, args.state.per_k_accum, scale_a_rv);
       if constexpr (layout::kIsUniformScales) { // single scale case
         args.state.per_k_accum *= b_scale_0;
       } else {
@@ -185,23 +214,43 @@ struct matmul_template {
         for (uint32_t i = 0; i < layout::BN / 16; i++) {
 
           const uint32_t column_chunk = i * 2;
-          float first_scale =
-              column_chunk < num_former_iters ? b_scale_0 : b_scale_1;
-          float second_scale =
-              column_chunk + 1 < num_former_iters ? b_scale_0 : b_scale_1;
+          float first_scale = column_chunk < args.state.num_former_iters
+                                  ? b_scale_0
+                                  : b_scale_1;
+          float second_scale = column_chunk + 1 < args.state.num_former_iters
+                                   ? b_scale_0
+                                   : b_scale_1;
           col_scale_b[i][0] = make_float2(first_scale, first_scale);
           col_scale_b[i][1] = make_float2(second_scale, second_scale);
         }
         warp::mul_col(args.state.per_k_accum, args.state.per_k_accum,
                       col_scale_b);
+        if constexpr (DEBUG) {
+          if (warpgroup::warpid() == 0 && blockIdx.x == 0 && blockIdx.y == 0 &&
+              blockIdx.z == 0 && args.iter == 0) {
+            kittens::print(col_scale_b);
+          }
+          if (warpgroup::laneid() == 0)
+            printf("scales : %f, %f", b_scale_0, b_scale_1);
+        }
       }
 
+      args.state.accum += args.state.per_k_accum;
       if (laneid() == 0)
         arrive(args.inputs_finished);
-
-      args.state.accum += args.state.per_k_accum;
     }
     __device__ static void finish(consumer_finish_args<layout> args) {
+      if constexpr (DEBUG) {
+        if (threadIdx.x == 0 && blockIdx.x == 0) {
+          printf("beginning epilogue, common coord : %d, %d\n",
+                 args.common.coord.x, args.common.coord.y);
+          // if (warpgroup::warpid() == 0 && blockIdx.x == 0 && blockIdx.y == 0
+          // &&
+          //     blockIdx.z == 0) {
+          //   kittens::print(args.state.accum);
+          // }
+        }
+      }
       warpgroup::store(args.finish.c[warpgroup::groupid()], args.state.accum);
       warpgroup::sync(warpgroup::groupid() + 4);
       if (warpgroup::laneid() == 0) {
@@ -216,5 +265,5 @@ struct matmul_template {
 };
 
 // Default instantiation alias for convenience
-using mmt = matmul_template<-1, -1, -1, 64, 128, 128, 8, 1, 4, 12>;
+using mmt = matmul_template<-1, -1, -1, 64, 128, 128, 8, 1, 4, 0, float, 12>;
 using tk_globals_t = typename mmt::layout::globals;

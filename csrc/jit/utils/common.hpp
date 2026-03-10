@@ -22,6 +22,18 @@ template <typename TA, typename TB> __host__ constexpr TA constexpr_host_align(T
   return constexpr_host_ceil_div(a, b) * b;
 }
 
+// mirrors kittens dtypes in common/base_types.cuh
+static std::string to_string(const at::ScalarType& dtype) {
+  switch (dtype) {
+      case torch::kInt:           return "int";
+      case torch::kFloat:         return "float";
+      case torch::kBFloat16:      return "bf16";
+      case torch::kHalf:          return "half";
+      case torch::kFloat8_e4m3fn: return "fp8e4m3";
+      case torch::kFloat8_e5m2:   return "fp8e5m2";
+      default: HOST_ERROR("Unsupported dtype");
+  }
+}
 
 
 

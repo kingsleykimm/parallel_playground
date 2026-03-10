@@ -19,6 +19,13 @@ void fp8_gemm_nt(std::pair<at::Tensor &, at::Tensor &> act,
                    grouped_layout, stream);
 }
 
+void fp8_grouped_gemm_nt(std::pair<at::Tensor &, at::Tensor &> act,
+                          std::pair<at::Tensor &, at::Tensor &> weight,
+                          at::Tensor &output, GemmType gemm_type,
+                          int *grouped_layout, cudaStream_t &stream) {
+  api::fp8_grouped_gemm(act, weight, output, gemm_type, grouped_layout, stream);
+}
+
 void bf16_gemm(at::Tensor &A, at::Tensor &B, std::optional<at::Tensor> &C,
                at::Tensor &D, GemmType gemm_type,
                const std::string &compiled_dims, int *grouped_layout,

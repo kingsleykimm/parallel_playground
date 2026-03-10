@@ -8,7 +8,7 @@
 #include "cutlass/arch/barrier.h"
 #include "cutlass/arch/reg_reconfig.h"
 #include "cutlass/bfloat16.h"
-#include <moe_cuda/kernels/common/common.hpp>
+#include <moe_cuda/kernels/common/common.cuh>
 #include <moe_cuda/kernels/common/sm90_utils.cuh>
 #include <moe_cuda/types.h>
 

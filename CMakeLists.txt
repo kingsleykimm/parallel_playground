@@ -285,6 +285,7 @@ if(BUILD_TESTS)
     set(BASE_TESTS
         test/test_cpp/test_bf16_gemm.cpp
         test/test_cpp/test_fp8.cpp
+        test/test_cpp/test_kernel2.cpp
     )
 
     foreach(TEST_SRC ${BASE_TESTS})

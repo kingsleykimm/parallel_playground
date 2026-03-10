@@ -5,45 +5,46 @@
 #include <jit_kernels/heuristics/sm90_arch.hpp>
 
 
-inline SharedMemoryConfig get_smem_config(const GemmType& gemm_type, c10::ScalarType AB_type,
-c10::ScalarType CD_type, const int & m, const int & n, const int &k,
-const int& block_m, const int& block_n, const int & block_k,
-Major major_a, Major major_b, const int & num_stages) {
+// Computes the shared memory size required by the TK LCF kernel for a given tile config.
+//
+// TK LCF smem layout (from lcf.cuh):
+//   [0, scratch_alloc_size)                           : scratch_alloc_block
+//   [scratch_alloc_size, scratch + stages*input)      : input_alloc_block[INPUT_PIPE_STAGES]
+//   [(MAX_SHARED_MEMORY-1024) - sizeof(finish_block)) : finish_block  (fixed high-water offset)
+//
+// matmul_layout<BM, BN, BK, c_dtype>:
+//   scratch_block    = {}  (empty) -> padder<{}, 1024> = 1024 bytes
+//   input_block      = { st_fp8e4m3<64,BK> a[tiles]; st_fp8e4m3<BN,BK> b; sv<float,64> sfa[tiles]; }
+//   finish_block     = { st<c_dtype, 64, BN> c[tiles]; }
+//   where tiles = (BM > 64) ? 2 : 1,  a_tile height is always 64 (not BM)
+//
+// Setting MAX_SHARED_MEMORY = smem_size and allocating exactly that many bytes ensures
+// the finish_block lands at (smem_size - 1024 - sizeof(finish_block)), non-overlapping
+// with the input pipeline stages, and SAFE_STAGES_BETWEEN_BLOCKS == INPUT_PIPE_STAGES.
+inline int get_tk_lcf_smem_size(
+    const int block_m, const int block_n, const int block_k,
+    const int num_stages, const size_t cd_size
+) {
+    const int num_tiles = (block_m > 64) ? 2 : 1;
 
-    const size_t& ab_size = get_type_size(AB_type);
-    const size_t& cd_size = get_type_size(CD_type);
+    // scratch_alloc_block: padder<empty, 1024> — 1024 bytes regardless of content
+    const int scratch_alloc_size = 1024;
 
-    const int& load_block_m = SM90Arch::get_a_load_m(block_m);
-    const int& load_block_n = SM90Arch::get_b_load_n(block_n);
-    const int& load_block_k = 128;
+    // input_block raw bytes: a_tile[num_tiles] + b_tile + sfa_tile[num_tiles]
+    //   a_tile = st_fp8e4m3<64, BK>  : 64 * BK bytes  (fp8 = 1 byte)
+    //   b_tile = st_fp8e4m3<BN, BK>  : BN * BK bytes
+    //   sfa_tile = sv<float, 64>     : 64 * 4 bytes
+    const int input_block_bytes = num_tiles * 64 * block_k
+                                + block_n * block_k
+                                + num_tiles * 64 * (int)sizeof(float);
+    const int input_alloc_size = host_align(input_block_bytes, 1024);
 
-    // swizzle modes
-    const int& swizzle_a_mode = get_swizzle_mode(major_a == Major::K ? block_k : block_m, ab_size);
-    const int& swizzle_b_mode = get_swizzle_mode(major_b == Major::K ? block_k : block_n, cd_size);
-    const int& swizzle_cd_mode = SM90Arch::should_cd_swizzle(CD_type) ? get_swizzle_mode(block_n, cd_size) : 0;
+    // finish_block: c_tile[num_tiles] where c_tile = st<c_dtype, 64, BN>
+    const int finish_block_size = num_tiles * 64 * block_n * (int)cd_size;
 
-    const int& smem_cd_size = SM90Arch::get_smem_cd_size(block_m, block_n, CD_type);
-    const int& smem_a_size_per_stage = load_block_m * load_block_k * ab_size;
-    const int& smem_b_size_per_stage = load_block_n * load_block_k * ab_size;
-
-    const int& shape_k_scales = host_ceil_div(k, block_k);
-    const int& smem_sf_size_per_stage = host_align(block_m * sizeof(float) + shape_k_scales * sizeof(float) * (block_k % block_n != 0 ? 2 : 1), 16);
-
-    const int& smem_barrier_size_per_stage = SM90Arch::get_barrier_size();
-
-    int smem_size = 0;
-    smem_size += smem_cd_size;
-    smem_size += (smem_a_size_per_stage +
-                smem_b_size_per_stage +
-                smem_sf_size_per_stage +
-                smem_barrier_size_per_stage) * num_stages + 1024;
-
-    return SharedMemoryConfig {
-        .smem_size = smem_size,
-        .swizzle_a_mode = swizzle_a_mode,
-        .swizzle_b_mode = swizzle_b_mode,
-        .swizzle_cd_mode = swizzle_cd_mode
-    };
+    // Total: scratch | stages*input | gap | finish — +2*1024 ensures
+    // SAFE_STAGES_BETWEEN_BLOCKS == num_stages (producer never stalls on finish_finished).
+    return scratch_alloc_size + num_stages * input_alloc_size + finish_block_size + 2 * 1024;
 }
 
 inline GemmConfig search_configs(
@@ -147,20 +148,16 @@ inline GemmConfig search_configs(
     // multicast config is complete, move to shared
     const auto& [num_tma_threads, num_math_threads] = SM90Arch::get_num_threads(best_block_m);
 
-    // Shared Memory Config
+    // Shared Memory Config — use TK LCF layout (not the generic heuristic model)
     constexpr int smem_capacity = SM90Arch::kMaxSharedMemoryPerBlock;
     SharedMemoryConfig smem_config;
     int best_num_stages = 0;
-    for (int num_stages = 32; num_stages > 0; num_stages--) {
-        if (!SM90Arch::is_num_stages_legal(AB_type, num_stages, best_block_n, 128))
-            continue;
-
-        smem_config = get_smem_config(gemm_type, AB_type, CD_type, M, N,
-            K, best_block_m, best_block_n, block_k, AMajor, BMajor, num_stages);
-
-        // use the largest stage possible that fits in smem capacity, 1024 for padding
-        if (smem_config.smem_size  <= smem_capacity) {
+    const size_t cd_size = get_type_size(CD_type);
+    for (int num_stages = 16; num_stages > 0; num_stages--) {
+        int smem_size = get_tk_lcf_smem_size(best_block_m, best_block_n, block_k, num_stages, cd_size);
+        if (smem_size <= smem_capacity) {
             best_num_stages = num_stages;
+            smem_config.smem_size = smem_size;
             break;
         }
     }

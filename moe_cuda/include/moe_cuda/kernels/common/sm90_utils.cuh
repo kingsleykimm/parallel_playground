@@ -16,7 +16,7 @@ https://github.com/deepseek-ai/DeepGEMM/blob/main/deep_gemm/include/deep_gemm/co
 // #include <cutlass/numeric_types.h>
 // #include <cutlass/pipeline/sm90_pipeline.hpp>
 
-#include <moe_cuda/kernels/common/common.hpp>
+#include <moe_cuda/kernels/common/common.cuh>
 // #include <moe_cuda/types.h>
 
 // template <int N_, typename MMA> struct FP8MMA {

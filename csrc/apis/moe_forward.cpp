@@ -32,6 +32,16 @@ void fp8_gemm_nt(
     kernels::fp8_gemm_nt(act, weight, output, gemm_type, compiled_dims, grouped_layout, stream);
 }
 
+void fp8_grouped_gemm_nt(
+    std::pair<at::Tensor&, at::Tensor&> act,
+    std::pair<at::Tensor&, at::Tensor&> weight,
+    at::Tensor& output,
+    GemmType gemm_type,
+    int* grouped_layout,
+    cudaStream_t& stream) {
+    kernels::fp8_grouped_gemm_nt(act, weight, output, gemm_type, grouped_layout, stream);
+}
+
 #ifdef MOE_CUDA_USE_MPI
 void a2a_dispatch(
     All2All& all2all,

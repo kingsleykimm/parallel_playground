@@ -33,7 +33,7 @@ struct SM90Arch {
   static std::vector<int> get_block_n_candidates(uint32_t & n, Major major) {
       // the n direction has more flexibility - the range of values is from 8 - 256, but there's almost no reason to begin at 8
     std::vector<int> candidates;
-    for (uint32_t block_n = 16; block_n <= 256; block_n += 16) {
+    for (uint32_t block_n : {32, 64, 96, 128, 160, 192, 224, 256}) { // for TK only up to BN = 32 is supported
         candidates.push_back(block_n);
     }
     return candidates;

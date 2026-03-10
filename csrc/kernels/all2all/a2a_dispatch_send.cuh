@@ -7,7 +7,7 @@ ones
 #include "a2a_kernels.h"
 #include <cooperative_groups.h>
 #include <cuda.h>
-#include <moe_cuda/kernels/common/common.hpp>
+#include <moe_cuda/kernels/common/common.cuh>
 #include <moe_cuda/kernels/common/launch_utils.cuh>
 #include <moe_cuda/kernels/common/sm90_utils.cuh>
 #include <runtime/utils.h>
