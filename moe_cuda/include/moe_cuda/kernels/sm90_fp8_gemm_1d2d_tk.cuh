@@ -71,6 +71,7 @@ struct matmul_template {
   static constexpr int SUPER_M = _SUPER_M;
   static constexpr int NUM_CONSUMER_WARPS = NUM_CONSUMER_WARPS_;
   static constexpr int NUM_PRODUCER_WARPS = NUM_PRODUCER_WARPS_;
+  static constexpr int PRODUCER_BARRIER_ARRIVALS = 1;
   static constexpr int INPUT_PIPE_STAGES = NUM_STAGES_;
   static constexpr int MAX_SHARED_MEMORY = KERNEL_SMEM_SIZE;
   static constexpr int DEBUG = 1;
@@ -166,11 +167,11 @@ struct matmul_template {
     }
     __device__ static void compute(consumer_compute_args<layout> args) {
 
-      if constexpr (DEBUG) {
-        if (threadIdx.x == 0 && blockIdx.x == 0) {
-          printf("beginning wgmma \n");
-        }
-      }
+      // if constexpr (DEBUG) {
+      //   if (threadIdx.x == 0 && blockIdx.x == 0) {
+      //     printf("beginning wgmma \n");
+      //   }
+      // }
       warp::zero(args.state.per_k_accum);
 
       warpgroup::mma_ABt(args.state.per_k_accum,
@@ -225,14 +226,15 @@ struct matmul_template {
         }
         warp::mul_col(args.state.per_k_accum, args.state.per_k_accum,
                       col_scale_b);
-        if constexpr (DEBUG) {
-          if (warpgroup::warpid() == 0 && blockIdx.x == 0 && blockIdx.y == 0 &&
-              blockIdx.z == 0 && args.iter == 0) {
-            kittens::print(col_scale_b);
-          }
-          if (warpgroup::laneid() == 0)
-            printf("scales : %f, %f", b_scale_0, b_scale_1);
-        }
+        // if constexpr (DEBUG) {
+        //   if (warpgroup::warpid() == 0 && blockIdx.x == 0 && blockIdx.y == 0
+        //   &&
+        //       blockIdx.z == 0 && args.iter == 0) {
+        //     kittens::print(col_scale_b);
+        //   }
+        //   if (warpgroup::laneid() == 0)
+        //     printf("scales : %f, %f", b_scale_0, b_scale_1);
+        // }
       }
 
       args.state.accum += args.state.per_k_accum;
@@ -240,17 +242,18 @@ struct matmul_template {
         arrive(args.inputs_finished);
     }
     __device__ static void finish(consumer_finish_args<layout> args) {
-      if constexpr (DEBUG) {
-        if (threadIdx.x == 0 && blockIdx.x == 0) {
-          printf("beginning epilogue, common coord : %d, %d\n",
-                 args.common.coord.x, args.common.coord.y);
-          // if (warpgroup::warpid() == 0 && blockIdx.x == 0 && blockIdx.y == 0
-          // &&
-          //     blockIdx.z == 0) {
-          //   kittens::print(args.state.accum);
-          // }
-        }
-      }
+      // if constexpr (DEBUG) {
+      //   if (threadIdx.x == 0 && blockIdx.x == 0) {
+      //     printf("beginning epilogue, common coord : %d, %d\n",
+      //            args.common.coord.x, args.common.coord.y);
+      //     // if (warpgroup::warpid() == 0 && blockIdx.x == 0 && blockIdx.y ==
+      //     0
+      //     // &&
+      //     //     blockIdx.z == 0) {
+      //     //   kittens::print(args.state.accum);
+      //     // }
+      //   }
+      // }
       warpgroup::store(args.finish.c[warpgroup::groupid()], args.state.accum);
       warpgroup::sync(warpgroup::groupid() + 4);
       if (warpgroup::laneid() == 0) {

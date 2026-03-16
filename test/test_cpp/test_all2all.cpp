@@ -1,415 +1,742 @@
 /*
- * moe_cuda::All2All Dispatch/Combine Testing Harness (MPI)
+ * TK-backed moe_cuda::All2All dispatch test harness.
  *
- * Tests the moe_cuda::All2All dispatch and combine operations across multiple GPUs
- * using MPI for process management. Each MPI rank maps to one GPU.
- *
- * Usage:
- *   mpirun -np 4 ./test_all2all          # EP=4
- *   mpirun -np 2 ./test_all2all          # EP=2
- *   mpirun -np 1 ./test_all2all          # EP=1
- *   mpirun -np 4 ./test_all2all --verbose
+ * The TK path is currently single-node and 4-GPU specific, so this test
+ * launches one child process per local rank and validates dispatch routing
+ * against a deterministic CPU oracle.
  */
 
-#include <chrono>
+#include <sys/mman.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include <array>
+#include <algorithm>
+#include <cstdint>
+#include <unordered_set>
+#include <cstdlib>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <iostream>
-#include <numeric>
-#include <random>
+#include <optional>
+#include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
-#include <cuda_bf16.h>
 #include <cuda_runtime.h>
-#include <mpi.h>
 #include <torch/torch.h>
 
 #include "test_utils.h"
-#include <all2all/all2all.hpp>
-#include <runtime/kernels_api.h>
+#include <all2all/all2all_tk.hpp>
 #include <runtime/parallel.h>
 
-using test_utils::check_tensor_close;
-using test_utils::shape_to_string;
+namespace {
 
-struct All2AllTestConfig {
-    uint32_t num_experts;
+constexpr int kWorldSize = 4;
+constexpr int kNumExperts = 512;
+
+struct TestCase {
+    const char* name;
     uint32_t num_tokens;
     uint32_t hidden_dim;
-    uint32_t num_experts_per_token;
+    uint32_t top_k;
     uint32_t expert_padding;
-    c10::ScalarType dtype;
-    bool verbose;
 };
 
-// ============================================================================
-// Helpers
-// ============================================================================
+std::vector<TestCase> kCases = {{
+    // {"topk1_h128", 128, 128, 1, 16},
+    // {"topk2_h256", 64, 256, 2, 16},
+    {"topk10_h2048", 8192, 2048, 10, 128},
+    {"topk12_h2048", 4096, 2048, 12, 128}
+}};
 
-static void log_rank(int rank, const std::string& msg) {
-    std::cout << "[Rank " << rank << "] " << msg << std::endl;
+struct RankResult {
+    int passed;
+    char message[512];
+};
+
+struct SharedResults {
+    RankResult results[kWorldSize];
+};
+
+struct OracleBundle {
+    std::vector<torch::Tensor> input_fp8_cpu;
+    std::vector<torch::Tensor> input_scale_cpu;
+    std::vector<torch::Tensor> input_dequant_cpu;
+    std::vector<torch::Tensor> indices_cpu;
+    std::vector<torch::Tensor> weights_cpu;
+    std::vector<torch::Tensor> expected_expert_x_cpu;
+    std::vector<torch::Tensor> expected_expert_x_scale_cpu;
+    std::vector<torch::Tensor> expected_counts_cpu;
+    std::vector<torch::Tensor> expected_expert_x_dequant_cpu;
+    std::vector<torch::Tensor> expected_source_rank_cpu;
+    std::vector<torch::Tensor> expected_source_dispatch_offset_cpu;
+    std::vector<torch::Tensor> expected_combine_send_offset_cpu;
+    std::vector<torch::Tensor> expected_padded_index_cpu;
+    std::vector<torch::Tensor> route_positions_cpu;
+    std::vector<uint32_t> expected_num_recv_tokens;
+    uint32_t max_private_tokens = 0;
+    uint32_t max_recv_tokens = 0;
+    torch::Tensor expected_num_routed_cpu;
+};
+
+struct SourceRouteRef {
+    uint32_t token;
+    uint32_t route;
+    uint32_t source_local_offset;
+};
+
+uint32_t align_to(uint32_t value, uint32_t alignment) {
+    return ((value + alignment - 1) / alignment) * alignment;
 }
 
-// ============================================================================
-// Dispatch Test
-// ============================================================================
+uint32_t compute_max_private_tokens(const TestCase& cfg) {
+    const uint32_t num_local_experts = (kNumExperts + kWorldSize - 1) / kWorldSize;
+    const uint32_t avg_tokens_per_expert = static_cast<uint32_t>(
+        ((cfg.num_tokens * cfg.top_k + kNumExperts - 1) / kNumExperts) * 1.2f);
+    return avg_tokens_per_expert * num_local_experts;
+}
 
-bool test_dispatch(
-    int rank,
-    int world_size,
-    moe_cuda::All2All& all2all,
-    const All2AllTestConfig& config,
-    cudaStream_t stream,
-    // outputs used by combine test
-    torch::Tensor& out_indices_torch,
-    torch::Tensor& out_weights_torch,
-    torch::Tensor& out_expert_x_torch,
-    torch::Tensor& out_expert_num_tokens_torch,
-    torch::Tensor& out_dp_x_torch
-) {
-    if (rank == 0) {
-        std::cout << "\n--- Testing a2a_dispatch (EP=" << world_size
-                  << ", num_tokens=" << config.num_tokens
-                  << ", num_experts=" << config.num_experts
-                  << ", hidden_dim=" << config.hidden_dim
-                  << ", top_k=" << config.num_experts_per_token
-                  << ") ---\n";
+uint32_t compute_max_recv_tokens(const TestCase& cfg) {
+    const uint32_t num_local_experts = (kNumExperts + kWorldSize - 1) / kWorldSize;
+    const uint32_t num_dp_groups = kWorldSize;
+    const uint32_t max_private_tokens = compute_max_private_tokens(cfg);
+    const uint32_t num_tokens = cfg.num_tokens * num_dp_groups;
+
+    uint32_t max_recv_tokens = max_private_tokens * num_dp_groups;
+    max_recv_tokens += align_to(
+        std::max(
+            std::min(
+                num_tokens * cfg.top_k + num_local_experts * (cfg.expert_padding - 1),
+                num_local_experts * num_tokens),
+            num_local_experts * cfg.expert_padding),
+        cfg.expert_padding);
+    return max_recv_tokens;
+}
+
+// Returns random float32 input seeded by rank (call torch::manual_seed before use).
+torch::Tensor make_float_input_cpu(const TestCase& cfg, int /*rank*/) {
+    return torch::randn(
+        {static_cast<int64_t>(cfg.num_tokens), static_cast<int64_t>(cfg.hidden_dim)},
+        torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU));
+}
+
+// Random top-k indices via scores: each expert gets an uneven, non-uniform share.
+torch::Tensor make_indices_cpu(const TestCase& cfg, int /*rank*/) {
+    auto scores = torch::randn(
+        {static_cast<int64_t>(cfg.num_tokens), kNumExperts},
+        torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU));
+    scores = scores.abs() + 1.0f;
+    auto topk = torch::topk(scores, static_cast<int64_t>(cfg.top_k), /*dim=*/-1,
+                             /*largest=*/true, /*sorted=*/true);
+    return std::get<1>(topk).to(torch::kUInt32);
+}
+
+// Random weights normalized to sum to 1 per token.
+torch::Tensor make_weights_cpu(const TestCase& cfg) {
+    auto w = torch::rand(
+        {static_cast<int64_t>(cfg.num_tokens), static_cast<int64_t>(cfg.top_k)},
+        torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU));
+    return w / w.sum(/*dim=*/-1, /*keepdim=*/true);
+}
+
+torch::Tensor dequantize_fp8_blocks(const torch::Tensor& fp8,
+                                    const torch::Tensor& scales) {
+    auto fp32 = fp8.to(torch::kFloat32).contiguous();
+    auto out = torch::empty_like(fp32);
+    const int64_t hidden_dim = fp32.size(1);
+    const int64_t num_blocks = hidden_dim / 128;
+    for (int64_t block = 0; block < num_blocks; ++block) {
+        auto values = fp32.slice(1, block * 128, (block + 1) * 128);
+        auto block_scale = scales.slice(1, block, block + 1);
+        out.slice(1, block * 128, (block + 1) * 128)
+            .copy_(values * block_scale);
+    }
+    return out;
+}
+
+OracleBundle build_oracle(const TestCase& cfg) {
+    OracleBundle oracle;
+    oracle.max_private_tokens = compute_max_private_tokens(cfg);
+    oracle.max_recv_tokens = compute_max_recv_tokens(cfg);
+
+    oracle.input_fp8_cpu.reserve(kWorldSize);
+    oracle.input_scale_cpu.reserve(kWorldSize);
+    oracle.input_dequant_cpu.reserve(kWorldSize);
+    oracle.indices_cpu.reserve(kWorldSize);
+    oracle.weights_cpu.reserve(kWorldSize);
+    oracle.expected_expert_x_cpu.reserve(kWorldSize);
+    oracle.expected_expert_x_scale_cpu.reserve(kWorldSize);
+    oracle.expected_counts_cpu.reserve(kWorldSize);
+    oracle.expected_expert_x_dequant_cpu.reserve(kWorldSize);
+    oracle.expected_source_rank_cpu.reserve(kWorldSize);
+    oracle.expected_source_dispatch_offset_cpu.reserve(kWorldSize);
+    oracle.expected_combine_send_offset_cpu.reserve(kWorldSize);
+    oracle.expected_padded_index_cpu.reserve(kWorldSize);
+    oracle.route_positions_cpu.reserve(kWorldSize);
+    oracle.expected_num_recv_tokens.reserve(kWorldSize);
+
+    const uint32_t experts_per_rank = kNumExperts / kWorldSize;
+    std::vector<std::vector<uint32_t>> routed_count_by_source(
+        kWorldSize, std::vector<uint32_t>(kNumExperts, 0));
+    std::vector<std::vector<std::vector<SourceRouteRef>>> routes_by_source(
+        kWorldSize, std::vector<std::vector<SourceRouteRef>>(kNumExperts));
+
+    for (int rank = 0; rank < kWorldSize; ++rank) {
+        // Reproducible per-rank seed: different ranks get different data,
+        // same seed every run so the oracle is consistent across processes.
+        torch::manual_seed(static_cast<uint64_t>(rank) * 98761 + 42);
+        auto input_cpu = make_float_input_cpu(cfg, rank);
+        auto [fp8_cpu, scale_cpu] = test_utils::quantize_fp8_1d_block(
+            input_cpu, Major::K, torch::Device(torch::kCPU));
+        oracle.input_fp8_cpu.push_back(fp8_cpu.contiguous());
+        oracle.input_scale_cpu.push_back(scale_cpu.contiguous());
+        oracle.input_dequant_cpu.push_back(
+            dequantize_fp8_blocks(oracle.input_fp8_cpu.back(), oracle.input_scale_cpu.back()));
+        oracle.indices_cpu.push_back(make_indices_cpu(cfg, rank));
+        oracle.weights_cpu.push_back(make_weights_cpu(cfg));
+        oracle.route_positions_cpu.push_back(torch::full(
+            {static_cast<int64_t>(cfg.num_tokens), static_cast<int64_t>(cfg.top_k)}, -1,
+            torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU)));
+
+        auto indices = oracle.indices_cpu.back().accessor<uint32_t, 2>();
+        std::vector<uint32_t> expert_offsets(kNumExperts, 0);
+        std::vector<uint32_t> routed_seen(kNumExperts, 0);
+
+        for (uint32_t token = 0; token < cfg.num_tokens; ++token) {
+            for (uint32_t route = 0; route < cfg.top_k; ++route) {
+                routed_count_by_source[rank][indices[token][route]] += 1;
+            }
+        }
+
+        uint32_t running_offset = 0;
+        for (int expert = 0; expert < kNumExperts; ++expert) {
+            expert_offsets[expert] = running_offset;
+            running_offset += routed_count_by_source[rank][expert];
+        }
+
+        for (uint32_t token = 0; token < cfg.num_tokens; ++token) {
+            for (uint32_t route = 0; route < cfg.top_k; ++route) {
+                const uint32_t expert = indices[token][route];
+                routes_by_source[rank][expert].push_back(SourceRouteRef{
+                    token,
+                    route,
+                    expert_offsets[expert] + routed_seen[expert]++,
+                });
+            }
+        }
     }
 
-    try {
-        torch::Device device(torch::kCUDA, rank);
-        auto bf16_opts = torch::TensorOptions().dtype(torch::kBFloat16).device(device);
-        auto f32_opts = torch::TensorOptions().dtype(torch::kFloat32).device(device);
-        auto i32_opts = torch::TensorOptions().dtype(torch::kInt32).device(device);
+    {
+        auto t = torch::zeros(
+            {static_cast<int64_t>(kWorldSize * kNumExperts)},
+            torch::TensorOptions().dtype(torch::kUInt32).device(torch::kCPU));
+        auto acc = t.accessor<uint32_t, 1>();
+        for (int dp_group = 0; dp_group < kWorldSize; ++dp_group)
+            for (int expert = 0; expert < kNumExperts; ++expert)
+                acc[dp_group * kNumExperts + expert] =
+                    routed_count_by_source[dp_group][expert];
+        oracle.expected_num_routed_cpu = t.contiguous();
+    }
 
-        // Create input tokens (num_tokens, hidden_dim) in BF16
-        torch::Tensor dp_x_torch = torch::randn(
-            {(int64_t)config.num_tokens, (int64_t)config.hidden_dim}, bf16_opts);
+    for (int target_rank = 0; target_rank < kWorldSize; ++target_rank) {
+        const int32_t first_local_expert = target_rank * experts_per_rank;
+        auto counts = torch::zeros(
+            {static_cast<int64_t>(experts_per_rank)},
+            torch::TensorOptions().dtype(torch::kUInt32).device(torch::kCPU));
+        auto counts_acc = counts.accessor<uint32_t, 1>();
 
-        // Create expert indices (num_tokens, num_experts_per_token) in INT32
-        // Values in [0, num_experts)
-        torch::Tensor indices_torch = torch::randint(
-            0, (int64_t)config.num_experts,
-            {(int64_t)config.num_tokens, (int64_t)config.num_experts_per_token}, i32_opts);
-
-        // Create routing weights (num_tokens, num_experts_per_token) in FP32
-        torch::Tensor weights_torch = torch::rand(
-            {(int64_t)config.num_tokens, (int64_t)config.num_experts_per_token}, f32_opts);
-        // Normalize weights per token
-        weights_torch = weights_torch / weights_torch.sum(/*dim=*/1, /*keepdim=*/true);
-
-        // Compute number of local experts for this rank
-        uint32_t num_local_experts = (config.num_experts + world_size - 1) / world_size;
-
-        // Compute max recv tokens for output buffer sizing
-        uint32_t avg_tokens_per_expert = (uint32_t)std::ceil(
-            (float)(config.num_tokens * config.num_experts_per_token) / config.num_experts * 1.2f);
-        uint32_t max_recv_tokens = avg_tokens_per_expert * num_local_experts * world_size;
-        max_recv_tokens += std::max(
-            std::min((uint32_t)(config.num_tokens * world_size * config.num_experts_per_token
-                + num_local_experts * (config.expert_padding - 1)),
-                num_local_experts * config.num_tokens * (uint32_t)world_size),
-            num_local_experts * config.expert_padding);
-        // Align to expert_padding
-        max_recv_tokens = ((max_recv_tokens + config.expert_padding - 1) / config.expert_padding) * config.expert_padding;
-
-        // Pre-allocate output buffers
-        torch::Tensor expert_x_torch = torch::zeros(
-            {(int64_t)max_recv_tokens, (int64_t)config.hidden_dim}, bf16_opts);
-        torch::Tensor expert_num_tokens_torch = torch::zeros(
-            {(int64_t)num_local_experts}, i32_opts);
-
-        // Convert to custom tensors
-        at::Tensor dp_x = (dp_x_torch);
-        at::Tensor indices = (indices_torch);
-        at::Tensor weights = (weights_torch);
-        at::Tensor out_expert_x = (expert_x_torch);
-        at::Tensor out_expert_num_tokens = (expert_num_tokens_torch);
-
-        std::optional<at::Tensor> out_expert_x_scale = std::nullopt;
-        std::optional<at::Tensor> dp_x_scale = std::nullopt;
-        std::optional<at::Tensor> bound_m = std::nullopt;
-
-        // Call dispatch
-        moe_cuda::kernels::a2a_dispatch(
-            all2all,
-            out_expert_num_tokens, out_expert_x, out_expert_x_scale,
-            dp_x, dp_x_scale, indices, weights, bound_m,
-            true, true, stream);
-
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-
-        // Verification: check that expert_num_tokens sums correctly
-        // Gather all expert_num_tokens across ranks to verify total token count
-        torch::Tensor num_tokens_cpu = expert_num_tokens_torch.to(torch::kCPU).to(torch::kInt32);
-        int32_t local_total = 0;
-        auto num_tokens_acc = num_tokens_cpu.accessor<int32_t, 1>();
-        for (int64_t i = 0; i < num_tokens_cpu.size(0); i++) {
-            local_total += num_tokens_acc[i];
-        }
-
-        // Sum across all ranks
-        int32_t global_total = 0;
-        MPI_Allreduce(&local_total, &global_total, 1, MPI_INT32_T, MPI_SUM, MPI_COMM_WORLD);
-
-        // Expected: each rank sends num_tokens * num_experts_per_token token-expert assignments
-        int32_t expected_total = config.num_tokens * config.num_experts_per_token * world_size;
-
-        bool count_passed = (global_total == expected_total);
-        if (rank == 0) {
-            std::cout << "Token count check: global_total=" << global_total
-                      << " expected=" << expected_total;
-            if (count_passed) {
-                std::cout << " \033[0;32m[PASSED]\033[0m\n";
-            } else {
-                std::cout << " \033[0;31m[FAILED]\033[0m\n";
+        for (int source_rank = 0; source_rank < kWorldSize; ++source_rank) {
+            for (uint32_t local_expert = 0; local_expert < experts_per_rank; ++local_expert) {
+                counts_acc[local_expert] += routed_count_by_source[source_rank]
+                                                          [first_local_expert + local_expert];
             }
         }
 
-        if (config.verbose) {
-            log_rank(rank, "Local expert token counts:");
-            for (int64_t i = 0; i < num_tokens_cpu.size(0); i++) {
-                std::cout << "  expert[" << i << "] = " << num_tokens_acc[i] << "\n";
+        std::vector<int32_t> dst_group_offset(kWorldSize, 0);
+        int32_t num_recv_tokens = 0;
+        for (int peer_group = 0; peer_group < kWorldSize; ++peer_group) {
+            for (uint32_t local_expert = 0; local_expert < experts_per_rank; ++local_expert) {
+                num_recv_tokens += routed_count_by_source[peer_group]
+                                                        [first_local_expert + local_expert];
+            }
+            for (int expert = 0; expert < first_local_expert; ++expert) {
+                dst_group_offset[peer_group] += routed_count_by_source[peer_group][expert];
             }
         }
+        oracle.expected_num_recv_tokens.push_back(static_cast<uint32_t>(num_recv_tokens));
 
-        // Store outputs for combine test
-        out_indices_torch = indices_torch;
-        out_weights_torch = weights_torch;
-        out_expert_x_torch = expert_x_torch;
-        out_expert_num_tokens_torch = expert_num_tokens_torch;
-        out_dp_x_torch = dp_x_torch;
+        std::vector<int32_t> padded_offsets(experts_per_rank, 0);
+        for (uint32_t local_expert = 0; local_expert < experts_per_rank; ++local_expert) {
+            padded_offsets[local_expert] =
+                local_expert == 0
+                    ? 0
+                    : padded_offsets[local_expert - 1] +
+                          align_to(counts_acc[local_expert - 1], cfg.expert_padding);
+        }
 
-        return count_passed;
-    } catch (const std::exception& e) {
-        std::cerr << "\033[0;31m[Rank " << rank << "] Dispatch error: " << e.what() << "\033[0m\n";
+        auto expert_x = torch::zeros(
+            {static_cast<int64_t>(oracle.max_recv_tokens), static_cast<int64_t>(cfg.hidden_dim)},
+            torch::TensorOptions().dtype(torch::kFloat8_e4m3fn).device(torch::kCPU));
+        auto expert_x_scale = torch::zeros(
+            {static_cast<int64_t>(oracle.max_recv_tokens),
+             static_cast<int64_t>(cfg.hidden_dim / 128)},
+            torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU));
+        auto source_rank = torch::empty(
+            {static_cast<int64_t>(num_recv_tokens)},
+            torch::TensorOptions().dtype(torch::kUInt32).device(torch::kCPU));
+        auto source_dispatch_offset = torch::empty(
+            {static_cast<int64_t>(num_recv_tokens)},
+            torch::TensorOptions().dtype(torch::kUInt32).device(torch::kCPU));
+        auto combine_send_offset = torch::empty(
+            {static_cast<int64_t>(num_recv_tokens)},
+            torch::TensorOptions().dtype(torch::kUInt32).device(torch::kCPU));
+        auto padded_index = torch::empty(
+            {static_cast<int64_t>(num_recv_tokens)},
+            torch::TensorOptions().dtype(torch::kUInt32).device(torch::kCPU));
+        std::vector<int32_t> seen_per_expert(experts_per_rank, 0);
+        std::vector<int32_t> src_dispatch_count(kWorldSize, 0);
+        std::vector<int32_t> src_combine_count(kWorldSize, 0);
+        auto source_rank_acc = source_rank.accessor<uint32_t, 1>();
+        auto source_dispatch_offset_acc = source_dispatch_offset.accessor<uint32_t, 1>();
+        auto combine_send_offset_acc = combine_send_offset.accessor<uint32_t, 1>();
+        auto padded_index_acc = padded_index.accessor<uint32_t, 1>();
+        int32_t next_recv_slot = 0;
+
+        auto route_group = [&](int peer_group, bool is_self_group) {
+            auto positions = oracle.route_positions_cpu[peer_group].accessor<int32_t, 2>();
+            for (uint32_t local_expert = 0; local_expert < experts_per_rank; ++local_expert) {
+                const int32_t expert = first_local_expert + local_expert;
+                for (const auto& entry : routes_by_source[peer_group][expert]) {
+                    const int32_t position =
+                        padded_offsets[local_expert] + seen_per_expert[local_expert]++;
+                    source_rank_acc[next_recv_slot] = static_cast<uint32_t>(peer_group);
+                    if (is_self_group) {
+                        source_dispatch_offset_acc[next_recv_slot] =
+                            static_cast<uint32_t>(entry.source_local_offset);
+                        combine_send_offset_acc[next_recv_slot] =
+                            static_cast<uint32_t>(entry.source_local_offset);
+                    } else {
+                        const int32_t index_on_rank = src_dispatch_count[peer_group]++;
+                        if (index_on_rank < static_cast<int32_t>(oracle.max_private_tokens)) {
+                            source_dispatch_offset_acc[next_recv_slot] =
+                                static_cast<uint32_t>(oracle.max_private_tokens * peer_group) +
+                                static_cast<uint32_t>(index_on_rank);
+                        } else {
+                            source_dispatch_offset_acc[next_recv_slot] =
+                                static_cast<uint32_t>(dst_group_offset[peer_group] + index_on_rank) |
+                                (1u << 31);
+                        }
+                        combine_send_offset_acc[next_recv_slot] =
+                            static_cast<uint32_t>(
+                                dst_group_offset[peer_group] + src_combine_count[peer_group]++);
+                    }
+                    padded_index_acc[next_recv_slot] = static_cast<uint32_t>(position);
+                    expert_x[position].copy_(oracle.input_fp8_cpu[peer_group][entry.token]);
+                    expert_x_scale[position].copy_(
+                        oracle.input_scale_cpu[peer_group][entry.token]);
+                    positions[entry.token][entry.route] = position;
+                    next_recv_slot += 1;
+                }
+            }
+        };
+
+        for (int local_group = 1; local_group < kWorldSize; ++local_group) {
+            route_group((target_rank + local_group) % kWorldSize, false);
+        }
+        route_group(target_rank, true);
+
+        if (next_recv_slot != num_recv_tokens) {
+            throw std::runtime_error("single-node oracle produced inconsistent recv count");
+        }
+
+        oracle.expected_counts_cpu.push_back(counts);
+        oracle.expected_expert_x_cpu.push_back(expert_x.contiguous());
+        oracle.expected_expert_x_scale_cpu.push_back(expert_x_scale.contiguous());
+        oracle.expected_expert_x_dequant_cpu.push_back(
+            dequantize_fp8_blocks(expert_x, expert_x_scale));
+        oracle.expected_source_rank_cpu.push_back(source_rank.contiguous());
+        oracle.expected_source_dispatch_offset_cpu.push_back(
+            source_dispatch_offset.contiguous());
+        oracle.expected_combine_send_offset_cpu.push_back(
+            combine_send_offset.contiguous());
+        oracle.expected_padded_index_cpu.push_back(padded_index.contiguous());
+    }
+
+    return oracle;
+}
+
+bool tensor_equal(const torch::Tensor& actual, const torch::Tensor& expected,
+                  const std::string& what, std::ostringstream& error) {
+    if (!torch::equal(actual, expected)) {
+        auto a = actual.to(torch::kInt64);
+        auto e = expected.to(torch::kInt64);
+        auto diff = torch::abs(a - e);
+        error << what << " mismatch: max diff="
+              << diff.max().item<int64_t>()
+              << " at index " << torch::nonzero(diff == diff.max()).flatten()[0].item<int64_t>();
         return false;
     }
+
+    return true;
 }
 
-// ============================================================================
-// Combine Test
-// ============================================================================
-
-bool test_combine(
-    int rank,
-    int world_size,
-    moe_cuda::All2All& all2all,
-    const All2AllTestConfig& config,
-    cudaStream_t stream,
-    torch::Tensor& indices_torch,
-    torch::Tensor& weights_torch,
-    torch::Tensor& expert_x_torch,
-    torch::Tensor& expert_num_tokens_torch,
-    torch::Tensor& dp_x_torch
-) {
-    if (rank == 0) {
-        std::cout << "\n--- Testing a2a_combine (EP=" << world_size << ") ---\n";
-    }
-
-    try {
-        torch::Device device(torch::kCUDA, rank);
-        auto bf16_opts = torch::TensorOptions().dtype(torch::kBFloat16).device(device);
-
-        // Simulate expert output: use expert_x as identity transform (expert_y = expert_x)
-        // This way we can verify the combine produces correct weighted sums
-        torch::Tensor expert_y_torch = expert_x_torch.clone();
-
-        // Output buffer for combined tokens
-        torch::Tensor out_tokens_torch = torch::zeros(
-            {(int64_t)config.num_tokens, (int64_t)config.hidden_dim}, bf16_opts);
-
-        // Convert to custom tensors
-        at::Tensor out_tokens = (out_tokens_torch);
-        at::Tensor indices = (indices_torch);
-        at::Tensor weights = (weights_torch);
-        at::Tensor expert_y = (expert_y_torch);
-        std::optional<at::Tensor> bound_m = std::nullopt;
-
-        // Call combine
-        moe_cuda::kernels::a2a_combine(
-            all2all,
-            out_tokens, indices, weights, expert_y, bound_m,
-            true, true, false, stream);
-
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-
-        // Verification: output tokens should be non-zero (tokens returned to originating rank)
-        torch::Tensor out_abs_sum = out_tokens_torch.abs().sum();
-        float abs_sum_val = out_abs_sum.item<float>();
-
-        bool nonzero_passed = (abs_sum_val > 0.0f);
-
-        if (rank == 0) {
-            std::cout << "Combine output non-zero check: abs_sum=" << abs_sum_val;
-            if (nonzero_passed) {
-                std::cout << " \033[0;32m[PASSED]\033[0m\n";
-            } else {
-                std::cout << " \033[0;31m[FAILED]\033[0m\n";
-            }
-        }
-
-        if (config.verbose) {
-            log_rank(rank, "Output tokens (first 5 values of token 0):");
-            std::cout << out_tokens_torch.slice(0, 0, 1).slice(1, 0, 5) << "\n";
-        }
-
-        return nonzero_passed;
-    } catch (const std::exception& e) {
-        std::cerr << "\033[0;31m[Rank " << rank << "] Combine error: " << e.what() << "\033[0m\n";
+bool tensor_close(const torch::Tensor& actual, const torch::Tensor& expected,
+                  double atol, double rtol, const std::string& what,
+                  std::ostringstream& error) {
+    if (!torch::allclose(actual, expected, atol, rtol)) {
+        error << what << " mismatch: max diff="
+              << torch::abs(actual - expected).max().item<double>()
+              << torch::abs(actual - expected).max()
+              << " at index " << torch::nonzero(torch::abs(actual - expected) == torch::abs(actual - expected).max()).flatten()[0].item<int64_t>();
+            //   printf("Reference \n");
+            //   test_utils::inspect_tensor(expected, 10);
+            //   printf("Actual \n");
+            //   test_utils::inspect_tensor(actual, 10);
         return false;
     }
+    return true;
 }
 
-// ============================================================================
-// Run a single test configuration
-// ============================================================================
+// Hashes a token as raw fp8 bytes concatenated with its scale bytes.
+// Two tokens are "equal" iff both their fp8 values and scales are identical.
+static std::string hash_token(const torch::Tensor& fp8_row,
+                               const torch::Tensor& scale_row) {
+    auto fp8_c  = fp8_row.contiguous();
+    auto scl_c  = scale_row.contiguous();
+    std::string key;
+    key.append(static_cast<const char*>(fp8_c.data_ptr()), fp8_c.nbytes());
+    key.append(static_cast<const char*>(scl_c.data_ptr()), scl_c.nbytes());
+    return key;
+}
 
-bool run_test_config(int rank, int world_size, const All2AllTestConfig& config) {
-    torch::Device device(torch::kCUDA, rank);
-    cudaStream_t stream;
+// Mirrors pplx-garden's set-membership check: verifies that every input token
+// routed to this rank's local experts appears somewhere in the dispatch output,
+// without caring about the order of tokens within each expert's slot.
+bool check_dispatch_set_membership(
+        const TestCase& cfg,
+        int rank,
+        const OracleBundle& oracle,
+        const torch::Tensor& actual_expert_x_cpu,    // [max_recv_tokens, H] fp8
+        const torch::Tensor& actual_expert_x_scale_cpu, // [max_recv_tokens, H/128] f32
+        const torch::Tensor& actual_counts_cpu,      // [experts_per_rank] u32
+        std::ostringstream& error) {
+
+    const uint32_t experts_per_rank = kNumExperts / kWorldSize;
+    const int32_t  first_local_expert = rank * static_cast<int32_t>(experts_per_rank);
+
+    // Collect hashes of every token that actually arrived at this rank.
+    std::unordered_set<std::string> tokens_on_rank;
+    auto counts_acc = actual_counts_cpu.accessor<uint32_t, 1>();
+    int64_t slot = 0;
+    for (uint32_t le = 0; le < experts_per_rank; ++le) {
+        uint32_t n = counts_acc[le];
+        for (int64_t i = slot; i < slot + static_cast<int64_t>(n); ++i) {
+            tokens_on_rank.insert(
+                hash_token(actual_expert_x_cpu[i], actual_expert_x_scale_cpu[i]));
+        }
+        slot = static_cast<int64_t>(align_to(
+            static_cast<uint32_t>(slot + n), cfg.expert_padding));
+    }
+
+    // For every source rank, check that each token routed to a local expert is present.
+    int num_missing = 0;
+    for (int src = kWorldSize - 1; src >= 0 ; --src) {
+        auto indices = oracle.indices_cpu[src].accessor<uint32_t, 2>();
+        for (uint32_t token = 0; token < cfg.num_tokens; ++token) {
+            for (uint32_t route = 0; route < cfg.top_k; ++route) {
+                const uint32_t expert = indices[token][route];
+                if (static_cast<int32_t>(expert) < first_local_expert ||
+                    static_cast<int32_t>(expert) >= first_local_expert + static_cast<int32_t>(experts_per_rank))
+                    continue;
+
+                const std::string key = hash_token(
+                    oracle.input_fp8_cpu[src][token],
+                    oracle.input_scale_cpu[src][token]);
+
+                if (tokens_on_rank.find(key) == tokens_on_rank.end()) {
+                    ++num_missing;
+                    // if (num_missing <= 5) {
+                        error << "\n  missing token " << token
+                              << " from rank " << src
+                              << " routed to expert " << expert;
+                    // }
+                }
+            }
+        }
+    }
+
+    if (num_missing > 0) {
+        error << "\n" << cfg.name << " dispatch set check: "
+              << num_missing << " token(s) missing on rank " << rank;
+        return false;
+    }
+    return true;
+}
+
+template <int TopK, int HiddenDim>
+bool run_case_for_rank(const TestCase& cfg, int rank, bool verbose,
+                       std::ostringstream& error) {
+    static_assert(HiddenDim % 128 == 0);
+    CUDA_CHECK(cudaSetDevice(rank));
+    cudaStream_t stream = nullptr;
     CUDA_CHECK(cudaStreamCreate(&stream));
+    printf("Initializing All2All for rank %d + setup\n", rank);
+    using All2AllT = moe_cuda::All2All<TopK, kNumExperts, HiddenDim>;
+    
+    const OracleBundle oracle = build_oracle(cfg);
+    const auto device = torch::Device(torch::kCUDA, rank);
+    const auto fp8_opts =
+        torch::TensorOptions().dtype(torch::kFloat8_e4m3fn).device(device);
+    const auto f32_opts =
+        torch::TensorOptions().dtype(torch::kFloat32).device(device);
+    const auto u32_opts =
+        torch::TensorOptions().dtype(torch::kUInt32).device(device);
+    const uint32_t experts_per_rank = kNumExperts / kWorldSize;
 
-    // Create parallel groups
-    // node_group = all ranks (single node)
-    ParallelGroup node_group(rank, world_size);
-    // global_group = same as node_group for single-node
-    ParallelGroup global_group(rank, world_size);
-    // No dp_group for this test
-    std::optional<ParallelGroup> dp_group = std::nullopt;
+    
 
-    // Create moe_cuda::All2All instance
-    moe_cuda::All2All all2all(
-        config.num_tokens,          // max_num_tokens
-        config.num_experts,         // num_experts
-        config.expert_padding,      // expert_padding
-        config.hidden_dim,          // hidden_dim
-        std::nullopt,               // hidden_dim_scale
-        config.dtype,               // in_dtype
-        config.dtype,               // out_dtype
-        std::nullopt,               // scale_dtype
-        config.num_experts_per_token,
-        std::nullopt,               // max_private_tokens
-        dp_group,                   // dp_group
-        node_group,                 // node_group
-        rank,                       // device
-        global_group,               // global_group
-        stream
-    );
+    ParallelConfig parallel_config{
+        .tp_size = 1,
+        .dp_size = 1,
+        .ep_size = kWorldSize,
+        .node_size = kWorldSize,
+        .world_size = kWorldSize,
+    };
 
-    MPI_Barrier(MPI_COMM_WORLD);
+    auto dp_x = oracle.input_fp8_cpu[rank].to(device);
+    auto dp_x_scale = oracle.input_scale_cpu[rank].to(device);
+    auto indices = oracle.indices_cpu[rank].to(device);
+    auto weights = oracle.weights_cpu[rank].to(device);
 
-    // Outputs from dispatch used by combine
-    torch::Tensor indices_torch, weights_torch, expert_x_torch, expert_num_tokens_torch, dp_x_torch;
+    auto out_expert_x = torch::zeros(
+        {static_cast<int64_t>(oracle.max_recv_tokens), static_cast<int64_t>(cfg.hidden_dim)},
+        fp8_opts);
+    auto out_expert_x_scale = torch::zeros(
+        {static_cast<int64_t>(oracle.max_recv_tokens),
+         static_cast<int64_t>(cfg.hidden_dim / 128)},
+        f32_opts);
+    auto out_expert_num_tokens = torch::zeros(
+        {static_cast<int64_t>(experts_per_rank)}, u32_opts);
 
-    bool dispatch_passed = test_dispatch(
-        rank, world_size, all2all, config, stream,
-        indices_torch, weights_torch, expert_x_torch, expert_num_tokens_torch, dp_x_torch);
+    std::optional<at::Tensor> bound_m = std::nullopt;
+    std::optional<at::Tensor> dp_x_scale_opt = dp_x_scale;
+    std::optional<at::Tensor> out_expert_x_scale_opt = out_expert_x_scale;
 
-    MPI_Barrier(MPI_COMM_WORLD);
+    All2AllT all2all(
+        cfg.num_tokens,
+        kNumExperts,
+        cfg.expert_padding,
+        cfg.hidden_dim,
+        std::nullopt,
+        c10::ScalarType::Float8_e4m3fn,
+        c10::ScalarType::BFloat16,
+        c10::ScalarType::Float,
+        TopK,
+        std::nullopt,
+        rank,
+        parallel_config,
+        stream);
 
-    bool combine_passed = test_combine(
-        rank, world_size, all2all, config, stream,
-        indices_torch, weights_torch, expert_x_torch, expert_num_tokens_torch, dp_x_torch);
-
-    MPI_Barrier(MPI_COMM_WORLD);
-
+    all2all.dispatch(out_expert_num_tokens, out_expert_x, out_expert_x_scale_opt, dp_x,
+                     dp_x_scale_opt, indices, weights, bound_m, true, true, stream);
+    auto routing_state = all2all.debug_routing_state(stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
     CUDA_CHECK(cudaStreamDestroy(stream));
 
-    return dispatch_passed && combine_passed;
+    auto actual_counts = out_expert_num_tokens.to(torch::kCPU).to(torch::kUInt32).contiguous();
+    auto actual_expert_x = out_expert_x.to(torch::kCPU).contiguous();
+    auto actual_expert_x_scale = out_expert_x_scale.to(torch::kCPU).contiguous();
+    auto actual_dequant = dequantize_fp8_blocks(actual_expert_x, actual_expert_x_scale);
+    auto actual_source_rank =
+        routing_state.source_rank.to(torch::kCPU).to(torch::kUInt32).contiguous();
+    auto actual_source_dispatch_offset =
+        routing_state.source_dispatch_offset.to(torch::kCPU).to(torch::kUInt32).contiguous();
+    auto actual_combine_send_offset =
+        routing_state.combine_send_offset.to(torch::kCPU).to(torch::kUInt32).contiguous();
+    auto actual_padded_index =
+        routing_state.padded_index.to(torch::kCPU).to(torch::kUInt32).contiguous();
+    auto actual_num_routed = all2all.debug_num_routed();
+
+    if (!tensor_equal(actual_num_routed, oracle.expected_num_routed_cpu,
+                      std::string(cfg.name) + " num_routed", error)) {
+        return false;
+    }
+
+    if (routing_state.num_recv_tokens != oracle.expected_num_recv_tokens[rank]) {
+        error << cfg.name << " num_recv_tokens mismatch: actual="
+              << routing_state.num_recv_tokens
+              << " expected=" << oracle.expected_num_recv_tokens[rank];
+        return false;
+    }
+    if (static_cast<uint32_t>(actual_counts.sum().item<int64_t>()) !=
+        routing_state.num_recv_tokens) {
+        error << cfg.name << " counts sum does not match num_recv_tokens";
+        return false;
+    }
+
+    if (!tensor_equal(actual_counts, oracle.expected_counts_cpu[rank],
+                      std::string(cfg.name) + " counts", error)) {
+        return false;
+    }
+    if (!tensor_equal(actual_source_rank, oracle.expected_source_rank_cpu[rank],
+                      std::string(cfg.name) + " source_rank", error)) {
+        return false;
+    }
+    // source_dispatch_offset and padded_index are order-dependent within each
+    // expert group (kernel uses non-deterministic atomicAdd ordering), so we
+    // skip exact positional checks here and rely on set-membership below.
+    (void)actual_source_dispatch_offset;
+    (void)actual_combine_send_offset;
+    (void)actual_padded_index;
+    if (!check_dispatch_set_membership(cfg, rank, oracle,
+                                        actual_expert_x, actual_expert_x_scale,
+                                        actual_counts, error)) {
+        return false;
+    }
+
+    auto route_positions = oracle.route_positions_cpu[rank].accessor<int32_t, 2>();
+    auto input_dequant = oracle.input_dequant_cpu[rank];
+    auto weights_cpu = oracle.weights_cpu[rank].accessor<float, 2>();
+    auto indices_cpu = oracle.indices_cpu[rank].accessor<uint32_t, 2>();
+
+    auto combine_reference = torch::zeros_like(input_dequant);
+    for (uint32_t token = 0; token < cfg.num_tokens; ++token) {
+        for (uint32_t route = 0; route < cfg.top_k; ++route) {
+            const uint32_t expert = indices_cpu[token][route];
+            const uint32_t owner = expert / experts_per_rank;
+            const int32_t position = route_positions[token][route];
+            combine_reference[token].add_(
+                oracle.expected_expert_x_dequant_cpu[owner][position] *
+                weights_cpu[token][route]);
+        }
+    }
+
+    if (!tensor_close(combine_reference, input_dequant, 1e-4, 1e-4,
+                      std::string(cfg.name) + " combine oracle", error)) {
+        return false;
+    }
+
+    if (verbose) {
+        std::cout << "[Rank " << rank << "] " << cfg.name << " passed\n";
+    }
+    return true;
 }
 
-// ============================================================================
-// Main
-// ============================================================================
+bool run_rank(int rank, bool verbose, std::ostringstream& error) {
+    if (rank < 0 || rank >= kWorldSize) {
+        error << "invalid rank " << rank;
+        return false;
+    }
+
+    int num_devices = 0;
+    CUDA_CHECK(cudaGetDeviceCount(&num_devices));
+
+    CUDA_CHECK(cudaSetDevice(rank));
+    for (int peer = 0; peer < kWorldSize; ++peer) {                                                                                                                                                                                                                                                                       
+        if (peer != rank) CUDA_CHECK(cudaDeviceEnablePeerAccess(peer, 0));                                                                                                                                                                                                                                                          
+    }     
+    if (num_devices < kWorldSize) {
+        error << "need " << kWorldSize << " GPUs, found " << num_devices;
+        return false;
+    }
+
+    for (const auto& cfg : kCases) {
+        bool passed = false;
+        if (cfg.top_k == 1 && cfg.hidden_dim == 128) {
+            passed = run_case_for_rank<1, 128>(cfg, rank, verbose, error);
+        } else if (cfg.top_k == 2 && cfg.hidden_dim == 256) {
+            passed = run_case_for_rank<2, 256>(cfg, rank, verbose, error);
+        }  else if (cfg.top_k == 10 && cfg.hidden_dim == 2048) {
+            passed = run_case_for_rank<10, 2048>(cfg, rank, verbose, error);
+        }
+         else if (cfg.top_k == 12 && cfg.hidden_dim == 2048) {
+            passed = run_case_for_rank<12, 2048>(cfg, rank, verbose, error);
+         }
+        else {
+            error << "unsupported test config " << cfg.name;
+            return false;
+        }
+
+        if (!passed) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+void write_result(RankResult& slot, bool passed, const std::string& message) {
+    slot.passed = passed ? 1 : 0;
+    std::snprintf(slot.message, sizeof(slot.message), "%s", message.c_str());
+}
+
+}  // namespace
 
 int main(int argc, char** argv) {
-    MPI_Init(&argc, &argv);
-
-    int rank, world_size;
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &world_size);
-
-    // Parse args
     bool verbose = false;
-    for (int i = 1; i < argc; i++) {
-        std::string arg = argv[i];
-        if (arg == "--verbose") verbose = true;
-        else if (arg == "--help" || arg == "-h") {
-            if (rank == 0) {
-                std::cout << "moe_cuda::All2All Test\n";
-                std::cout << "Usage: mpirun -np <N> " << argv[0] << " [--verbose] [--help]\n";
-            }
-            MPI_Finalize();
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--verbose") {
+            verbose = true;
+        } else if (arg == "--help" || arg == "-h") {
+            std::cout << "Usage: " << argv[0] << " [--verbose]\n";
             return 0;
         }
     }
 
-    // Set CUDA device based on rank
-    int num_devices;
-    CUDA_CHECK(cudaGetDeviceCount(&num_devices));
-    if (rank >= num_devices) {
-        std::cerr << "[Rank " << rank << "] Error: not enough GPUs (have "
-                  << num_devices << ", need " << world_size << ")\n";
-        MPI_Finalize();
+    auto* shared = static_cast<SharedResults*>(
+        mmap(nullptr, sizeof(SharedResults), PROT_READ | PROT_WRITE,
+             MAP_SHARED | MAP_ANONYMOUS, -1, 0));
+    if (shared == MAP_FAILED) {
+        std::perror("mmap");
         return 1;
     }
-    CUDA_CHECK(cudaSetDevice(rank));
+    std::memset(shared, 0, sizeof(SharedResults));
 
-    if (rank == 0) {
-        std::cout << "============================================\n";
-        std::cout << "moe_cuda::All2All Dispatch/Combine Testing Harness\n";
-        std::cout << "World size (EP): " << world_size << "\n";
-        std::cout << "============================================\n";
+    std::array<pid_t, kWorldSize> children{};
+    for (int rank = 0; rank < kWorldSize; ++rank) {
+        const pid_t pid = fork();
+        if (pid < 0) {
+            std::perror("fork");
+            return 1;
+        }
+        if (pid == 0) {
+            std::ostringstream error;
+            const bool passed = run_rank(rank, verbose, error);
+            write_result(shared->results[rank], passed,
+                         passed ? "passed" : error.str());
+            std::_Exit(passed ? 0 : 1);
+        }
+        children[rank] = pid;
     }
 
-    // Define test configurations
-    std::vector<All2AllTestConfig> configs = {
-        // num_experts, num_tokens, hidden_dim, top_k, expert_padding, dtype, verbose
-        {(uint32_t)(4 * world_size), 64,  256, 2, 16, c10::ScalarType::BFloat16, verbose},
-        {(uint32_t)(4 * world_size), 128, 128, 1, 16, c10::ScalarType::BFloat16, verbose},
-        {(uint32_t)(2 * world_size), 32,  256, 2, 16, c10::ScalarType::BFloat16, verbose},
-    };
-
-    int passed = 0, failed = 0;
-
-    for (size_t i = 0; i < configs.size(); i++) {
-        auto& cfg = configs[i];
-
-        if (rank == 0) {
-            std::cout << "\n=== Test Config " << (i + 1) << "/" << configs.size() << " ===\n";
+    int failed = 0;
+    for (int rank = 0; rank < kWorldSize; ++rank) {
+        int status = 0;
+        if (waitpid(children[rank], &status, 0) < 0) {
+            std::perror("waitpid");
+            failed += 1;
+            continue;
         }
-
-        bool result = run_test_config(rank, world_size, cfg);
-
-        if (rank == 0) {
-            if (result) {
-                std::cout << "\033[0;32m[PASSED] Config " << (i + 1) << "\033[0m\n";
-                passed++;
-            } else {
-                std::cout << "\033[0;31m[FAILED] Config " << (i + 1) << "\033[0m\n";
-                failed++;
-            }
-        }
-
-        MPI_Barrier(MPI_COMM_WORLD);
-    }
-
-    if (rank == 0) {
-        std::cout << "\n============================================\n";
-        std::cout << "Test Summary\n";
-        std::cout << "============================================\n";
-        std::cout << "Passed: " << passed << "\n";
-        std::cout << "Failed: " << failed << "\n";
-
-        if (failed > 0) {
-            std::cout << "\033[0;31mSome tests FAILED\033[0m\n";
-        } else {
-            std::cout << "\033[0;32mAll tests PASSED\033[0m\n";
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+            failed += 1;
         }
     }
 
-    MPI_Finalize();
-    return (failed > 0) ? 1 : 0;
+    std::cout << "============================================\n";
+    std::cout << "TK moe_cuda::All2All Dispatch Test\n";
+    std::cout << "World size: " << kWorldSize << "\n";
+    std::cout << "============================================\n";
+    for (int rank = 0; rank < kWorldSize; ++rank) {
+        const bool passed = shared->results[rank].passed != 0;
+        std::cout << "[Rank " << rank << "] "
+                  << (passed ? "PASSED" : "FAILED") << ": "
+                  << shared->results[rank].message << "\n";
+    }
+
+    munmap(shared, sizeof(SharedResults));
+    return failed == 0 ? 0 : 1;
 }

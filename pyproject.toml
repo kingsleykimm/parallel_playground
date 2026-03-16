@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel", "cmake>=3.22"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "moe-cuda"
+version = "0.1.0"
+description = "High-performance MoE CUDA kernels optimized for NVIDIA H100 GPUs"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+    {name = "Kingsley Kim"},
+]
+keywords = ["cuda", "deep-learning", "pytorch", "h100", "moe", "kernels"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: C++",
+    "Programming Language :: CUDA",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "torch>=2.0.0",
+    "vllm>=0.17.1",
+]
+
+[tool.uv.extra-build-dependencies]
+moe-cuda = ["torch>=2.8.0"]
+
+[tool.uv.workspace]
+members = [
+    "third-party/ThunderKittens",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pre-commit>=4.5.1",
+    "pytest>=9.0.2",
+    "build>=1.0.0",
+    "twine>=4.0.0",
+]
+
+[tool.setuptools]
+packages = []
+
+[tool.pytest.ini_options]
+python_files = ["test_*.py", "*_test.py"]

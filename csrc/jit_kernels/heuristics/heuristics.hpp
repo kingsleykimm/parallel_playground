@@ -47,6 +47,178 @@ inline int get_tk_lcf_smem_size(
     return scratch_alloc_size + num_stages * input_alloc_size + finish_block_size + 2 * 1024;
 }
 
+// Computes the shared memory size required by the TK LCF kernel3 (fused silu-mul-quant).
+//
+// kernel3 smem layout differences vs kernel2:
+//   input_block  : a[tiles] + gate_tile + up_tile + sfa[tiles]
+//                  (two B tiles instead of one — gate and up projections)
+//   finish_block : c[tiles] + out_scales[tiles]
+//                  (extra sfa_tile per warpgroup for quantization output scales)
+//   scratch_block: {} (empty, same as kernel2)
+//
+// Tile sizes:
+//   a_tile    = st_fp8e4m3<64, BK>   : 64 * BK bytes
+//   gate_tile = st_fp8e4m3<BN, BK>   : BN * BK bytes
+//   up_tile   = st_fp8e4m3<BN, BK>   : BN * BK bytes
+//   c_tile    = st<c_dtype, 64, BN>  : 64 * BN * cd_size bytes
+//   sfa_tile  = sv<float, 64>        : 64 * 4 bytes
+inline int get_tk_lcf_kernel3_smem_size(
+    const int block_m, const int block_n, const int block_k,
+    const int num_stages, const size_t cd_size
+) {
+    const int num_tiles = (block_m > 64) ? 2 : 1;
+
+    // scratch_alloc_block: padder<empty, 1024> — 1024 bytes regardless of content
+    const int scratch_alloc_size = 1024;
+
+    // input_block raw bytes: a_tile[num_tiles] + gate_tile + up_tile + sfa_tile[num_tiles]
+    //   a_tile    = st_fp8e4m3<64, BK>  : 64 * BK bytes (fp8 = 1 byte)
+    //   gate_tile = st_fp8e4m3<BN, BK>  : BN * BK bytes
+    //   up_tile   = st_fp8e4m3<BN, BK>  : BN * BK bytes
+    //   sfa_tile  = sv<float, 64>       : 64 * 4 bytes
+    const int input_block_bytes = num_tiles * 64 * block_k
+                                + 2 * block_n * block_k   // gate + up
+                                + num_tiles * 64 * (int)sizeof(float);
+    const int input_alloc_size = host_align(input_block_bytes, 1024);
+
+    // finish_block: c_tile[num_tiles] + out_scales[num_tiles]
+    //   c_tile     = st<c_dtype, 64, BN> : 64 * BN * cd_size bytes
+    //   out_scales = sv<float, 64>       : 64 * 4 bytes
+    const int finish_block_size = num_tiles * 64 * block_n * (int)cd_size
+                                + num_tiles * 64 * (int)sizeof(float);
+
+    // Total: scratch | stages*input | gap | finish — +2*1024 ensures
+    // SAFE_STAGES_BETWEEN_BLOCKS == num_stages (producer never stalls on finish_finished).
+    return scratch_alloc_size + num_stages * input_alloc_size + finish_block_size + 2 * 1024;
+}
+
+inline GemmConfig get_kernel3_config(
+    GemmType gemm_type,
+    uint32_t M,
+    uint32_t N,
+    uint32_t K,
+    uint32_t num_groups,
+    Major AMajor,
+    Major BMajor,
+    Major CMajor,
+    c10::ScalarType AB_type, c10::ScalarType CD_type,
+    const uint32_t& num_sms
+) {
+    const uint32_t block_k = 128 / get_type_size(AB_type);
+
+    auto get_num_blocks = [&](const uint32_t block_m, const uint32_t block_n) -> uint32_t {
+        return host_ceil_div(M, block_m) * host_ceil_div(N, block_n) * num_groups;
+    };
+    auto get_num_sm_waves = [&](const uint32_t block_m, const uint32_t block_n, const uint32_t num_sms_arg) -> uint32_t {
+        return host_ceil_div(get_num_blocks(block_m, block_n), num_sms_arg);
+    };
+    auto get_last_wave_util = [&](const uint32_t block_m, const uint32_t block_n) -> uint32_t {
+        auto last_wave_blocks = get_num_blocks(block_m, block_n) % num_sms;
+        return last_wave_blocks == 0 ? num_sms : last_wave_blocks;
+    };
+
+    std::vector<int> block_m_candidates = SM90Arch::get_block_m_candidates(M, AMajor);
+    if (gemm_type == GemmType::MGroupedContiguous) {
+        block_m_candidates = {128};
+    } else if (gemm_type == GemmType::MGroupedMasked) {
+        block_m_candidates = {64, 128};
+    }
+
+    // kernel3 requires BN % 128 == 0 (grouped_matmul_layout static_assert)
+    std::vector<int> block_n_candidates;
+    for (int bn : SM90Arch::get_block_n_candidates(N, BMajor)) {
+        if (bn % 128 == 0) block_n_candidates.push_back(bn);
+    }
+
+    uint32_t best_block_m = 0, best_block_n = 0;
+    int best_num_waves = 0, best_last_util = 0;
+
+    for (auto block_m : block_m_candidates) {
+        for (auto block_n : block_n_candidates) {
+            uint32_t num_waves = get_num_sm_waves(block_m, block_n, SM90Arch::kMaxSMs);
+            uint32_t last_wave_util = get_last_wave_util(block_m, block_n);
+
+            if (!SM90Arch::is_block_legal(
+                AMajor, BMajor, AB_type, CD_type,
+                block_m, block_n, block_k, M, N, K
+              )) continue;
+
+            bool success = false;
+            if (best_block_m == 0 || best_block_n == 0 || num_waves < best_num_waves)
+                success = true;
+            else if (num_waves == best_num_waves) {
+                success = last_wave_util > best_last_util;
+                if (last_wave_util == best_last_util) {
+                    success |= block_m == best_block_m && block_n < best_block_n;
+                    success |= block_m < best_block_m && block_n == best_block_n;
+                    success |= block_m != best_block_m && block_n > best_block_n && block_n <= N && block_m <= M;
+                }
+            }
+
+            if (success) {
+                best_block_m = block_m; best_block_n = block_n;
+                best_num_waves = num_waves; best_last_util = last_wave_util;
+            }
+        }
+    }
+    HOST_ASSERT(best_block_m != 0 && best_block_n != 0, "Error: BLOCK_M, BLOCK_N search yielded no results for kernel3");
+
+    bool tma_multicast_a = false;
+    uint32_t num_tma_multicast = 1;
+    const auto& [a_legal_multicast, b_legal_multicast] = SM90Arch::get_multicast_legality(gemm_type, num_groups, M, N, best_block_m, best_block_n, num_sms);
+    const bool is_legal[2] = {b_legal_multicast, a_legal_multicast};
+    bool order[2] = {false, true};
+    if (best_block_m > best_block_n) {
+        std::swap(order[0], order[1]);
+    }
+    for (const bool& is_multicast_on_a : order) {
+        if (M >= 512 && is_legal[static_cast<int>(is_multicast_on_a)]) {
+            tma_multicast_a = is_multicast_on_a;
+            num_tma_multicast = 2;
+            break;
+        }
+    }
+
+    const auto& [num_tma_threads, num_math_threads] = SM90Arch::get_num_threads(best_block_m);
+
+    constexpr int smem_capacity = SM90Arch::kMaxSharedMemoryPerBlock;
+    SharedMemoryConfig smem_config;
+    int best_num_stages = 0;
+    const size_t cd_size = get_type_size(CD_type);
+    for (int num_stages = 16; num_stages > 0; num_stages--) {
+        int smem_size = get_tk_lcf_kernel3_smem_size(best_block_m, best_block_n, block_k, num_stages, cd_size);
+        if (smem_size <= smem_capacity) {
+            best_num_stages = num_stages;
+            smem_config.smem_size = smem_size;
+            break;
+        }
+    }
+
+    int min_sms = num_sms;
+    if (SM90Arch::should_minimize_sms()) {
+        min_sms = host_ceil_div(
+            host_ceil_div(M, best_block_m) * host_ceil_div(N, best_block_n) * num_groups, best_num_waves
+        );
+        min_sms = host_align(min_sms, num_tma_multicast);
+        if (min_sms > num_sms) {
+            HOST_ERROR("While trying to minimize SMs in kernel3 FP8 Heuristic");
+        }
+    }
+    return GemmConfig {
+        gemm_type,
+        best_block_m,
+        best_block_n,
+        block_k,
+        smem_config,
+        num_tma_multicast,
+        tma_multicast_a,
+        static_cast<uint32_t>(num_tma_threads),
+        static_cast<uint32_t>(num_math_threads),
+        static_cast<uint32_t>(min_sms),
+        best_num_stages
+    };
+}
+
 inline GemmConfig search_configs(
     GemmType gemm_type,
     uint32_t M,

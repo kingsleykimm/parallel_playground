@@ -407,18 +407,19 @@ __global__ void __launch_bounds__(kNumThreads, 1) a2a_dispatch_send_kernel(
                   *(float *)(token_dst + token_dim_fixed + i) = scales[s];
                 }
               }
-            } else {
-              // for same copies, we use the absolute offset
-              for (int i = threadIdx.x, s = 0; i * sizeof(int4) < TOKEN_DIM;
-                   i += kNumThreads, s++) {
-                const bool has_scale = x_scale_ptr && i < hidden_dim_scale;
-                std::byte *token_ptr =
-                    send_buffer + route.position * token_stride;
-                uint4 *x_token_dst = (uint4 *)token_ptr;
-                st_global_nc_uint4(vals[s], &x_token_dst[i]);
-                if (has_scale) {
-                  *(float *)(token_ptr + token_dim_fixed + i) = scales[s];
-                }
+            }
+          } else { // for either same node copies or overflow, we use our
+                   // send_buffer
+            // for same copies, we use the absolute offset
+            for (int i = threadIdx.x, s = 0; i * sizeof(int4) < TOKEN_DIM;
+                 i += kNumThreads, s++) {
+              const bool has_scale = x_scale_ptr && i < hidden_dim_scale;
+              std::byte *token_ptr =
+                  send_buffer + route.position * token_stride;
+              uint4 *x_token_dst = (uint4 *)token_ptr;
+              st_global_nc_uint4(vals[s], &x_token_dst[i]);
+              if (has_scale) {
+                *(float *)(token_ptr + token_dim_fixed + i) = scales[s];
               }
             }
           }

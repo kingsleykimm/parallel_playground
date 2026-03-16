@@ -18,3 +18,16 @@ extern "C" void tk_build_grouped_globals(int bm, int bn, int bk,
     int gemm_type, int num_groups, c10::ScalarType c_dtype, void* out,
     void* A, void* B, void* C, void* scale_a, void* scale_b,
     void* grouped_layout, size_t total_M, size_t total_N, size_t K);
+extern "C" void tk_dump_grouped_globals(int bm, int bn, int bk,
+    int gemm_type, c10::ScalarType c_dtype, const void* globals_ptr);
+
+// kernel3 globals (kernel3::grouped_matmul_layout) — gate+up fused silu-mul-quant
+// gate, up : separate weight tensors (each covers half the combined N)
+// out_scales: per-row quantization scale output
+extern "C" size_t tk_kernel3_globals_size(int bm, int bn, int bk,
+    int gemm_type, c10::ScalarType c_dtype);
+extern "C" void tk_build_kernel3_globals(int bm, int bn, int bk,
+    int gemm_type, int num_groups, c10::ScalarType c_dtype, void* out,
+    void* A, void* gate, void* up, void* C,
+    void* scale_a, void* scale_gate, void* scale_up, void* out_scales,
+    void* grouped_layout, size_t total_M, size_t total_N, size_t K);

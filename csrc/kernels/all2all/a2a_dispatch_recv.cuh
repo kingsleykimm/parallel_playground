@@ -179,7 +179,6 @@ cudaError_t a2a_kernels::a2a_dispatch_recv(
   constexpr size_t kNumThreads = 512;
 
   dim3 dimGrid(num_blocks, 1, 1);
-  dim3 dimBlock(kNumThreads, 1, 1);
 
   const size_t token_dim = ti_align(hidden_dim * x_elemsize, sizeof(float4));
   const size_t token_scale_dim =
@@ -188,42 +187,42 @@ cudaError_t a2a_kernels::a2a_dispatch_recv(
 
   HOST_ASSERT(token_stride % sizeof(float4) == 0, "Token stride not divisible");
 
-  void *args[] = {
-      const_cast<size_t *>(&token_dim),
-      const_cast<size_t *>(&token_scale_dim),
-      const_cast<size_t *>(&token_stride),
-      &hidden_dim,
-      &hidden_dim_scale,
-      &x_elemsize,
-      &x_scale_elemsize,
-      &num_experts,
-      &rank,
-      &world_size,
-      &out_num_tokens_ptr,
-      &out_x_ptr,
-      &out_x_stride,
-      &out_x_scale_ptr,
-      &out_x_scale_stride_elem,
-      &out_x_scale_stride_token,
-      &tokens_per_expert,
-      &send_buffer,
-      &recv_buffer,
-      &source_rank,
-      &source_offset,
-      &padded_index,
-      &num_routed,
-      &num_recv_tokens_ptr,
-      &sync_counter,
-      &sync_ptrs,
-      &send_ptrs,
-  };
-
   nvtxRangePush("dispatch_recv");
-  cudaError_t status;
+  cudaError_t status = cudaErrorInvalidValue;
 
   LAUNCH_WORLD_SIZE(node_size, NODE_SIZE, {
     LAUNCH_TOKEN_DIM(token_dim, TokenDim_t, {
       LAUNCH_HIDDEN_DIM_SCALE(hidden_dim_scale, HiddenDimScale_t, {
+        dim3 dimBlock(kNumThreads, 1, 1);
+        void *args[] = {
+            const_cast<size_t *>(&token_dim),
+            const_cast<size_t *>(&token_scale_dim),
+            const_cast<size_t *>(&token_stride),
+            &hidden_dim,
+            &hidden_dim_scale,
+            &x_elemsize,
+            &x_scale_elemsize,
+            &num_experts,
+            &rank,
+            &world_size,
+            &out_num_tokens_ptr,
+            &out_x_ptr,
+            &out_x_stride,
+            &out_x_scale_ptr,
+            &out_x_scale_stride_elem,
+            &out_x_scale_stride_token,
+            &tokens_per_expert,
+            &send_buffer,
+            &recv_buffer,
+            &source_rank,
+            &source_offset,
+            &padded_index,
+            &num_routed,
+            &num_recv_tokens_ptr,
+            &sync_counter,
+            &sync_ptrs,
+            &send_ptrs,
+        };
         status = cudaLaunchCooperativeKernel(
             (void *)&a2a_dispatch_recv_kernel<kNumThreads, NODE_SIZE,
                                               TokenDim_t, HiddenDimScale_t>,

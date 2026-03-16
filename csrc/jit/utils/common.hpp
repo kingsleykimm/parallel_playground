@@ -33,6 +33,7 @@ static std::string to_string(const at::ScalarType& dtype) {
       case torch::kFloat8_e5m2:   return "fp8e5m2";
       default: HOST_ERROR("Unsupported dtype");
   }
+  return "";
 }
 
 

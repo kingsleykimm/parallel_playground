@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.22)
 project(parallel_playground LANGUAGES CXX CUDA)
 
 option(BUILD_TESTS "Build C++ tests" ON)
+option(BUILD_PYBIND "Build Python extension" OFF)
 option(FETCH_LIBTORCH "Auto-fetch LibTorch when Torch is not found" OFF)
 set(LIBTORCH_VERSION "2.10.0" CACHE STRING "LibTorch version to fetch")
 set(LIBTORCH_CUDA_TAG "" CACHE STRING "Override CUDA tag (e.g. cu128)")
@@ -26,6 +27,7 @@ endforeach()
 include(FetchContent)
 set(FETCHCONTENT_BASE_DIR "${CMAKE_SOURCE_DIR}/.cmake_deps" CACHE PATH "Persistent FetchContent cache")
 
+find_package(Python3 COMPONENTS Interpreter Development QUIET)
 find_package(CUDAToolkit REQUIRED)
 if(NOT DEFINED TORCH_CUDA_ARCH_LIST)
     set(TORCH_CUDA_ARCH_LIST "9.0a" CACHE STRING "Torch CUDA arch list")
@@ -38,7 +40,6 @@ if(DEFINED Torch_DIR AND NOT "${Torch_DIR}" STREQUAL "" AND NOT "${Torch_DIR}" M
 endif()
 
 if(NOT HAS_VALID_TORCH_DIR)
-    find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
         execute_process(
             COMMAND "${Python3_EXECUTABLE}" -c "import torch; print(torch.utils.cmake_prefix_path)"
@@ -154,23 +155,6 @@ else()
     FetchContent_MakeAvailable(fmt)
 endif()
 
-# MPI (required)
-set(MPI_SKIP_COMPILER_WRAPPER TRUE CACHE BOOL "Avoid MPI wrapper parsing issues in FindMPI")
-find_package(MPI REQUIRED COMPONENTS CXX)
-set(MOE_CUDA_USE_MPI ON)
-message(STATUS "MPI found: enabling all2all support")
-if(TARGET MPI::MPI_CXX)
-    get_target_property(_mpi_inc_dirs MPI::MPI_CXX INTERFACE_INCLUDE_DIRECTORIES)
-    if(_mpi_inc_dirs)
-        set(_mpi_inc_dirs_clean "")
-        foreach(_inc IN LISTS _mpi_inc_dirs)
-            string(REGEX REPLACE "^-I" "" _inc_clean "${_inc}")
-            list(APPEND _mpi_inc_dirs_clean "${_inc_clean}")
-        endforeach()
-        set_target_properties(MPI::MPI_CXX PROPERTIES INTERFACE_INCLUDE_DIRECTORIES "${_mpi_inc_dirs_clean}")
-    endif()
-endif()
-
 # NCCL (required)
 set(_NCCL_HINT_ROOTS "")
 if(DEFINED ENV{NCCL_ROOT} AND NOT "$ENV{NCCL_ROOT}" STREQUAL "")
@@ -225,6 +209,7 @@ add_library(moe_cuda_lib STATIC
     csrc/apis/moe_forward.cpp
     csrc/jit_kernels/fp8_tk_globals_factory.cu
 )
+set_source_files_properties(csrc/apis/moe_forward.cpp PROPERTIES LANGUAGE CUDA)
 
 target_include_directories(moe_cuda_lib
     PUBLIC
@@ -233,6 +218,7 @@ target_include_directories(moe_cuda_lib
         # ${CUTLASS_INCLUDE}
         ${TK_INCLUDE}
         ${TK_PROTOTYPE_INCLUDE}
+        ${Python3_INCLUDE_DIRS}
         ${TORCH_INCLUDE_DIRS}
         ${CUDAToolkit_INCLUDE_DIRS}
 )
@@ -245,18 +231,18 @@ target_link_libraries(moe_cuda_lib PUBLIC
     CUDA::nvJitLink
     CUDA::cublas
     CUDA::cublasLt
-    MPI::MPI_CXX
     NCCL::NCCL
     fmt::fmt
 )
 
 target_compile_definitions(moe_cuda_lib PUBLIC FMT_USE_INT128=0)
 
-# ThunderKittens globals factory needs KITTENS_HOPPER for TMA/WGMMA support
-set_source_files_properties(csrc/jit_kernels/fp8_tk_globals_factory.cu PROPERTIES
-    COMPILE_DEFINITIONS "KITTENS_HOPPER"
+# ThunderKittens system/TMA headers are gated on KITTENS_HOPPER.
+set_source_files_properties(
+    csrc/jit_kernels/fp8_tk_globals_factory.cu
+    src/moe_ops.cu
+    PROPERTIES COMPILE_DEFINITIONS "KITTENS_HOPPER"
 )
-target_compile_definitions(moe_cuda_lib PUBLIC MOE_CUDA_USE_MPI=1)
 
 set_target_properties(moe_cuda_lib PROPERTIES
     CUDA_SEPARABLE_COMPILATION OFF
@@ -279,6 +265,48 @@ target_compile_options(moe_cuda_lib PRIVATE
     >
 )
 
+if(BUILD_PYBIND)
+    if(NOT Python3_Development_FOUND)
+        find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
+    endif()
+    Python3_add_library(moe_cuda MODULE WITH_SOABI csrc/python_api.cpp)
+    set_target_properties(moe_cuda PROPERTIES PREFIX "")
+    target_include_directories(moe_cuda PRIVATE
+        ${CMAKE_SOURCE_DIR}/moe_cuda/include
+        ${CMAKE_SOURCE_DIR}/csrc
+        ${TK_INCLUDE}
+        ${TK_PROTOTYPE_INCLUDE}
+        ${Python3_INCLUDE_DIRS}
+        ${TORCH_INCLUDE_DIRS}
+        ${CUDAToolkit_INCLUDE_DIRS}
+    )
+    target_link_libraries(moe_cuda PRIVATE
+        moe_cuda_lib
+        Python3::Module
+        ${TORCH_LIBRARIES}
+        fmt::fmt
+    )
+    execute_process(
+        COMMAND "${Python3_EXECUTABLE}" -c "import os, torch; p=os.path.join(os.path.dirname(torch.__file__), 'lib', 'libtorch_python.so'); print(p if os.path.exists(p) else '')"
+        OUTPUT_VARIABLE TORCH_PYTHON_LIB
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+    if(TORCH_PYTHON_LIB)
+        message(STATUS "Linking torch_python from ${TORCH_PYTHON_LIB}")
+        target_link_libraries(moe_cuda PRIVATE "${TORCH_PYTHON_LIB}")
+    else()
+        message(WARNING "libtorch_python.so not found in Python torch package; proceeding without explicit torch_python link.")
+    endif()
+    target_compile_definitions(moe_cuda PRIVATE
+        FMT_USE_INT128=0
+        TORCH_EXTENSION_NAME=moe_cuda
+    )
+    target_compile_options(moe_cuda PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:-O3 -fPIC>
+    )
+endif()
+
 if(BUILD_TESTS)
     enable_testing()
 
@@ -286,6 +314,7 @@ if(BUILD_TESTS)
         test/test_cpp/test_bf16_gemm.cpp
         test/test_cpp/test_fp8.cpp
         test/test_cpp/test_kernel2.cpp
+        test/test_cpp/test_kernel3.cpp
     )
 
     foreach(TEST_SRC ${BASE_TESTS})
@@ -323,6 +352,8 @@ if(BUILD_TESTS)
         ${CMAKE_SOURCE_DIR}/csrc
         ${CMAKE_SOURCE_DIR}/test/test_cpp
         # ${CUTLASS_INCLUDE}
+        ${TK_INCLUDE}
+        ${TK_PROTOTYPE_INCLUDE}
         ${TORCH_INCLUDE_DIRS}
         ${CUDAToolkit_INCLUDE_DIRS}
     )
@@ -335,11 +366,12 @@ if(BUILD_TESTS)
         CUDA::nvJitLink
         CUDA::cublas
         CUDA::cublasLt
-        MPI::MPI_CXX
-        NCCL::NCCL
         fmt::fmt
     )
-    target_compile_definitions(test_all2all PRIVATE FMT_USE_INT128=0 MOE_CUDA_USE_MPI=1)
+    target_compile_definitions(test_all2all PRIVATE
+        FMT_USE_INT128=0
+        KITTENS_HOPPER
+    )
     add_test(NAME test_all2all COMMAND test_all2all)
 endif()
 

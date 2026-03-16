@@ -10,6 +10,7 @@
 #include <jit/runtime.hpp>
 #include <jit/cache.hpp>
 #include <jit/utils/lazy_init.hpp>
+#include <cstring>
 #include <fstream>
 #include <regex>
 // Returns -isystem flags for the GCC C++ stdlib include paths, by running
@@ -41,6 +42,10 @@ static std::string get_gcc_system_include_flags() {
         }
     }
     return flags;
+}
+
+static bool kernel2_trace_host_enabled() {
+    return get_env<int>("KERNEL2_TRACE_HOST", 0) > 0;
 }
 
 class Compiler {
@@ -140,7 +145,22 @@ class Compiler {
             
             const fs::path full_path = cache_dir_path / "cache" / kernel_dir;
 
+            if (kernel2_trace_host_enabled()) {
+                printf("[jit] build request name=%s\n", name.c_str());
+                printf("[jit] cache_dir=%s\n", full_path.string().c_str());
+            }
+
             if (const auto& runtime_ptr = jit_cache->get_runtime(full_path); runtime_ptr != nullptr) {
+                if (kernel2_trace_host_enabled()) {
+                    printf("[jit] cache_hit=1 cubin=%s\n",
+                           (full_path / "kernel.cubin").string().c_str());
+                    printf("[jit] code_path=%s\n",
+                           (full_path / "kernel.cu").string().c_str());
+                    if (fs::exists(full_path / "kernel.ptx")) {
+                        printf("[jit] ptx_path=%s\n",
+                               (full_path / "kernel.ptx").string().c_str());
+                    }
+                }
                 return runtime_ptr;
             }
             // if not in cache, we need to set up a new cubin and compile
@@ -156,6 +176,17 @@ class Compiler {
 
             std::shared_ptr<KernelRuntime> new_runtime = std::make_shared<KernelRuntime>(full_path);
             jit_cache->store_runtime(full_path, new_runtime);
+
+            if (kernel2_trace_host_enabled()) {
+                printf("[jit] cache_hit=0 cubin=%s\n",
+                       (full_path / "kernel.cubin").string().c_str());
+                printf("[jit] code_path=%s\n",
+                       (full_path / "kernel.cu").string().c_str());
+                if (fs::exists(full_path / "kernel.ptx")) {
+                    printf("[jit] ptx_path=%s\n",
+                           (full_path / "kernel.ptx").string().c_str());
+                }
+            }
 
             return new_runtime;
         }
@@ -213,7 +244,7 @@ class NVCC_Compiler : public Compiler {
             ? fmt::format("--compiler-bindir={} ", gcc_path) : "";
 
         flags = fmt::format("{} -I{} {} {} {} -arch=sm_{} "
-                                "--compiler-options=-fPIC,-O3,-fconcepts,-Wno-abi "
+                                "-lineinfo --compiler-options=-fPIC,-O3,-fconcepts,-Wno-abi "
                                 "-cubin -O3 --expt-relaxed-constexpr --expt-extended-lambda",
                                 flags, library_include_path.c_str(), extra_includes,
                                 gcc_system_includes, compiler_bindir, device_prop->get_arch(true));
@@ -237,6 +268,31 @@ class NVCC_Compiler : public Compiler {
         if (exit_code != 0) {
             printf("NVCC compilation for file %s failed, with output: %s", code_path.string().c_str(), output.c_str());
             HOST_ASSERT(false, "");
+        }
+
+        if (get_env<int>("JIT_KEEP_PTX", 0) > 0) {
+            std::string ptx_flags = flags;
+            if (const auto pos = ptx_flags.find("-cubin"); pos != std::string::npos) {
+                ptx_flags.replace(pos, std::strlen("-cubin"), "-ptx -src-in-ptx");
+            } else {
+                ptx_flags += " -ptx -src-in-ptx";
+            }
+
+            const fs::path ptx_path = kernel_dir_path / "kernel.ptx";
+            const std::string ptx_command = fmt::format(
+                "{} {} -o {} {}", nvcc_path.string(), code_path.string(),
+                ptx_path.string(), ptx_flags);
+
+            if (get_env<int>("JIT_DEBUG", 0) > 0 || kernel2_trace_host_enabled()) {
+                printf("Compiling JIT PTX with NVCC options: %s\n",
+                       ptx_command.c_str());
+            }
+            auto [ptx_exit_code, ptx_output] = run_command(ptx_command);
+            if (ptx_exit_code != 0) {
+                printf("NVCC PTX compilation for file %s failed, with output: %s",
+                       code_path.string().c_str(), ptx_output.c_str());
+                HOST_ASSERT(false, "");
+            }
         }
 
         if (get_env("JIT_DEBUG", 0)) {

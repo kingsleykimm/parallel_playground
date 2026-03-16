@@ -9,6 +9,38 @@ void init(const std::string& library_root, const std::string& cuda_home) {
     Compiler::init_static_vars(library_root, cuda_home);
 }
 
+void fp8_grouped_gemm_swiglu_contiguous(
+    at::Tensor& A,
+    at::Tensor& gate_weight,
+    at::Tensor& up_weight,
+    at::Tensor& scale_a,
+    at::Tensor& scale_gate,
+    at::Tensor& scale_up,
+    at::Tensor& scale_d,
+    at::Tensor& D,
+    int* grouped_layout,
+    cudaStream_t& stream) {
+    kernels::fp8_grouped_gemm_swiglu_contiguous(
+        A, gate_weight, up_weight, scale_a, scale_gate, scale_up,
+        scale_d, D, grouped_layout, stream);
+}
+
+void fp8_grouped_gemm_swiglu_masked(
+    at::Tensor& A,
+    at::Tensor& gate_weight,
+    at::Tensor& up_weight,
+    at::Tensor& scale_a,
+    at::Tensor& scale_gate,
+    at::Tensor& scale_up,
+    at::Tensor& scale_d,
+    at::Tensor& D,
+    int* grouped_layout,
+    cudaStream_t& stream) {
+    kernels::fp8_grouped_gemm_swiglu_masked(
+        A, gate_weight, up_weight, scale_a, scale_gate, scale_up,
+        scale_d, D, grouped_layout, stream);
+}
+
 void bf16_gemm(
     at::Tensor& A,
     at::Tensor& B,
@@ -41,59 +73,5 @@ void fp8_grouped_gemm_nt(
     cudaStream_t& stream) {
     kernels::fp8_grouped_gemm_nt(act, weight, output, gemm_type, grouped_layout, stream);
 }
-
-#ifdef MOE_CUDA_USE_MPI
-void a2a_dispatch(
-    All2All& all2all,
-    at::Tensor& out_expert_num_tokens,
-    at::Tensor& out_expert_x,
-    std::optional<at::Tensor>& out_expert_x_scale,
-    at::Tensor& dp_x,
-    std::optional<at::Tensor>& dp_x_scale,
-    at::Tensor& indices,
-    at::Tensor& weights,
-    std::optional<at::Tensor>& bound_m,
-    bool do_send,
-    bool do_recv,
-    cudaStream_t stream) {
-    kernels::a2a_dispatch(
-        all2all,
-        out_expert_num_tokens,
-        out_expert_x,
-        out_expert_x_scale,
-        dp_x,
-        dp_x_scale,
-        indices,
-        weights,
-        bound_m,
-        do_send,
-        do_recv,
-        stream);
-}
-
-void a2a_combine(
-    All2All& all2all,
-    at::Tensor& out_tokens,
-    at::Tensor& indices,
-    at::Tensor& weights,
-    at::Tensor& expert_y,
-    std::optional<at::Tensor>& bound_m,
-    bool do_send,
-    bool do_recv,
-    bool accumulate,
-    cudaStream_t stream) {
-    kernels::a2a_combine(
-        all2all,
-        out_tokens,
-        indices,
-        weights,
-        expert_y,
-        bound_m,
-        do_send,
-        do_recv,
-        accumulate,
-        stream);
-}
-#endif
 
 }  // namespace moe_cuda

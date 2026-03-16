@@ -7,6 +7,7 @@
 #include <moe_cuda/error.hpp>
 #include <moe_cuda/dtype.h>
 #include <c10/core/Device.h>
+#include <algorithm>
 #include <iostream>
 #include <cstdint>
 #include <sstream>
@@ -261,20 +262,20 @@ inline std::tuple<torch::Tensor, std::vector<size_t>, std::vector<size_t>> gener
     int& total_rows,
     int num_groups,
     int expected_m_per_group,
-    torch::Device device = torch::kCUDA
+    torch::Device device = torch::kCUDA,
+    bool padded = true,
+    uint64_t seed = 1234
 ) {
-    // Calculate padding interval to simulate sparse token assignment
-    // Similar to Python's random.uniform(0.7, 1.3) * expected_m_per_group
-    std::random_device rd;
-    std::mt19937 gen(rd());
+    std::mt19937 gen(static_cast<std::mt19937::result_type>(seed));
     std::uniform_real_distribution<float> dist(0.7f, 1.3f);
 
     std::vector<size_t> actual_ms;
     std::vector<size_t> aligned_ms;
     total_rows = 0;
     for (int i = 0; i < num_groups; i++) {
-        int actual_m = (int) (dist(gen) * expected_m_per_group);
-        int aligned_m = ((actual_m + 127) / 128) * 128;
+        int actual_m = padded ? static_cast<int>(dist(gen) * expected_m_per_group)
+                              : expected_m_per_group;
+        int aligned_m = padded ? ((actual_m + 127) / 128) * 128 : actual_m;
         actual_ms.push_back(actual_m);
         aligned_ms.push_back(aligned_m);
         total_rows += aligned_m;
@@ -303,20 +304,33 @@ inline std::tuple<torch::Tensor, std::vector<size_t>, std::vector<size_t>> gener
 // Returns a tensor of shape (num_groups,) containing the number of valid rows per group
 inline torch::Tensor generate_masked_grouped_layout(
     int64_t max_rows_per_group,
+    int64_t expected_rows_per_group,
     int num_groups,
-    torch::Device device = torch::kCUDA
+    torch::Device device = torch::kCUDA,
+    uint64_t seed = 1234
 ) {
+    std::mt19937 gen(static_cast<std::mt19937::result_type>(seed));
+    std::uniform_real_distribution<float> dist(0.7f, 1.3f);
+
     torch::Tensor layout = torch::empty({num_groups}, torch::TensorOptions().dtype(torch::kInt32));
     auto accessor = layout.accessor<int32_t, 1>();
 
-    // For testing, use varying row counts per group
     for (int g = 0; g < num_groups; g++) {
-        // Use a deterministic pattern: each group gets slightly different row count
-        int64_t rows = max_rows_per_group - (g % 4) * 32;
-        rows = std::max(rows, (int64_t)128);  // Minimum 128 rows
+        int64_t rows =
+            static_cast<int64_t>(dist(gen) * expected_rows_per_group);
+        rows = std::max<int64_t>(0, std::min(rows, max_rows_per_group));
         accessor[g] = static_cast<int32_t>(rows);
     }
     return layout.to(device);
+}
+
+inline torch::Tensor generate_masked_grouped_layout(
+    int64_t max_rows_per_group,
+    int num_groups,
+    torch::Device device = torch::kCUDA
+) {
+    return generate_masked_grouped_layout(max_rows_per_group, max_rows_per_group,
+                                          num_groups, device, 1234);
 }
 
 }

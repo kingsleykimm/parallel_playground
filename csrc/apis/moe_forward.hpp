@@ -6,9 +6,6 @@
 #include <optional>
 #include <string>
 #include <utility>
-#ifdef MOE_CUDA_USE_MPI
-#include <all2all/all2all.hpp>
-#endif
 
 namespace moe_cuda {
 
@@ -21,6 +18,30 @@ void bf16_gemm(
     at::Tensor& D,
     GemmType gemm_type,
     const std::string& compiled_dims,
+    int* grouped_layout,
+    cudaStream_t& stream);
+
+void fp8_grouped_gemm_swiglu_contiguous(
+    at::Tensor& A,
+    at::Tensor& gate_weight,
+    at::Tensor& up_weight,
+    at::Tensor& scale_a,
+    at::Tensor& scale_gate,
+    at::Tensor& scale_up,
+    at::Tensor& scale_d,
+    at::Tensor& D,
+    int* grouped_layout,
+    cudaStream_t& stream);
+
+void fp8_grouped_gemm_swiglu_masked(
+    at::Tensor& A,
+    at::Tensor& gate_weight,
+    at::Tensor& up_weight,
+    at::Tensor& scale_a,
+    at::Tensor& scale_gate,
+    at::Tensor& scale_up,
+    at::Tensor& scale_d,
+    at::Tensor& D,
     int* grouped_layout,
     cudaStream_t& stream);
 
@@ -40,33 +61,5 @@ void fp8_grouped_gemm_nt(
     GemmType gemm_type,
     int* grouped_layout,
     cudaStream_t& stream);
-
-#ifdef MOE_CUDA_USE_MPI
-void a2a_dispatch(
-    All2All& all2all,
-    at::Tensor& out_expert_num_tokens,
-    at::Tensor& out_expert_x,
-    std::optional<at::Tensor>& out_expert_x_scale,
-    at::Tensor& dp_x,
-    std::optional<at::Tensor>& dp_x_scale,
-    at::Tensor& indices,
-    at::Tensor& weights,
-    std::optional<at::Tensor>& bound_m,
-    bool do_send = true,
-    bool do_recv = true,
-    cudaStream_t stream = nullptr);
-
-void a2a_combine(
-    All2All& all2all,
-    at::Tensor& out_tokens,
-    at::Tensor& indices,
-    at::Tensor& weights,
-    at::Tensor& expert_y,
-    std::optional<at::Tensor>& bound_m,
-    bool do_send = true,
-    bool do_recv = true,
-    bool accumulate = false,
-    cudaStream_t stream = nullptr);
-#endif
 
 }  // namespace moe_cuda

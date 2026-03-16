@@ -1,7 +1,14 @@
-#pragma once
-#include <optional>
-#include <cuda.h>
+/**
+ @file All2All handler for token quantized MoE kernels, shared across all layers
+*/
 
+#pragma once
+#include <chrono>
+#include <optional>
+#include <utility>
+#include <atomic>
+#include <cuda.h>
+#include "utils.h"
 #include <runtime/utils.h>
 #include <moe_cuda/dtype.h>
 #include <runtime/parallel.h>
@@ -10,37 +17,32 @@
 #include <jit/utils/lazy_init.hpp>
 #include <jit/utils/common.hpp>
 #include <runtime/tensor.h>
-#ifdef MOE_CUDA_USE_MPI
-#include <mpi.h>
-#include "a2a_context.hpp"
-#endif
+#include "a2a_context_tk.hpp"
+#include <kittens.cuh>
+#include <pyutils/parallel_tensor.cuh>
 
 namespace moe_cuda {
 
     
-
-#ifdef MOE_CUDA_USE_MPI
 // System page size for padding
 constexpr int PAGE_SIZE = 4096; // 4KB
+constexpr int NUM_DEVICES = 4; // i'm only on a H100 x 4 node for now
 
-struct NVLinkLoad { // load to send through MPI
-    CUMemExportData sync_fd;
-    CUMemExportData recv_fd;
-    CUMemExportData send_fd;
-    CUMemExportData num_routed_fd;
-};
 
-struct NVLRankMappings {
-    CUMemMapping sync_mapping;
-    CUMemMapping recv_mapping;
-    CUMemMapping send_mapping;
-    CUMemMapping num_routed_mapping;
-};
-
-// entrypoint - api methods should call this method
+// entrypoint - api methods should call this method. this is only instantiated once per proces at the start
+template<int EXPERTS_PER_TOKEN, int NUM_EXPERTS, int TOKEN_DIM>
 class All2All {
 
     public:
+        struct RoutingDebugState {
+            at::Tensor tokens_per_expert;
+            at::Tensor source_rank;
+            at::Tensor source_dispatch_offset;
+            at::Tensor combine_send_offset;
+            at::Tensor padded_index;
+            uint32_t num_recv_tokens = 0;
+        };
+
         All2All (
             uint32_t max_num_tokens,
             uint32_t num_experts,
@@ -52,35 +54,37 @@ class All2All {
             std::optional<c10::ScalarType> scale_dtype,
             uint32_t num_experts_per_token,
             std::optional<uint32_t> max_private_tokens_opt,
-            std::optional<ParallelGroup> dp_group,
-            ParallelGroup node_group,
-            int device,
-            ParallelGroup global_group,
+            int local_rank,
+            ParallelConfig parallel_config,
             cudaStream_t stream
         ) {
+            HOST_ASSERT(parallel_config.world_size == NUM_DEVICES,
+                        "TK all2all currently expects a 4-GPU single-node run");
+            HOST_ASSERT(parallel_config.node_size == NUM_DEVICES,
+                        "TK all2all currently expects node_size == 4");
+            HOST_ASSERT(get_num_experts(num_experts) == NUM_EXPERTS,
+                        "Template NUM_EXPERTS must match runtime num_experts");
+            HOST_ASSERT(get_num_experts_per_token(num_experts_per_token) ==
+                            EXPERTS_PER_TOKEN,
+                        "Template EXPERTS_PER_TOKEN must match runtime top-k");
+            HOST_ASSERT(get_token_dim(hidden_dim) == TOKEN_DIM,
+                        "Template TOKEN_DIM must match runtime hidden_dim");
             this->initialized = true;
             this->hidden_dim = hidden_dim;
             this->hidden_dim_scale = hidden_dim_scale;
-            this->num_experts = num_experts;
+            this->num_experts = get_num_experts(num_experts);
             this->num_experts_per_token = num_experts_per_token;
             this->in_dtype = in_dtype;
             this->out_dtype = out_dtype;
             this->scale_dtype = scale_dtype;
-            this->device = device;
-            this->dp_group = dp_group;
-            this->node_group = node_group;
-            if (dp_group.has_value()) {
-                this->dp_size = dp_group->size;
-            }
-            else {
-                this->dp_size = 1;
-            }
-
-            // global group tells global parallel information
-            this->rank = global_group.rank;
-            this->world_size = global_group.size;
+            this->local_rank = local_rank;
+            this->rank = local_rank;
+            this->dp_group = local_rank / parallel_config.dp_size;
+            this->node_group = local_rank / parallel_config.node_size;
+            this->dp_size = parallel_config.dp_size;
+            this->world_size = parallel_config.world_size;
+            this->parallel_config = parallel_config;
             uint32_t num_dp_groups = this->world_size / this->dp_size;
-
             this->num_local_experts = host_ceil_div(this->num_experts, this->world_size);
 
             // recv buffer size
@@ -99,20 +103,15 @@ class All2All {
             uint32_t num_tokens = max_num_tokens * num_dp_groups;
             uint32_t max_recv_tokens = max_private_tokens * num_dp_groups; // private size for direct NVlink copies
 
-            // first min is to ensure there are at most num_tokens * num_local_experts, the maximum possible upper bound where all tokens get mapped to this rank
-            // the next max is to ensure at least num_local_experts * expert_padding is on each rank - this is the lower bound of expert tokens mapped to this device
+            // max_recv_tokens is bounded between [this->num_local_experts * expert_padding, num_tokens * num_experts_per_token]
+            // the actual value is the 
             max_recv_tokens += host_align(std::max(
                 std::min(num_tokens * num_experts_per_token 
                     + this->num_local_experts * (expert_padding - 1), 
-              this->num_local_experts * num_tokens),
-               this->num_local_experts * expert_padding), 
+              this->num_local_experts * num_tokens), // upper bound
+               this->num_local_experts * expert_padding), // lower bound
                expert_padding);
 
-            // num_routed initialization
-            // TODO: zero initialization here?
-            this->_num_routed_handle = CUMemAllocHandle(num_dp_groups * num_experts * sizeof(uint32_t), device, CUMemHandleKind::FileDescriptor);
-            this->_num_routed_mapping = _num_routed_handle.map(this->device);
-            
             // siz send buffer sizes + token_dim (combing optional scale factors)
             uint32_t token_dim_dispatch = host_align(hidden_dim * get_type_size(in_dtype), 16) + 16;
             if (hidden_dim_scale.has_value() && scale_dtype.has_value()) {
@@ -126,92 +125,106 @@ class All2All {
 
             uint32_t token_dim_combine = host_align(hidden_dim * get_type_size(in_dtype), 16);
             uint32_t token_dim = std::max(token_dim_combine, token_dim_dispatch);
+            (void)token_dim;
 
-
-            
-            uint32_t send_buffer_bytes = host_align(max_recv_tokens * token_dim, PAGE_SIZE);
-            this->_send_buffer_handle = CUMemAllocHandle (send_buffer_bytes, device, CUMemHandleKind::FileDescriptor);
-            this->_send_buffer_mapping = _send_buffer_handle.map(this->device);
-
-            this->_recv_buffer_handle = CUMemAllocHandle (send_buffer_bytes, device, CUMemHandleKind::FileDescriptor);
-            this->_recv_buffer_mapping = _recv_buffer_handle.map(this->device);
-            
-            std::vector<uint32_t *> sync_ptrs;
-            std::vector<uint8_t *> send_ptrs;
-            std::vector<uint8_t *> recv_ptrs;
-            std::vector<uint32_t *> num_routed_ptrs;
-            if (node_group.size > 1) { // nvlink buffers
-                printf("Setting up NVLink for node group size (%d)", node_group.size);
-
-                this->_sync_buffer_handle = CUMemAllocHandle(node_group.size * 2 * sizeof(uint32_t), this->device, CUMemHandleKind::FileDescriptor);
-                CUMemMapping sync_mapping = _sync_buffer_handle.map(this->device);
-                CUDA_CHECK(cudaMemset(sync_mapping.data_ptr(), 0, sizeof(uint32_t) * node_group.size * 2));
-
-                {
-                    auto local_handle = NVLinkLoad{
-                    this->_sync_buffer_handle.export_handle(),
-                    this->_recv_buffer_handle.export_handle(),
-                    this->_send_buffer_handle.export_handle(),
-                    this->_num_routed_handle.export_handle()
-                    };
-
-                    std::vector<NVLinkLoad> handles (node_group.size);
-                    MPI_Allgather(&local_handle, sizeof(local_handle), MPI_BYTE, handles.data(), sizeof(local_handle) * node_group.size, MPI_BYTE, node_group.comm);
-
-                    for (size_t i = 0; i < handles.size(); i++) {
-                        auto handle = handles[i];
-
-                        if (i == this->node_group.rank) {
-                            this->nvl_rank_mappings.push_back(NVLRankMappings {
-                                std::move(sync_mapping), std::move(this->_recv_buffer_mapping), std::move(this->_send_buffer_mapping), std::move(this->_num_routed_mapping)
-                            });
-                        }
-                        else {
-                            this->nvl_rank_mappings.push_back(NVLRankMappings {
-                                CUMemImportHandle::from_export(handle.sync_fd).map(this->device),
-                                CUMemImportHandle::from_export(handle.recv_fd).map(this->device),
-                                CUMemImportHandle::from_export(handle.send_fd).map(this->device),
-                                CUMemImportHandle::from_export(handle.num_routed_fd).map(this->device)
-                            });
-                        }
-                    }
-                    MPI_Barrier(node_group.comm);
-                }
-
-                for (uint32_t i = 0; i < node_group.size; i++) {
-                    recv_ptrs.push_back((uint8_t * )this->nvl_rank_mappings[i].recv_mapping.data_ptr());
-                    send_ptrs.push_back((uint8_t * )this->nvl_rank_mappings[i].recv_mapping.data_ptr());
-                    sync_ptrs.push_back((uint32_t * )this->nvl_rank_mappings[i].recv_mapping.data_ptr());
-                    num_routed_ptrs.push_back((uint32_t * )this->nvl_rank_mappings[i].num_routed_mapping.data_ptr());
-                }
-            }
-            this->context = All2AllContext(
+            this->context.emplace(
                 hidden_dim,
                 hidden_dim_scale,
                 get_type_size(in_dtype),
                 get_type_size(out_dtype),
                 out_dtype,
-                scale_dtype.has_value() ? get_type_size(scale_dtype.value()) : 0,
+                scale_dtype.has_value()
+                    ? std::optional<size_t>(get_type_size(scale_dtype.value()))
+                    : std::nullopt,
                 max_num_tokens,
                 max_recv_tokens,
                 max_private_tokens,
                 num_experts,
                 expert_padding,
                 num_experts_per_token,
-                rank,
-                dp_size,
-                node_group.size,
-                world_size,
-                (uint32_t * )this->_num_routed_mapping.data_ptr(),
-                (uint8_t * )this->_send_buffer_mapping.data_ptr(),
-                (uint8_t * )this->_recv_buffer_mapping.data_ptr(),
-                sync_ptrs.data(),
-                send_ptrs.data(),
-                recv_ptrs.data(),
-                num_routed_ptrs.data(),
-                device,
-                stream
-            );
+                this->rank,
+                this->dp_size,
+                parallel_config.node_size,
+                parallel_config.world_size,
+                stream);
+        }
+
+        RoutingDebugState debug_routing_state(cudaStream_t stream = nullptr) const {
+            HOST_ASSERT(initialized, "All2All handler is not initialized");
+            HOST_ASSERT(this->context.has_value(), "All2All context is not initialized");
+
+            auto effective_stream = stream != nullptr ? stream : this->context->stream;
+            auto opts =
+                at::TensorOptions()
+                    .dtype(c10::ScalarType::UInt32)
+                    .device(c10::Device(c10::DeviceType::CUDA, this->local_rank));
+
+            RoutingDebugState state;
+            state.num_recv_tokens = this->context->worker.num_recv_tokens;
+
+            c10::IntArrayRef size = {static_cast<int64_t>(this->num_local_experts)};
+            state.tokens_per_expert = at::empty(size, opts);
+
+            // cudaPointerAttributes attr;
+            // CUDA_CHECK(cudaPointerGetAttributes(&attr, this->context->worker.tokens_per_expert));
+            // printf("tokens_per_expert is in %s memory\n", attr.type == cudaMemoryTypeDevice ? "device" : "host");
+
+            
+            CUDA_CHECK(cudaMemcpyAsync(
+                (uint32_t *)state.tokens_per_expert.data_ptr(),
+                this->context->worker.tokens_per_expert,
+                this->num_local_experts * sizeof(uint32_t),
+                cudaMemcpyDeviceToDevice,
+                effective_stream));
+
+            state.source_rank =
+                at::empty({static_cast<int64_t>(state.num_recv_tokens)}, opts);
+            state.source_dispatch_offset =
+                at::empty({static_cast<int64_t>(state.num_recv_tokens)}, opts);
+            state.combine_send_offset =
+                at::empty({static_cast<int64_t>(state.num_recv_tokens)}, opts);
+            state.padded_index =
+                at::empty({static_cast<int64_t>(state.num_recv_tokens)}, opts);
+
+            if (state.num_recv_tokens > 0) {
+                CUDA_CHECK(cudaMemcpyAsync(
+                    (uint32_t * )state.source_rank.data_ptr(),
+                    this->context->worker.source_rank,
+                    state.num_recv_tokens * sizeof(uint32_t),
+                    cudaMemcpyDeviceToDevice,
+                    effective_stream));
+                CUDA_CHECK(cudaMemcpyAsync(
+                    (uint32_t * )state.source_dispatch_offset.data_ptr(),
+                    this->context->worker.source_dispatch_offset,
+                    state.num_recv_tokens * sizeof(uint32_t),
+                    cudaMemcpyDeviceToDevice,
+                    effective_stream));
+                CUDA_CHECK(cudaMemcpyAsync(
+                    (uint32_t * )state.combine_send_offset.data_ptr(),
+                    this->context->worker.combine_send_offset,
+                    state.num_recv_tokens * sizeof(uint32_t),
+                    cudaMemcpyDeviceToDevice,
+                    effective_stream));
+                CUDA_CHECK(cudaMemcpyAsync(
+                    (uint32_t * )state.padded_index.data_ptr(),
+                    this->context->worker.padded_index,
+                    state.num_recv_tokens * sizeof(uint32_t),
+                    cudaMemcpyDeviceToDevice,
+                    effective_stream));
+            }
+
+            return state;
+        }
+
+        at::Tensor debug_num_routed() const {
+            HOST_ASSERT(initialized, "All2All handler is not initialized");
+            HOST_ASSERT(this->context.has_value(), "All2All context is not initialized");
+            const auto& hw = this->context->worker.host_num_routed;
+            auto t = at::empty(
+                {static_cast<int64_t>(hw.size())},
+                at::TensorOptions().dtype(c10::ScalarType::UInt32).device(at::kCPU));
+            std::memcpy(t.data_ptr<uint32_t>(), hw.data(), hw.size() * sizeof(uint32_t));
+            return t;
         }
 
 
@@ -231,7 +244,7 @@ class All2All {
             HOST_ASSERT(initialized, "All2All handler is not initialized");
             HOST_ASSERT (do_send || do_recv, "do_send and do_recv must be true");    
 
-            HOST_ASSERT(out_expert_num_tokens.size(0) == num_local_experts, "Shape check failed");
+            HOST_ASSERT(out_expert_num_tokens.size(0) == this->num_local_experts, "Shape check failed");
             HOST_ASSERT(dtype_of(out_expert_num_tokens) == c10::ScalarType::UInt32, "Dtype check failed");
             uint32_t *out_expert_num_tokens_ptr = out_expert_num_tokens.data_ptr<uint32_t>();
 
@@ -239,7 +252,7 @@ class All2All {
             HOST_ASSERT(out_expert_x.dim() == 2, "Expected 2D tensor");
             HOST_ASSERT(out_expert_x.stride(1) == 1, "Expected stride of 1");
             HOST_ASSERT(dtype_of(out_expert_x) == this->in_dtype, "Dtype check failed");
-            uint8_t * out_x_ptr = out_expert_x.data_ptr<uint8_t>();
+            uint8_t * out_x_ptr = (uint8_t *) out_expert_x.data_ptr();
             uint32_t out_x_stride = get_type_size(this->in_dtype) * out_expert_x.stride(0); // in bytes
             
             float * out_x_scale_ptr = nullptr;
@@ -258,7 +271,7 @@ class All2All {
             HOST_ASSERT(dp_x.stride(1) == 1, "contiguous check");
             HOST_ASSERT(dtype_of(dp_x) == this->in_dtype, "input dtype check");
 
-            uint8_t * x_ptr = dp_x.data_ptr<uint8_t>();
+            uint8_t * x_ptr = (uint8_t *) dp_x.data_ptr();
             uint32_t x_stride = dp_x.stride(0);
 
             float * x_scale_ptr = nullptr;
@@ -296,34 +309,55 @@ class All2All {
             }
             
             if (do_send) {
-                this->context.dispatch_send(
+                if (get_env<int>("A2A_DEBUG") > 0) {
+                    CUDA_CHECK(cudaStreamSynchronize(stream));
+                    printf("launching dispatch send from all2all_tk.hpp\n");
+                }
+
+                this->context->dispatch_send(
+                    dp_x,
+                    dp_x_scale.value(),
+                    indices,
+                    weights,
+                    this->context->workspace.sync_counter,
                     dp_x.size(0),
-                    x_ptr,
-                    x_stride,
-                    x_scale_ptr, // can be nullptr if not
-                    x_scale_stride_elem, // these can be 0
-                     x_scale_stride_token,
-                      indices_ptr,
-                    indices_stride,
-                     weights_ptr,
-                     weights_stride,
-                    bound_m_ptr,
-                     stream
-                );
-            }
-
-            this->context.worker.process_routing_info(); // although there are cuda async functions in here, they are all done on the same stream per device
-
-            if (do_recv) {
-                this->context.dispatch_recv(
-                    out_expert_num_tokens_ptr,
-                    out_x_ptr,
-                    out_x_stride,
-                    reinterpret_cast<uint8_t*>(out_x_scale_ptr),
-                    out_x_scale_stride_elem,
-                    out_x_scale_stride_token,
                     stream
                 );
+                if (get_env<int>("A2A_DEBUG") > 0) {
+                    CUDA_CHECK(cudaStreamSynchronize(stream));
+                }
+            }
+            // wait on dispatch_route_done flag, then scatter num_routed through route_write_op
+
+
+            std::atomic_ref<uint8_t> dispatch_route_ptr(*this->context->worker.dispatch_route_done);
+            while (!dispatch_route_ptr.load()) {
+                std::this_thread::sleep_for(std::chrono::nanoseconds(1));
+            }
+            dispatch_route_ptr.store(0); // reset the flag
+            this->context->worker.route_write_op();
+            this->context->worker.process_routing_info();
+            CUDA_CHECK(cudaMemcpyAsync(
+                out_expert_num_tokens_ptr,
+                this->context->worker.tokens_per_expert,
+                this->num_local_experts * sizeof(uint32_t),
+                cudaMemcpyDeviceToDevice,
+                stream));
+
+            if (do_recv) {
+                if (get_env<int>("A2A_DEBUG") > 0) {
+                    CUDA_CHECK(cudaStreamSynchronize(stream));
+                    printf("launching dispatch recv from all2all_tk.hpp\n");
+                }
+                this->context->dispatch_recv(
+                    out_expert_x,
+                    out_expert_x_scale.value(),
+                    out_expert_num_tokens_ptr,
+                    stream
+                );
+                if (get_env<int>("A2A_DEBUG") > 0) {
+                    CUDA_CHECK(cudaStreamSynchronize(stream));
+                }
             }
         }
 
@@ -345,9 +379,9 @@ class All2All {
             uint32_t num_recv_tokens = expert_y.size(0);
             HOST_ASSERT(out_tokens.dim() == 2, "input tokens ndim == 2");
             HOST_ASSERT(out_tokens.stride(1) == 1, "contiguous check");
-            HOST_ASSERT(dtype_of(out_tokens) == this->in_dtype, "input dtype check");
+            HOST_ASSERT(dtype_of(out_tokens) == this->out_dtype, "input dtype check");
 
-            uint8_t * out_tokens_ptr = out_tokens.data_ptr<uint8_t>();
+            uint8_t * out_tokens_ptr = (uint8_t *) out_tokens.data_ptr();
             uint32_t out_tokens_stride = out_tokens.stride(0);
 
             HOST_ASSERT(indices.dim() == 2 && indices.size(0) == num_tokens && indices.size(1) == this->num_experts_per_token, "indices shape check");
@@ -363,7 +397,7 @@ class All2All {
             uint32_t weights_stride = weights.stride(0);
 
             HOST_ASSERT(expert_y.dim() == 2, "outputs should be 2 dimensional (even for batched)");
-            uint8_t * expert_y_ptr = expert_y.data_ptr<uint8_t>();
+            uint8_t * expert_y_ptr = (uint8_t *) expert_y.data_ptr();
             uint32_t expert_y_stride = expert_y.stride(0) * get_type_size(dtype_of(expert_y));
 
             uint32_t * bound_m_ptr = nullptr;
@@ -374,7 +408,7 @@ class All2All {
             }
 
             if (do_send) {
-                this->context.combine_send(
+                this->context->combine_send(
                     expert_y_ptr, // Y = XW output of groupped gemm kenrel
                     expert_y_stride,
                     stream
@@ -382,7 +416,7 @@ class All2All {
             }
 
             if (do_recv) {
-                this->context.combine_recv(
+                this->context->combine_recv(
                     num_tokens,// 
                     num_recv_tokens,
                     dtype_of(expert_y),
@@ -444,59 +478,20 @@ class All2All {
         std::optional<c10::ScalarType> scale_dtype;
         uint32_t num_experts_per_token;
         std::optional<uint32_t> max_private_tokens;
-        int device;
+        int local_rank;
         uint32_t num_local_experts;
         uint32_t rank;
         int world_size;
         int dp_size;
-        std::optional<ParallelGroup> dp_group;
-        ParallelGroup node_group;
-        bool initialized;
-        CUMemAllocHandle _send_buffer_handle, _recv_buffer_handle, _sync_buffer_handle, _num_routed_handle;
-        CUMemMapping _send_buffer_mapping, _recv_buffer_mapping, _num_routed_mapping;
-
-        std::vector<NVLRankMappings> nvl_rank_mappings; // this is used to persist the mappings we receive from other devices after importing
-        All2AllContext context;
+        int  dp_group;
+        int node_group;
+        ParallelConfig parallel_config;
+        bool initialized = false;
+        std::optional<All2AllContext<EXPERTS_PER_TOKEN, NUM_EXPERTS, TOKEN_DIM>> context;
 };
 
-#else
 
-class All2All {
-    public:
-        template <typename... Args>
-        explicit All2All(Args&&...) {
-            HOST_ERROR("All2All is unavailable in this build");
-        }
 
-        void dispatch(
-            at::Tensor&,
-            at::Tensor&,
-            std::optional<at::Tensor>&,
-            at::Tensor&,
-            std::optional<at::Tensor>&,
-            at::Tensor&,
-            at::Tensor&,
-            std::optional<at::Tensor>&,
-            bool = true,
-            bool = true,
-            cudaStream_t = nullptr) {
-            HOST_ERROR("All2All dispatch is unavailable in this build");
-        }
 
-        void combine(
-            at::Tensor&,
-            at::Tensor&,
-            at::Tensor&,
-            at::Tensor&,
-            std::optional<at::Tensor>&,
-            bool = true,
-            bool = true,
-            bool = false,
-            cudaStream_t = nullptr) {
-            HOST_ERROR("All2All combine is unavailable in this build");
-        }
-};
-
-#endif
 
 }  // namespace moe_cuda

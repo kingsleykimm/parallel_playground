@@ -41,7 +41,7 @@ struct SM90Arch {
 
   static std::pair<int, int> get_num_threads(uint32_t & block_m) {
     return std::make_pair(
-        32, (block_m <= 64 ? 1 : 2) * 128
+        128, (block_m <= 64 ? 1 : 2) * 128
     ); // returns (numTMAThreads, numWGMMAThreads)
   }
 

@@ -49,34 +49,20 @@ template <int _BM, int _BN, int _BK, typename c_dtype> struct fp8_tk_factory {
 // Supported configs: {64,128} x {64,128,256} x {64,128}
 #define TK_ALL_CONFIGS(MACRO, c_dtype_t)                                       \
   MACRO(64, 32, 128, c_dtype_t)                                                \
-  MACRO(64, 48, 128, c_dtype_t)                                                \
   MACRO(64, 64, 128, c_dtype_t)                                                \
-  MACRO(64, 80, 128, c_dtype_t)                                                \
   MACRO(64, 96, 128, c_dtype_t)                                                \
-  MACRO(64, 112, 128, c_dtype_t)                                               \
   MACRO(64, 128, 128, c_dtype_t)                                               \
-  MACRO(64, 144, 128, c_dtype_t)                                               \
   MACRO(64, 160, 128, c_dtype_t)                                               \
-  MACRO(64, 176, 128, c_dtype_t)                                               \
   MACRO(64, 192, 128, c_dtype_t)                                               \
-  MACRO(64, 208, 128, c_dtype_t)                                               \
   MACRO(64, 224, 128, c_dtype_t)                                               \
-  MACRO(64, 240, 128, c_dtype_t)                                               \
   MACRO(64, 256, 128, c_dtype_t)                                               \
   MACRO(128, 32, 128, c_dtype_t)                                               \
-  MACRO(128, 48, 128, c_dtype_t)                                               \
   MACRO(128, 64, 128, c_dtype_t)                                               \
-  MACRO(128, 80, 128, c_dtype_t)                                               \
   MACRO(128, 96, 128, c_dtype_t)                                               \
-  MACRO(128, 112, 128, c_dtype_t)                                              \
   MACRO(128, 128, 128, c_dtype_t)                                              \
-  MACRO(128, 144, 128, c_dtype_t)                                              \
   MACRO(128, 160, 128, c_dtype_t)                                              \
-  MACRO(128, 176, 128, c_dtype_t)                                              \
   MACRO(128, 192, 128, c_dtype_t)                                              \
-  MACRO(128, 208, 128, c_dtype_t)                                              \
   MACRO(128, 224, 128, c_dtype_t)                                              \
-  MACRO(128, 240, 128, c_dtype_t)                                              \
   MACRO(128, 256, 128, c_dtype_t)
 
 template <typename c_dtype>
@@ -158,8 +144,9 @@ struct fp8_grouped_tk_factory {
 
   // A / B / scale_b TMA descriptors span the full concatenated tensor.
   // C cols = total_N / num_groups:
-  //   contiguous (num_groups=1): C.cols = total_N   (all groups' output cols)
-  //   masked     (num_groups>1): C.cols = N_per_group (each group's own N cols)
+  //   contiguous (num_groups=1): C.cols = N_per_group   (all groups' output
+  //   cols) masked     (num_groups>1): C.cols = N_per_group (each group's own N
+  //   cols)
   static void build(void *out, void *A, void *B, void *C, void *scale_a,
                     void *scale_b, void *grouped_layout, size_t total_M,
                     size_t total_N, size_t K, int num_groups) {
@@ -169,9 +156,7 @@ struct fp8_grouped_tk_factory {
         {(c_dtype *)C, nullptr, nullptr, total_M, total_N / num_groups},
         {(float *)scale_a, nullptr, nullptr, K / 128, total_M},
         {(float *)scale_b, nullptr, nullptr, total_N / 128, K / 128},
-        (float *)grouped_layout,
-        /*cur_group_idx=*/0,
-        /*current_m_cumsum=*/0,
+        (int *)grouped_layout,
     };
     memcpy(out, &G, sizeof(G));
   }
@@ -180,23 +165,23 @@ struct fp8_grouped_tk_factory {
 #define TK_GROUPED_SIZE_CASE(bm, bn, bk, c_dtype_t)                            \
   if (bm_ == bm && bn_ == bn && bk_ == bk) {                                   \
     if (gemm_type_ == 0)                                                       \
-      return fp8_grouped_tk_factory<bm, bn, bk, 0, c_dtype_t>::size();        \
+      return fp8_grouped_tk_factory<bm, bn, bk, 0, c_dtype_t>::size();         \
     if (gemm_type_ == 1)                                                       \
-      return fp8_grouped_tk_factory<bm, bn, bk, 1, c_dtype_t>::size();        \
+      return fp8_grouped_tk_factory<bm, bn, bk, 1, c_dtype_t>::size();         \
   }
 
 #define TK_GROUPED_BUILD_CASE(bm, bn, bk, c_dtype_t)                           \
   if (bm_ == bm && bn_ == bn && bk_ == bk) {                                   \
     if (gemm_type_ == 0) {                                                     \
-      fp8_grouped_tk_factory<bm, bn, bk, 0, c_dtype_t>::build(                \
-          out, A, B, C, scale_a, scale_b, grouped_layout, total_M, total_N,   \
-          K, num_groups_);                                                     \
+      fp8_grouped_tk_factory<bm, bn, bk, 0, c_dtype_t>::build(                 \
+          out, A, B, C, scale_a, scale_b, grouped_layout, total_M, total_N, K, \
+          num_groups_);                                                        \
       return;                                                                  \
     }                                                                          \
     if (gemm_type_ == 1) {                                                     \
-      fp8_grouped_tk_factory<bm, bn, bk, 1, c_dtype_t>::build(                \
-          out, A, B, C, scale_a, scale_b, grouped_layout, total_M, total_N,   \
-          K, num_groups_);                                                     \
+      fp8_grouped_tk_factory<bm, bn, bk, 1, c_dtype_t>::build(                 \
+          out, A, B, C, scale_a, scale_b, grouped_layout, total_M, total_N, K, \
+          num_groups_);                                                        \
       return;                                                                  \
     }                                                                          \
   }
@@ -245,6 +230,54 @@ static void tk_build_grouped_globals_impl(int bm_, int bn_, int bk_,
   abort();
 }
 
+template <typename GL>
+static void dump_gl_layout(const char *name, const GL &gl) {
+  printf("  %s raw_ptr=%p batch=%d depth=%d rows=%d cols=%d numel=%zu\n", name,
+         static_cast<const void *>(gl.raw_ptr), gl.batch(), gl.depth(),
+         gl.rows(), gl.cols(), gl.numel());
+}
+
+template <int _BM, int _BN, int _BK, int GEMM_TYPE, typename c_dtype>
+static void tk_dump_grouped_globals_impl_typed(const void *globals_ptr) {
+  using globals_t =
+      typename kernel2::grouped_matmul_layout<_BM, _BN, _BK, GEMM_TYPE,
+                                              c_dtype>::globals;
+  const auto &G = *reinterpret_cast<const globals_t *>(globals_ptr);
+  printf("grouped globals size=%zu\n", sizeof(globals_t));
+  dump_gl_layout("A", G.A);
+  dump_gl_layout("B", G.B);
+  dump_gl_layout("C", G.C);
+  dump_gl_layout("scale_a", G.scale_a);
+  dump_gl_layout("scale_b", G.scale_b);
+  printf("  grouped_layout raw_ptr=%p\n",
+         static_cast<const void *>(G.grouped_layout));
+}
+
+#define TK_GROUPED_DUMP_CASE(bm, bn, bk, c_dtype_t)                            \
+  if (bm_ == bm && bn_ == bn && bk_ == bk) {                                   \
+    if (gemm_type_ == 0) {                                                     \
+      tk_dump_grouped_globals_impl_typed<bm, bn, bk, 0, c_dtype_t>(            \
+          globals_ptr);                                                        \
+      return;                                                                  \
+    }                                                                          \
+    if (gemm_type_ == 1) {                                                     \
+      tk_dump_grouped_globals_impl_typed<bm, bn, bk, 1, c_dtype_t>(            \
+          globals_ptr);                                                        \
+      return;                                                                  \
+    }                                                                          \
+  }
+
+template <typename c_dtype>
+static void tk_dump_grouped_globals_dispatch(int bm_, int bn_, int bk_,
+                                             int gemm_type_,
+                                             const void *globals_ptr) {
+  TK_ALL_GROUPED_CONFIGS(TK_GROUPED_DUMP_CASE, c_dtype)
+  fprintf(stderr,
+          "tk_dump_grouped_globals: unsupported config BM=%d BN=%d BK=%d\n",
+          bm_, bn_, bk_);
+  abort();
+}
+
 extern "C" size_t tk_grouped_globals_size(int bm_, int bn_, int bk_,
                                           int gemm_type_,
                                           c10::ScalarType c_dtype_) {
@@ -261,11 +294,13 @@ extern "C" size_t tk_grouped_globals_size(int bm_, int bn_, int bk_,
   }
 }
 
-extern "C" void tk_build_grouped_globals(
-    int bm_, int bn_, int bk_, int gemm_type_, int num_groups_,
-    c10::ScalarType c_dtype_, void *out, void *A, void *B, void *C,
-    void *scale_a, void *scale_b, void *grouped_layout, size_t total_M,
-    size_t total_N, size_t K) {
+extern "C" void tk_build_grouped_globals(int bm_, int bn_, int bk_,
+                                         int gemm_type_, int num_groups_,
+                                         c10::ScalarType c_dtype_, void *out,
+                                         void *A, void *B, void *C,
+                                         void *scale_a, void *scale_b,
+                                         void *grouped_layout, size_t total_M,
+                                         size_t total_N, size_t K) {
   switch (c_dtype_) {
   case c10::ScalarType::Float:
     tk_build_grouped_globals_impl<float>(bm_, bn_, bk_, gemm_type_, num_groups_,
@@ -284,6 +319,176 @@ extern "C" void tk_build_grouped_globals(
   }
 }
 
+extern "C" void tk_dump_grouped_globals(int bm_, int bn_, int bk_,
+                                        int gemm_type_,
+                                        c10::ScalarType c_dtype_,
+                                        const void *globals_ptr) {
+  switch (c_dtype_) {
+  case c10::ScalarType::Float:
+    tk_dump_grouped_globals_dispatch<float>(bm_, bn_, bk_, gemm_type_,
+                                            globals_ptr);
+    return;
+  case c10::ScalarType::BFloat16:
+    tk_dump_grouped_globals_dispatch<__nv_bfloat16>(bm_, bn_, bk_, gemm_type_,
+                                                    globals_ptr);
+    return;
+  default:
+    fprintf(stderr, "tk_dump_grouped_globals: unsupported output dtype=%d\n",
+            static_cast<int>(c_dtype_));
+    abort();
+  }
+}
+
 #undef TK_GROUPED_SIZE_CASE
 #undef TK_GROUPED_BUILD_CASE
 #undef TK_ALL_GROUPED_CONFIGS
+
+// =========== kernel3 factory (kernel3::grouped_matmul_layout) ===========
+// kernel3 globals differ from kernel2 in:
+//   - Two separate B tiles (gate, up) instead of one B
+//   - An out_scales layout for the quantized epilogue output
+//   - C.cols = N_per_group / 2  (silu-mul output is half the combined N)
+//   - scale_gate / scale_up cover total_N/2 rows (not total_N)
+//   - out_scales rows = N_per_group / (2 * _BN)  (N column-block count)
+#include <moe_cuda/kernels/kernel3.cuh>
+
+template <int _BM, int _BN, int _BK, int GEMM_TYPE, typename c_dtype>
+struct fp8_kernel3_factory {
+  using globals_t =
+      typename kernel3::grouped_matmul_layout<_BM, _BN, _BK, GEMM_TYPE,
+                                              c_dtype>::globals;
+
+  static size_t size() { return sizeof(globals_t); }
+
+  static void build(void *out,
+                    void *A, void *gate, void *up, void *C,
+                    void *scale_a, void *scale_gate, void *scale_up,
+                    void *out_scales, void *grouped_layout,
+                    size_t total_M, size_t total_N, size_t K, int num_groups) {
+    // gate and up each cover half of the combined N dimension per group
+    size_t half_total_N = total_N / 2;
+    size_t N_per_group  = total_N / (size_t)num_groups;
+
+    // out_scales rows = number of BN-wide N-blocks per group
+    // accessed with coord{coord_y, M_offset} where coord_y in [0, N_per_group/(2*_BN))
+    size_t out_scales_rows = N_per_group / (2 * _BN);
+
+    globals_t G{
+        {(fp8e4m3 *)A,          nullptr, nullptr, total_M,     K},
+        {(fp8e4m3 *)gate,       nullptr, nullptr, half_total_N, K},
+        {(fp8e4m3 *)up,         nullptr, nullptr, half_total_N, K},
+        {(c_dtype *)C,          nullptr, nullptr, total_M,     N_per_group / 2},
+        {(float *)scale_a,      nullptr, nullptr, K / 128,     total_M},
+        {(float *)scale_gate,   nullptr, nullptr, half_total_N / 128, K / 128},
+        {(float *)scale_up,     nullptr, nullptr, half_total_N / 128, K / 128},
+        {(float *)out_scales,   nullptr, nullptr, out_scales_rows, total_M},
+        (int *)grouped_layout,
+    };
+    memcpy(out, &G, sizeof(G));
+  }
+};
+
+#define TK_KERNEL3_SIZE_CASE(bm, bn, bk, c_dtype_t)                           \
+  if (bm_ == bm && bn_ == bn && bk_ == bk) {                                  \
+    if (gemm_type_ == 0)                                                      \
+      return fp8_kernel3_factory<bm, bn, bk, 0, c_dtype_t>::size();           \
+    if (gemm_type_ == 1)                                                      \
+      return fp8_kernel3_factory<bm, bn, bk, 1, c_dtype_t>::size();           \
+  }
+
+#define TK_KERNEL3_BUILD_CASE(bm, bn, bk, c_dtype_t)                          \
+  if (bm_ == bm && bn_ == bn && bk_ == bk) {                                  \
+    if (gemm_type_ == 0) {                                                    \
+      fp8_kernel3_factory<bm, bn, bk, 0, c_dtype_t>::build(                   \
+          out, A, gate, up, C, scale_a, scale_gate, scale_up, out_scales,     \
+          grouped_layout, total_M, total_N, K, num_groups_);                  \
+      return;                                                                  \
+    }                                                                          \
+    if (gemm_type_ == 1) {                                                    \
+      fp8_kernel3_factory<bm, bn, bk, 1, c_dtype_t>::build(                   \
+          out, A, gate, up, C, scale_a, scale_gate, scale_up, out_scales,     \
+          grouped_layout, total_M, total_N, K, num_groups_);                  \
+      return;                                                                  \
+    }                                                                          \
+  }
+
+// kernel3 only supports BN that is a multiple of 128
+#define TK_ALL_KERNEL3_CONFIGS(MACRO, c_dtype_t)                               \
+  MACRO(64,  128, 128, c_dtype_t)                                              \
+  MACRO(128, 128, 128, c_dtype_t)
+
+template <typename c_dtype>
+static size_t tk_kernel3_globals_size_impl(int bm_, int bn_, int bk_,
+                                           int gemm_type_) {
+  TK_ALL_KERNEL3_CONFIGS(TK_KERNEL3_SIZE_CASE, c_dtype)
+  fprintf(stderr,
+          "tk_kernel3_globals_size: unsupported config BM=%d BN=%d BK=%d\n",
+          bm_, bn_, bk_);
+  abort();
+}
+
+template <typename c_dtype>
+static void tk_build_kernel3_globals_impl(int bm_, int bn_, int bk_,
+                                          int gemm_type_, int num_groups_,
+                                          void *out,
+                                          void *A, void *gate, void *up, void *C,
+                                          void *scale_a, void *scale_gate,
+                                          void *scale_up, void *out_scales,
+                                          void *grouped_layout,
+                                          size_t total_M, size_t total_N,
+                                          size_t K) {
+  TK_ALL_KERNEL3_CONFIGS(TK_KERNEL3_BUILD_CASE, c_dtype)
+  fprintf(stderr,
+          "tk_build_kernel3_globals: unsupported config BM=%d BN=%d BK=%d\n",
+          bm_, bn_, bk_);
+  abort();
+}
+
+extern "C" size_t tk_kernel3_globals_size(int bm_, int bn_, int bk_,
+                                          int gemm_type_,
+                                          c10::ScalarType c_dtype_) {
+  switch (c_dtype_) {
+  case c10::ScalarType::Float:
+    return tk_kernel3_globals_size_impl<float>(bm_, bn_, bk_, gemm_type_);
+  case c10::ScalarType::BFloat16:
+    return tk_kernel3_globals_size_impl<__nv_bfloat16>(bm_, bn_, bk_,
+                                                       gemm_type_);
+  default:
+    fprintf(stderr, "tk_kernel3_globals_size: unsupported output dtype=%d\n",
+            static_cast<int>(c_dtype_));
+    abort();
+  }
+}
+
+extern "C" void tk_build_kernel3_globals(int bm_, int bn_, int bk_,
+                                         int gemm_type_, int num_groups_,
+                                         c10::ScalarType c_dtype_, void *out,
+                                         void *A, void *gate, void *up, void *C,
+                                         void *scale_a, void *scale_gate,
+                                         void *scale_up, void *out_scales,
+                                         void *grouped_layout,
+                                         size_t total_M, size_t total_N,
+                                         size_t K) {
+  switch (c_dtype_) {
+  case c10::ScalarType::Float:
+    tk_build_kernel3_globals_impl<float>(
+        bm_, bn_, bk_, gemm_type_, num_groups_, out,
+        A, gate, up, C, scale_a, scale_gate, scale_up, out_scales,
+        grouped_layout, total_M, total_N, K);
+    return;
+  case c10::ScalarType::BFloat16:
+    tk_build_kernel3_globals_impl<__nv_bfloat16>(
+        bm_, bn_, bk_, gemm_type_, num_groups_, out,
+        A, gate, up, C, scale_a, scale_gate, scale_up, out_scales,
+        grouped_layout, total_M, total_N, K);
+    return;
+  default:
+    fprintf(stderr, "tk_build_kernel3_globals: unsupported output dtype=%d\n",
+            static_cast<int>(c_dtype_));
+    abort();
+  }
+}
+
+#undef TK_KERNEL3_SIZE_CASE
+#undef TK_KERNEL3_BUILD_CASE
+#undef TK_ALL_KERNEL3_CONFIGS

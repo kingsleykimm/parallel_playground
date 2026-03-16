@@ -6,7 +6,9 @@ cd "${ROOT_DIR}"
 
 if [[ -f ".env" ]]; then
   # shellcheck disable=SC1091
+  set +u
   source .env
+  set -u
 fi
 
 # --- Submodules (only when inside a git repo) ---
@@ -29,28 +31,33 @@ check_dir() {
 mkdir -p moe_cuda/include
 check_dir "ThunderKittens headers"     "${ROOT_DIR}/third-party/ThunderKittens/include"
 
-# --- CMake configure + build ---
-BUILD_DIR="${BUILD_DIR:-build}"
-BUILD_TYPE="${CMAKE_BUILD_TYPE:-Release}"
-JOBS="${JOBS:-$(nproc)}"
+# Wipe old artifacts to avoid stale extension/binary mismatches.
+rm -rf build build_* dist
+rm -rf ./*.egg-info
+rm -f ./*.so
 
-CMAKE_EXTRA_ARGS=()
-if [[ -n "${Torch_DIR:-}" ]]; then
-  CMAKE_EXTRA_ARGS+=("-DTorch_DIR=${Torch_DIR}")
+PYTHON_BIN="${PYTHON:-}"
+if [[ -z "${PYTHON_BIN}" ]]; then
+  if command -v python >/dev/null 2>&1; then
+    PYTHON_BIN="$(command -v python)"
+  else
+    echo "Error: python not found. Set PYTHON=/path/to/python or activate an environment." >&2
+    exit 1
+  fi
 fi
 
-cmake -S . -B "${BUILD_DIR}" \
-  -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
-  -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
-  -DMPI_SKIP_COMPILER_WRAPPER=TRUE \
-  -U MPI_* \
-  "${CMAKE_EXTRA_ARGS[@]}"
+"${PYTHON_BIN}" setup.py build
 
-cmake --build "${BUILD_DIR}" -j"${JOBS}"
+so_file="$("${PYTHON_BIN}" - <<'PY'
+import glob
+matches = sorted(glob.glob("build/**/moe_cuda*.so", recursive=True))
+print(matches[0] if matches else "")
+PY
+)"
+if [[ -z "${so_file}" ]]; then
+  echo "Error: no built moe_cuda*.so found under build/" >&2
+  exit 1
+fi
 
-
-# Symlink compile_commands.json to root so clangd picks it up automatically
-ln -sfn "${BUILD_DIR}/compile_commands.json" "${ROOT_DIR}/compile_commands.json"
-echo "Linked compile_commands.json -> ${BUILD_DIR}/compile_commands.json"
-
-echo "Build complete. Artifacts: ${BUILD_DIR}/"
+ln -sfn "${so_file}" "./$(basename "${so_file}")"
+echo "Linked module: $(basename "${so_file}") -> ${so_file}"

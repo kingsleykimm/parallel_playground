@@ -102,7 +102,7 @@ inline void sm90_transpose_sf(at::Tensor& sf, at::Tensor& transposed_sf, cudaStr
     size_t k = sf.size(2);
     // determine BLOCK_MN with a small heuristic search based off of mn size
     const auto [block_mn, num_threads, smem_size] = get_transpose_config(mn, k);
-    const size_t aligned_mn = ti_align(mn, 16 / get_type_size(dtype_of(sf)));
+    const size_t aligned_mn = host_align(mn, 16 / get_type_size(dtype_of(sf)));
     LaunchConfig launch_config = {
         dim3(num_threads), dim3(ti_ceil_div(mn, block_mn), num_groups),
         stream, smem_size, 1
@@ -134,7 +134,7 @@ inline void sm90_transpose_bf16(
 )
 {
     const auto [block_mn, num_threads, smem_size] = get_transpose_config(mn, k, c10::ScalarType::BFloat16);
-    const size_t aligned_mn = ti_align(mn, alignment / 2);
+    const size_t aligned_mn = host_align(mn, alignment / 2);
     LaunchConfig launch_config = {
         dim3(num_threads), dim3(ti_ceil_div(mn, block_mn), num_groups),
         stream, smem_size, 1
@@ -168,7 +168,7 @@ inline void sm90_transpose_fp32(
 )
 {
     const auto [block_mn, num_threads, smem_size] = get_transpose_config(mn, k);
-    const size_t aligned_mn = ti_align(mn, alignment / 4);
+    const size_t aligned_mn = host_align(mn, alignment / 4);
     LaunchConfig launch_config = {
         dim3(num_threads), dim3(ti_ceil_div(mn, block_mn), num_groups),
         stream, smem_size, 1
