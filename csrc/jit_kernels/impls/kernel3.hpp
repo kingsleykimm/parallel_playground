@@ -35,7 +35,7 @@ public:
         int num_stages;
         int smem_size;
         int gemm_type;  // 0 = MGroupedMasked, 1 = MGroupedContiguous
-        at::ScalarType c_dtype;
+        c10::ScalarType c_dtype;
         LaunchConfig launch_config;
     };
 

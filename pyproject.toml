@@ -26,7 +26,10 @@ classifiers = [
 ]
 
 dependencies = [
+    "deepspeed>=0.18.8",
+    "liger-kernel>=0.7.0",
     "torch>=2.0.0",
+    "transformer-engine[pytorch]>=2.12.0",
     "vllm>=0.17.1",
 ]
 

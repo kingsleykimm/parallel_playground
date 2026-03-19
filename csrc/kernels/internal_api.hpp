@@ -29,15 +29,17 @@ void fused_silu_mul_quant(
     cudaStream_t stream);
 
 void fp8_gemm_nt(
-    std::pair<at::Tensor&, at::Tensor&> act,
-    std::pair<at::Tensor&, at::Tensor&> weight,
+    at::Tensor& act,
+    at::Tensor& act_scale,
+    at::Tensor& weight,
+    at::Tensor& weight_scale,
     at::Tensor& output,
     GemmType gemm_type,
     const std::string& compiled_dims,
     int* grouped_layout,
     cudaStream_t& stream);
 
-void fp8_grouped_gemm_swiglu_contiguous(
+void fp8_grouped_gemm_swiglu(
     at::Tensor& A,
     at::Tensor& gate_weight,
     at::Tensor& up_weight,
@@ -46,10 +48,11 @@ void fp8_grouped_gemm_swiglu_contiguous(
     at::Tensor& scale_up,
     at::Tensor& scale_d,
     at::Tensor& D,
+    GemmType gemm_type,
     int* grouped_layout,
     cudaStream_t& stream);
 
-void fp8_grouped_gemm_swiglu_masked(
+void fp8_grouped_gemm_swiglu_consumer_pp(
     at::Tensor& A,
     at::Tensor& gate_weight,
     at::Tensor& up_weight,
@@ -58,12 +61,16 @@ void fp8_grouped_gemm_swiglu_masked(
     at::Tensor& scale_up,
     at::Tensor& scale_d,
     at::Tensor& D,
+    GemmType gemm_type,
     int* grouped_layout,
-    cudaStream_t& stream);
+    cudaStream_t& stream);    
+
 
 void fp8_grouped_gemm_nt(
-    std::pair<at::Tensor&, at::Tensor&> act,
-    std::pair<at::Tensor&, at::Tensor&> weight,
+    at::Tensor& act,
+    at::Tensor& act_scale,
+    at::Tensor& weight,
+    at::Tensor& weight_scale,
     at::Tensor& output,
     GemmType gemm_type,
     int* grouped_layout,
@@ -79,33 +86,6 @@ void bf16_gemm(
     int* grouped_layout,
     cudaStream_t& stream);
 
-// template <typename All2AllT>
-// inline void a2a_dispatch(
-//     All2AllT& all2all,
-//     at::Tensor& out_expert_num_tokens,
-//     at::Tensor& out_expert_x,
-//     std::optional<at::Tensor>& out_expert_x_scale,
-//     at::Tensor& dp_x,
-//     std::optional<at::Tensor>& dp_x_scale,
-//     at::Tensor& indices,
-//     at::Tensor& weights,
-//     std::optional<at::Tensor>& bound_m,
-//     bool do_send = true,
-//     bool do_recv = true,
-//     cudaStream_t stream = nullptr);
-
-// template <typename All2AllT>
-// inline void a2a_combine(
-//     All2AllT& all2all,
-//     at::Tensor& out_tokens,
-//     at::Tensor& indices,
-//     at::Tensor& weights,
-//     at::Tensor& expert_y,
-//     std::optional<at::Tensor>& bound_m,
-//     bool do_send = true,
-//     bool do_recv = true,
-//     bool accumulate = false,
-//     cudaStream_t stream = nullptr);
 
 }  // namespace kernels
 }  // namespace moe_cuda

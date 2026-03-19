@@ -27,7 +27,7 @@
 #include <torch/torch.h>
 
 #include "test_utils.h"
-#include <apis/moe_forward.hpp>
+#include <kernels/internal_api.hpp>
 #include <jit/compiler.hpp>
 #include <moe_cuda/types.h>
 #include <runtime/utils.h>
@@ -36,6 +36,7 @@ using test_utils::calc_diff;
 
 // BN used by kernel3 (the only supported block-N size).
 static constexpr int KERNEL3_BN = 128;
+static constexpr int KERNEL4_BM = 128;
 
 struct TestShape {
     int64_t M;        // expected tokens per group
@@ -66,6 +67,7 @@ struct Config {
     GemmType type = GemmType::MGroupedContiguous;
     uint64_t seed = 1234;
     bool verbose = false;
+    bool is_consumer_pp = false;
 };
 
 static bool parse_args(int argc, char** argv, Config& cfg) {
@@ -77,6 +79,7 @@ static bool parse_args(int argc, char** argv, Config& cfg) {
         else if ((a == "--groups") && i + 1 < argc) { cfg.groups = std::stoi(argv[++i]); }
         else if ((a == "--seed")   && i + 1 < argc) { cfg.seed = std::stoull(argv[++i]); }
         else if  (a == "--verbose") { cfg.verbose = true; }
+        else if (a == "--pingpong") { cfg.is_consumer_pp = true; }
         else if ((a == "--type")   && i + 1 < argc) {
             std::string t = argv[++i];
             if      (t == "contiguous") cfg.type = GemmType::MGroupedContiguous;
@@ -101,7 +104,7 @@ static torch::Tensor compute_swiglu_ref(
     torch::Device dev)
 {
     auto ref = torch::zeros({total_M, N_out},
-                            torch::TensorOptions().dtype(torch::kFloat32).device(dev));
+                            torch::TensorOptions().dtype(torch::kBFloat16).device(dev));
     using S = torch::indexing::Slice;
     for (int g = 0; g < groups; ++g) {
         std::vector<int64_t> rows_g;
@@ -139,12 +142,12 @@ static torch::Tensor dequantize_fp8(
     auto scale_t = scale_d.t().contiguous();              // (total_M, cblocks)
     auto scale_b = scale_t.unsqueeze(-1).expand({total_M, cblocks, KERNEL3_BN})
                           .reshape({total_M, N_out});     // (total_M, N_out)
-    return D_f32 * scale_b;
+    return (D_f32 * scale_b).to(torch::kBFloat16);
 }
 
 // ========================= Contiguous =========================
 static bool run_contiguous(int64_t expected_m_per_group, int64_t N, int64_t K,
-                            int groups, uint64_t seed, bool verbose)
+                            int groups, uint64_t seed, bool verbose, bool is_consumer_pp = false)
 {
     auto dev      = torch::Device(torch::kCUDA);
     auto bf16     = torch::TensorOptions().dtype(torch::kBFloat16).device(dev);
@@ -174,7 +177,7 @@ static bool run_contiguous(int64_t expected_m_per_group, int64_t N, int64_t K,
 
     // Reference in float32
     auto ref = compute_swiglu_ref(
-        A.to(torch::kFloat32), gate.to(torch::kFloat32), up.to(torch::kFloat32),
+        A, gate, up,
         layout_cpu, total_M, groups, N_out, dev);
 
     // Quantize A: scale_a (K/128, total_M) MN-major
@@ -200,9 +203,15 @@ static bool run_contiguous(int64_t expected_m_per_group, int64_t N, int64_t K,
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
     auto t0 = std::chrono::high_resolution_clock::now();
-    moe_cuda::fp8_grouped_gemm_swiglu_contiguous(
-        A_t, gate_t, up_t, sfa_t, sfg_t, sfu_t, sd_t, D_t,
-        layout_gpu.data_ptr<int>(), stream);
+    if (is_consumer_pp) {
+        moe_cuda::kernels::fp8_grouped_gemm_swiglu_consumer_pp(
+            A_t, gate_t, up_t, sfa_t, sfg_t, sfu_t, sd_t, D_t,
+            GemmType::MGroupedContiguous, layout_gpu.data_ptr<int>(), stream);
+    } else {
+        moe_cuda::kernels::fp8_grouped_gemm_swiglu(
+            A_t, gate_t, up_t, sfa_t, sfg_t, sfu_t, sd_t, D_t,
+            GemmType::MGroupedContiguous, layout_gpu.data_ptr<int>(), stream);
+    }
     CUDA_CHECK(cudaStreamSynchronize(stream));
     auto t1 = std::chrono::high_resolution_clock::now();
     CUDA_CHECK(cudaStreamDestroy(stream));
@@ -223,6 +232,8 @@ static bool run_contiguous(int64_t expected_m_per_group, int64_t N, int64_t K,
         auto out_v = D_dequant.index_select(0, idx);
         diff = calc_diff(ref_v, out_v);
         if (verbose) test_utils::check_tensor_close(ref_v, out_v, 0.1f, 0.1f);
+        auto error = (D_dequant - ref);
+        printf("mean error = %f, std error = %f\n", error.abs().mean().item<float>(), error.abs().std().item<float>());
     }
 
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
@@ -237,7 +248,7 @@ static bool run_contiguous(int64_t expected_m_per_group, int64_t N, int64_t K,
 
 // ========================= Masked =========================
 static bool run_masked(int64_t max_M, int64_t expected_m_per_group, int64_t N,
-                       int64_t K, int groups, uint64_t seed, bool verbose)
+                       int64_t K, int groups, uint64_t seed, bool verbose, bool is_consumer_pp = false)
 {
     auto dev      = torch::Device(torch::kCUDA);
     auto bf16     = torch::TensorOptions().dtype(torch::kBFloat16).device(dev);
@@ -269,13 +280,12 @@ static bool run_masked(int64_t max_M, int64_t expected_m_per_group, int64_t N,
     auto up   = torch::randn({(int64_t)groups, N_out, K}, bf16) * s;
 
     // Reference in float32
-    auto A_flat_f32 = A.reshape({total_M, K}).to(torch::kFloat32);
+    auto A_flat = A.reshape({total_M, K});
     auto ref = compute_swiglu_ref(
-        A_flat_f32, gate.to(torch::kFloat32), up.to(torch::kFloat32),
+        A_flat, gate, up,
         layout_flat, total_M, groups, N_out, dev);
 
     // Quantize A: reshape to (total_M, K) for 1D block quant, then MN-major
-    auto A_flat = A.reshape({total_M, K});
     auto [A_fp8_flat, sfa] = test_utils::quantize_fp8_1d_block(A_flat, Major::K, dev);
     sfa = sfa.reshape({total_M, K / 128}).transpose(-1, -2).contiguous();
     auto A_fp8 = A_fp8_flat.reshape({(int64_t)groups, max_M, K});
@@ -298,9 +308,15 @@ static bool run_masked(int64_t max_M, int64_t expected_m_per_group, int64_t N,
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
     auto t0 = std::chrono::high_resolution_clock::now();
-    moe_cuda::fp8_grouped_gemm_swiglu_masked(
-        A_t, gate_t, up_t, sfa_t, sfg_t, sfu_t, sd_t, D_t,
-        layout_gpu.data_ptr<int>(), stream);
+    if (is_consumer_pp) {
+        moe_cuda::kernels::fp8_grouped_gemm_swiglu_consumer_pp(
+            A_t, gate_t, up_t, sfa_t, sfg_t, sfu_t, sd_t, D_t,
+            GemmType::MGroupedMasked, layout_gpu.data_ptr<int>(), stream);
+    } else {
+        moe_cuda::kernels::fp8_grouped_gemm_swiglu(
+            A_t, gate_t, up_t, sfa_t, sfg_t, sfu_t, sd_t, D_t,
+            GemmType::MGroupedMasked, layout_gpu.data_ptr<int>(), stream);
+    }
     CUDA_CHECK(cudaStreamSynchronize(stream));
     auto t1 = std::chrono::high_resolution_clock::now();
     CUDA_CHECK(cudaStreamDestroy(stream));
@@ -322,6 +338,8 @@ static bool run_masked(int64_t max_M, int64_t expected_m_per_group, int64_t N,
         auto out_cat = torch::cat(out_parts, 0);
         diff = calc_diff(ref_cat, out_cat);
         if (verbose) test_utils::check_tensor_close(ref_cat, out_cat, 0.1f, 0.1f);
+        auto error = (out_cat - ref_cat);
+        printf("mean error = %f, std error = %f\n", error.abs().mean().item<float>(), error.abs().std().item<float>());
     }
 
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
@@ -354,9 +372,9 @@ int main(int argc, char** argv)
 
     auto run_one = [&](const TestShape& s) {
         bool ok = (s.type == GemmType::MGroupedContiguous)
-            ? run_contiguous(s.M, s.N, s.K, s.groups, cfg.seed, cfg.verbose)
+            ? run_contiguous(s.M, s.N, s.K, s.groups, cfg.seed, cfg.verbose, cfg.is_consumer_pp)
             : run_masked(s.M, s.expected_m_per_group, s.N, s.K,
-                         s.groups, cfg.seed, cfg.verbose);
+                         s.groups, cfg.seed, cfg.verbose, cfg.is_consumer_pp);
         if (ok) ++passed; else ++failed;
     };
 

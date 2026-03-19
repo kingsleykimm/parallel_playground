@@ -33,7 +33,7 @@ __forceinline__ __device__ uint32_t pack_float_2(float a, float b) {
 }
 
 // store into shared, "l" = long, "f" = float
-__device__ void st_shared(const __nv_bfloat16 *ptr, __nv_bfloat16 val) {
+__forceinline__ __device__ void st_shared(const __nv_bfloat16 *ptr, __nv_bfloat16 val) {
   uint16_t val16 = __bfloat16_as_ushort(val);
   asm volatile("{ st.shared.u16 [%0], %1; }"
                :
@@ -41,39 +41,39 @@ __device__ void st_shared(const __nv_bfloat16 *ptr, __nv_bfloat16 val) {
                :);
 }
 
-__device__ void st_shared(const float *ptr, float val) {
+__forceinline__ __device__ void st_shared(const float *ptr, float val) {
   asm volatile("{ st.shared.f32 [%0], %1; }"
                :
                : "l"(__cvta_generic_to_shared(ptr)), "f"(val)
                :);
 }
 
-__device__ void st_shared(const float2 *ptr, float2 val) {
+__forceinline__ __device__ void st_shared(const float2 *ptr, float2 val) {
   asm volatile("{ st.shared.v2.f32 [%0], {%1, %2}; }"
                :
                : "l"(__cvta_generic_to_shared(ptr)), "f"(val.x), "f"(val.y)
                :);
 }
 
-__device__ void st_shared(const uint32_t *ptr, uint32_t val) {
+__forceinline__ __device__ void st_shared(const uint32_t *ptr, uint32_t val) {
   asm volatile(
       "{ st.shared.u32 [%0], %1; }" ::"l"(__cvta_generic_to_shared(ptr)),
       "r"(val));
 }
 
-__device__ void st_shared(const uint2 *ptr, uint2 val) {
+__forceinline__ __device__ void st_shared(const uint2 *ptr, uint2 val) {
   asm volatile("{ st.shared.v2.u32 [%0], {%1, %2}; }" ::"l"(
                    __cvta_generic_to_shared(ptr)),
                "r"(val.x), "r"(val.y));
 }
 
-__device__ void st_shared(const uint4 *ptr, uint4 val) {
+__forceinline__ __device__ void st_shared(const uint4 *ptr, uint4 val) {
   asm volatile("{st.shared.v4.u32 [%0], {%1, %2, %3, %4};}" ::"l"(
                    __cvta_generic_to_shared(ptr)),
                "r"(val.x), "r"(val.y), "r"(val.z), "r"(val.w));
 }
 
-__device__ float ld_shared(float *ptr) {
+__forceinline__ __device__ float ld_shared(float *ptr) {
   float ret;
   asm volatile("{ ld.shared.f32 %0, [%1]; }"
                : "=f"(ret)
@@ -82,7 +82,7 @@ __device__ float ld_shared(float *ptr) {
   return ret;
 }
 
-__device__ float2 ld_shared(float2 *ptr) {
+__forceinline__ __device__ float2 ld_shared(float2 *ptr) {
   float ret1, ret2;
   asm volatile("{ ld.shared.v2.f32 {%0, %1}, [%2]; }"
                : "=f"(ret1), "=f"(ret2)
@@ -91,7 +91,7 @@ __device__ float2 ld_shared(float2 *ptr) {
   return make_float2(ret1, ret2);
 }
 
-__device__ float4 ld_shared(float4 *ptr) {
+__forceinline__ __device__ float4 ld_shared(float4 *ptr) {
   float ret1, ret2, ret3, ret4;
   asm volatile("{ ld.shared.v4.f32 {%0, %1, %2, %3}, [%4]; }"
                : "=f"(ret1), "=f"(ret2), "=f"(ret3), "=f"(ret4)
@@ -100,7 +100,7 @@ __device__ float4 ld_shared(float4 *ptr) {
   return make_float4(ret1, ret2, ret3, ret4);
 }
 
-__device__ __nv_bfloat162 ld_sharedbf16x2(__nv_bfloat16 *ptr) {
+__forceinline__ __device__ __nv_bfloat162 ld_sharedbf16x2(__nv_bfloat16 *ptr) {
   uint32_t ret;
   asm volatile("{ ld.shared.u32 %0, [%1]; }"
                : "=r"(ret)
@@ -109,7 +109,7 @@ __device__ __nv_bfloat162 ld_sharedbf16x2(__nv_bfloat16 *ptr) {
   return *reinterpret_cast<__nv_bfloat162 *>(&ret);
 }
 
-__device__ __nv_bfloat16 ld_shared(__nv_bfloat16 *ptr) {
+__forceinline__ __device__ __nv_bfloat16 ld_shared(__nv_bfloat16 *ptr) {
   uint16_t ret;
   asm volatile("{ ld.shared.u16 %0, [%1]; }"
                : "=h"(ret)
@@ -119,7 +119,7 @@ __device__ __nv_bfloat16 ld_shared(__nv_bfloat16 *ptr) {
   ;
 }
 
-__device__ uint32_t ld_shared(uint32_t *ptr) {
+__forceinline__ __device__ uint32_t ld_shared(uint32_t *ptr) {
   uint32_t ret;
   asm volatile("{ ld.shared.u32 %0, [%1]; }"
                : "=r"(ret)
@@ -128,7 +128,7 @@ __device__ uint32_t ld_shared(uint32_t *ptr) {
   return ret;
 }
 
-__device__ uint2 ld_shared(uint2 *ptr) {
+__forceinline__ __device__ uint2 ld_shared(uint2 *ptr) {
   uint32_t ret1, ret2;
   asm volatile("{ ld.shared.v2.u32 {%0, %1}, [%2]; }"
                : "=r"(ret1), "=r"(ret2)
@@ -137,7 +137,7 @@ __device__ uint2 ld_shared(uint2 *ptr) {
   return make_uint2(ret1, ret2);
 }
 
-__device__ uint4 ld_shared(uint4 *ptr) {
+__forceinline__ __device__ uint4 ld_shared(uint4 *ptr) {
   uint32_t ret1, ret2, ret3, ret4;
   asm volatile("{ ld.shared.v4.u32 {%0, %1, %2, %3}, [%4]; }"
                : "=r"(ret1), "=r"(ret2), "=r"(ret3), "=r"(ret4)
@@ -269,20 +269,20 @@ __forceinline__ __device__ uint4 ld_global_uint4_dispatch(uint4 *ptr) {
   return result;
 }
 
-// template <typename uint_t> __forceinline__ __device__ uint_t
-// ld_global_uint_dispatch(uint_t *ptr) {
-//   if constexpr (cute::is_same_v<uint_t, uint16_t>) {
-//     return ld_global_uint16_dispatch(ptr);
-//   } else if constexpr (cute::is_same_v<uint_t, uint32_t>) {
-//     return ld_global_uint32_dispatch(ptr);
-//   } else if constexpr (cute::is_same_v<uint_t, uint2>) {
-//     return ld_global_uint2_dispatch(ptr);
-//   } else if constexpr (cute::is_same_v<uint_t, uint4>) {
-//     return ld_global_uint4_dispatch(ptr);
-//   } else {
-//     DEVICE_ASSERT(false);
-//   }
-// }
+template <typename uint_t>
+__forceinline__ __device__ uint_t ld_global_uint_dispatch(uint_t *ptr) {
+  if constexpr (std::is_same_v<uint_t, uint16_t>) {
+    return ld_global_uint16_dispatch(ptr);
+  } else if constexpr (std::is_same_v<uint_t, uint32_t>) {
+    return ld_global_uint32_dispatch(ptr);
+  } else if constexpr (std::is_same_v<uint_t, uint2>) {
+    return ld_global_uint2_dispatch(ptr);
+  } else if constexpr (std::is_same_v<uint_t, uint4>) {
+    return ld_global_uint4_dispatch(ptr);
+  } else {
+    DEVICE_ASSERT(false);
+  }
+}
 
 __forceinline__ __device__ void st_global_uint16_dispatch(uint16_t val,
                                                           uint16_t *ptr) {
@@ -308,20 +308,21 @@ __forceinline__ __device__ void st_global_uint4_dispatch(uint4 val,
                :);
 }
 
-// template <typename uint_t> __forceinline__ __device__ void
-// st_global_uint_dispatch(uint_t val, uint_t *ptr) {
-//   if constexpr (cute::is_same_v<uint_t, uint16_t>) {
-//     st_global_uint16_dispatch(val, ptr);
-//   } else if constexpr (cute::is_same_v<uint_t, uint32_t>) {
-//     st_global_uint32_dispatch(val, ptr);
-//   } else if constexpr (cute::is_same_v<uint_t, uint2>) {
-//     st_global_uint2_dispatch(val, ptr);
-//   } else if constexpr (cute::is_same_v<uint_t, uint4>) {
-//     st_global_uint4_dispatch(val, ptr);
-//   } else {
-//     DEVICE_ASSERT(false);
-//   }
-// }
+template <typename uint_t>
+__forceinline__ __device__ void st_global_uint_dispatch(uint_t val,
+                                                        uint_t *ptr) {
+  if constexpr (std::is_same_v<uint_t, uint16_t>) {
+    st_global_uint16_dispatch(val, ptr);
+  } else if constexpr (std::is_same_v<uint_t, uint32_t>) {
+    st_global_uint32_dispatch(val, ptr);
+  } else if constexpr (std::is_same_v<uint_t, uint2>) {
+    st_global_uint2_dispatch(val, ptr);
+  } else if constexpr (std::is_same_v<uint_t, uint4>) {
+    st_global_uint4_dispatch(val, ptr);
+  } else {
+    DEVICE_ASSERT(false);
+  }
+}
 
 // =============== Cluster Operations ================= //
 
@@ -377,7 +378,7 @@ wait(const barrier_t &barrier,
      const int expected) {
   int val;
   do {
-    asm volatile("{ld.relaxed.sys.global.s32 %0, [%1];}"
+    asm volatile("{ld.acquire.sys.global.s32 %0, [%1];}"
                  : "=r"(val)
                  : "l"(&barrier[dev_idx][idx])
                  : "memory");

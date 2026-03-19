@@ -5,7 +5,6 @@
 #include <cuda.h>
 #include <kittens.cuh>
 #include <moe_cuda/kernels/common/common.cuh>
-#include <moe_cuda/kernels/common/launch_utils.cuh>
 #include <moe_cuda/kernels/common/sm90_utils.cuh>
 #include <pyutils/torchutils.cuh>
 #include <runtime/utils.h>
@@ -48,16 +47,16 @@ struct globals {
   // using scale_tile = sv_fl<ROW_BLOCK_SIZE>;
 
   using in_tokens_layout =
-      pgl<gl<fp8e4m3, -1, -1, -1, TOKEN_DIM>, config::NUM_DEVICES, false>;
+      pgl<gl<fp8e4m3, -1, -1, -1, -1>, config::NUM_DEVICES, false>;
   using in_scale_layout =
-      pgl<gl<float, -1, -1, -1, TOKEN_DIM / 128>, config::NUM_DEVICES, false>;
+      pgl<gl<float, -1, -1, TOKEN_DIM / 128, -1>, config::NUM_DEVICES, false>;
   using send_buffer_layout =
-      pgl<gl<fp8e4m3, -1, -1, -1, TOKEN_DIM>, config::NUM_DEVICES, false>;
+      pgl<gl<fp8e4m3, -1, -1, -1, -1>, config::NUM_DEVICES, false>;
   using send_scale_buffer_layout =
-      pgl<gl<float, -1, -1, -1, TOKEN_DIM / 128>, config::NUM_DEVICES, false>;
+      pgl<gl<float, -1, -1, TOKEN_DIM / 128, -1>, config::NUM_DEVICES, false>;
 
   using out_tokens_layout = gl<fp8e4m3, -1, -1, -1, TOKEN_DIM, token_tile>;
-  using out_scale_layout = gl<float, -1, -1, -1, TOKEN_DIM / 128>;
+  using out_scale_layout = gl<float, -1, -1, TOKEN_DIM / 128, -1>;
   barrier_layout barrier;
   in_tokens_layout in_tokens;
   in_scale_layout in_scales;
@@ -120,36 +119,41 @@ kernel(const globals<EXPERTS_PER_TOKEN, NUM_EXPERTS, TOKEN_DIM> &G) {
         G.source_offset[token]; // this is the source_dispatch_offset calculated
                                 // in worker.hpp
     uint4 *x_token_src;
-    float *x_scale_src;
+    bool use_send_buffer;
+    int scale_src_rank;
+    int scale_src_position;
     if (source_rank == G.rank) { // our own send buffer
-      x_token_src =
-          (uint4 *)(G.send_buffer[G.rank].raw_ptr + position * TOKEN_DIM);
-      x_scale_src =
-          G.send_scale_buffer[G.rank].raw_ptr + position * TOKEN_DIM / 128;
+      x_token_src = (uint4 *)(&G.send_buffer[G.rank][{(int)position, 0}]);
+      use_send_buffer = true;
+      scale_src_rank = G.rank;
+      scale_src_position = (int)position;
     } else if (position & (1u << 31)) { // overflow copy from peer's send buffer
-      x_token_src = (uint4 *)(G.send_buffer[local_rank].raw_ptr +
-                              (position & ~(1u << 31)) * TOKEN_DIM);
-      x_scale_src = G.send_scale_buffer[local_rank].raw_ptr +
-                    (position & ~(1u << 31)) * TOKEN_DIM / 128;
+      int clean_pos = (int)(position & ~(1u << 31));
+      x_token_src = (uint4 *)(&G.send_buffer[local_rank][{clean_pos, 0}]);
+      use_send_buffer = true;
+      scale_src_rank = local_rank;
+      scale_src_position = clean_pos;
     } else {
       // recv buffer case, already copied into our recv buffer
       x_token_src =
-          (uint4 *)(G.in_tokens[G.rank].raw_ptr + position * TOKEN_DIM);
-      x_scale_src = G.in_scales[G.rank].raw_ptr + position * TOKEN_DIM / 128;
+          (uint4 *)(&G.in_tokens[G.rank][{static_cast<int>(position), 0}]);
+      use_send_buffer = false;
+      scale_src_rank = G.rank;
+      scale_src_position = (int)position;
     }
 
     uint4 *x_token_dst =
         (uint4 *)(G.out_tokens.raw_ptr + padded_index * TOKEN_DIM);
-    float *x_scale_dst = G.out_scales.raw_ptr + padded_index * TOKEN_DIM / 128;
 
     for (uint32_t i = threadIdx.x; i * sizeof(uint4) < TOKEN_DIM;
          i += NUM_THREADS) {
       const bool has_scale = i < TOKEN_DIM / 128;
       auto val = ld_global_nc_uint4(&x_token_src[i]);
-      float scale;
       if (has_scale) {
-        scale = x_scale_src[i];
-        x_scale_dst[i] = scale;
+        float scale = use_send_buffer
+            ? G.send_scale_buffer[scale_src_rank][{(int)i, scale_src_position}]
+            : G.in_scales[G.rank][{(int)i, scale_src_position}];
+        G.out_scales[{(int)i, (int)padded_index}] = scale;
       }
       st_global_nc_uint4(val, &x_token_dst[i]);
     }
@@ -173,16 +177,9 @@ kernel(const globals<EXPERTS_PER_TOKEN, NUM_EXPERTS, TOKEN_DIM> &G) {
   if constexpr (NUM_DEVICES > 1) {
     grid.sync();
     if (blockIdx.x == 0) {
-      if (threadIdx.x == 0) {
-        *G.sync_counter = counter + 1;
-      }
       auto local_rank = G.rank % NUM_DEVICES;
-      for (int peer = threadIdx.x; peer < NUM_DEVICES; peer += blockDim.x) {
-        // signal to all the other peer nodes that current rank is done
-        // dst_dev_idx is peer rank, source is from current rank signaling
-        // completion
-        node_sync::signal(G.barrier, {local_rank}, peer, 1);
-      }
+      if (threadIdx.x < NUM_DEVICES)
+        node_sync::signal(G.barrier, {local_rank}, threadIdx.x, 1);
     }
   }
 }
@@ -218,12 +215,13 @@ cudaError_t a2a_kernels::fp8e4m3_a2a_dispatch_recv(
   using barrier_layout = typename globals::barrier_layout;
   globals args = {
       .barrier = kittens::py::parallel_tensor_to_pgl<barrier_layout>(barrier),
-      .in_tokens =
-          kittens::py::parallel_tensor_to_pgl<in_tokens_layout>(in_tokens),
+      .in_tokens = kittens::py::parallel_tensor_to_pgl<in_tokens_layout, false>(
+          in_tokens),
       .in_scales =
           kittens::py::parallel_tensor_to_pgl<in_scale_layout>(in_scales),
       .send_buffer =
-          kittens::py::parallel_tensor_to_pgl<send_buffer_layout>(send_buffer),
+          kittens::py::parallel_tensor_to_pgl<send_buffer_layout, false>(
+              send_buffer),
       .send_scale_buffer =
           kittens::py::parallel_tensor_to_pgl<send_scale_buffer_layout>(
               send_scale_buffer),

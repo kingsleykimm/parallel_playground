@@ -134,31 +134,6 @@ static void __instantiate_kernel() {{
                              ? (size_t)args.num_groups * args.M   // masked: total_M = groups * max_M
                              : (size_t)args.M;                    // contiguous: total_M already full
         size_t total_N = (size_t)args.num_groups * args.N;        // always N_per_group * num_groups
-
-        // #region agent log
-        {
-            FILE* f = fopen("/u/bjb3az/.cursor/debug-95615d.log", "a");
-            if (f) {
-                fprintf(f, "{\"sessionId\":\"95615d\",\"hypothesisId\":\"H1\",\"location\":\"kernel2.hpp:launch_impl\","
-                    "\"message\":\"B_tile_alignment_check\","
-                    "\"data\":{\"N\":%u,\"BN\":%d,\"N_mod_BN\":%u,\"num_groups\":%u,\"gemm_type\":%d,"
-                    "\"Cblocks\":%u,\"Cblocks_times_BN\":%u,\"group_stride_mismatch\":%d,"
-                    "\"total_M\":%zu,\"total_N\":%zu,\"K\":%u,\"BM\":%d},"
-                    "\"timestamp\":%ld}\n",
-                    args.N, args.bn, args.N % args.bn, args.num_groups, args.gemm_type,
-                    (args.N + args.bn - 1) / args.bn,
-                    ((args.N + args.bn - 1) / args.bn) * args.bn,
-                    (int)(((args.N + args.bn - 1) / args.bn) * args.bn != args.N),
-                    total_M, total_N, args.K, args.bm,
-                    (long)time(nullptr));
-                fclose(f);
-            }
-        }
-        // #endregion
-
-        assert_grouped_gemm_ptrs_device_resident(
-            args.A, args.B, args.C, args.scale_a, args.scale_b, args.grouped_layout);
-
         size_t gsize = tk_grouped_globals_size(args.bm, args.bn, args.bk, args.gemm_type, args.c_dtype);
         alignas(128) char globals_buf[2048];
         assert(gsize <= sizeof(globals_buf));

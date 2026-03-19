@@ -35,11 +35,13 @@ class WorkerState {
     std::vector<void *> num_routed_ptrs;
     std::vector<uint32_t> host_num_routed;
 
+    std::vector<uint32_t> tokens_per_expert_host;
     uint32_t * tokens_per_expert;
     uint32_t * source_rank;
     uint32_t * source_dispatch_offset;
     uint32_t * combine_send_offset;
-    uint32_t * padded_index;
+    uint32_t * padded_index; // grouped layout for contiguous
+    uint32_t * padded_offsets;  // grouped layout for masked
     uint32_t num_recv_tokens;
     uint8_t * dispatch_route_done;
 
@@ -106,6 +108,7 @@ class WorkerState {
         worker_malloc_size += max_recv_tokens * sizeof(uint32_t); // source_dispatch_offset
         worker_malloc_size += max_recv_tokens * sizeof(uint32_t); // combine_send_offset
         worker_malloc_size += max_recv_tokens * sizeof(uint32_t); // padded_index
+        worker_malloc_size += max_recv_tokens * sizeof(uint32_t); // padded_offsets
 
         uint32_t * worker_base_ptr;
         CUDA_CHECK(cudaMallocAsync(&worker_base_ptr, worker_malloc_size, stream));
@@ -115,6 +118,7 @@ class WorkerState {
         this->source_dispatch_offset = worker_base_ptr + num_local_experts + max_recv_tokens;
         this->combine_send_offset = worker_base_ptr + num_local_experts + max_recv_tokens * 2;
         this->padded_index = worker_base_ptr + num_local_experts + max_recv_tokens * 3;
+        this->padded_offsets = worker_base_ptr + num_local_experts + max_recv_tokens * 4;
 
         CUDA_CHECK(cudaHostAlloc(&this->dispatch_route_done, sizeof(uint8_t), cudaHostAllocMapped));
         this->host_num_routed = std::vector<uint32_t>(num_dp_groups * num_experts, 0);
@@ -179,7 +183,7 @@ class WorkerState {
         
         
         // local number, padded to experts_per_rank
-        std::vector<uint32_t> tokens_per_expert(experts_per_rank, 0);
+        this->tokens_per_expert_host = std::vector<uint32_t>(experts_per_rank, 0);
 
 
         // =========== ABSOLUTE OFFSETS FROM CURRENT RANK=====================
@@ -213,7 +217,7 @@ class WorkerState {
                     }
                 }
 
-                // calculate group offset
+                // calculate group offset, matches position calculation in a2a_dispatch_send_tk.cuh
                 uint32_t offset = 0;
                 for (uint32_t expert = 0; expert < first_local_expert; expert++) {
                     offset += this->get_num_routed(dp_group, expert);
@@ -224,7 +228,7 @@ class WorkerState {
                 for (uint32_t expert = first_local_expert; expert < last_local_expert; expert++) {
                     uint32_t n = this->get_num_routed(dp_group, expert);
                     num_tokens += n; 
-                    tokens_per_expert[expert - first_local_expert] += n;
+                    this->tokens_per_expert_host[expert - first_local_expert] += n;
                 }
 
                 tokens_from_group[dp_group] += num_tokens;
@@ -233,14 +237,14 @@ class WorkerState {
             }
         }
 
-        CUDA_CHECK(cudaMemcpyAsync(this->tokens_per_expert, tokens_per_expert.data(), sizeof(uint32_t) * num_local_experts, cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(this->tokens_per_expert, this->tokens_per_expert_host.data(), sizeof(uint32_t) * num_local_experts, cudaMemcpyHostToDevice, stream));
 
         // =========== PADDING CALCS FOR GROUPED GEMM =====================
         std::vector<uint32_t> padded_offsets;
         padded_offsets.reserve(num_local_experts);
         uint32_t base_expert_offset = 0;
 
-        for (auto count : tokens_per_expert) {
+        for (auto count : this->tokens_per_expert_host) {
             uint32_t padded_expert_count = ((count + this->expert_padding - 1) / this->expert_padding) * this->expert_padding;
             padded_offsets.push_back(base_expert_offset);
             base_expert_offset += padded_expert_count;
@@ -252,7 +256,7 @@ class WorkerState {
         // ? don't know yet
         std::vector<uint32_t> combine_send_offset = std::vector<uint32_t> (num_recv_tokens, 0);
         std::vector<uint32_t> source_rank = std::vector<uint32_t> (num_recv_tokens, 0);
-        std::vector<uint32_t> padded_index = std::vector<uint32_t> (num_recv_tokens, 0);
+        std::vector<uint32_t> padded_index = std::vector<uint32_t> (num_recv_tokens, -1);
        
         // uint32_t base_offset = this->max_private_tokens * num_dp_groups;
         uint32_t last = 0;
@@ -274,7 +278,7 @@ class WorkerState {
                 uint32_t src_offset = src_group_offset[peer_group];
                 uint32_t dst_offset = dst_group_offset[peer_group];
 
-                uint32_t peer_rank = peer_group * this->dp_size + this->dp_rank;
+                uint32_t peer_rank = (peer_group * this->dp_size + this->dp_rank) % this->world_size;
 
                 // per token assigned to expert
                 for (uint32_t i = 0; i < routed; i++) {
@@ -305,13 +309,16 @@ class WorkerState {
                         }
                     }
 
-                    // combine section - not looked at yet
+                
                     if (peer_rank != this->rank || this->dp_size > 1) {
                         // offset for current group
                         auto combine_index = src_combine_count[peer_group];
                         src_combine_count[peer_group] += 1;
                         if ( peer_rank / this->node_size == rank_node) {
                             combine_send_offset[last] = dst_offset + combine_index; // dst offset, since we're writing back into the source ranks recv buffers, each local expert token
+                        }
+                        else {
+                            HOST_ERROR("RDMA Inter-node comm is not supported");
                         }
                     }
 
@@ -333,6 +340,7 @@ class WorkerState {
         }
         route_group(this->dp_group);
         CUDA_CHECK(cudaMemcpyAsync(this->padded_index, padded_index.data(), sizeof(uint32_t) * num_recv_tokens, cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(this->padded_offsets, padded_offsets.data(), sizeof(uint32_t) * num_local_experts, cudaMemcpyHostToDevice, stream));
         CUDA_CHECK(cudaMemcpyAsync(this->source_rank, source_rank.data(), sizeof(uint32_t) * num_recv_tokens, cudaMemcpyHostToDevice, stream));
         CUDA_CHECK(cudaMemcpyAsync(this->source_dispatch_offset, source_dispatch_offset.data(), sizeof(uint32_t) * num_recv_tokens, cudaMemcpyHostToDevice, stream));
         CUDA_CHECK(cudaMemcpyAsync(this->combine_send_offset, combine_send_offset.data(), sizeof(uint32_t) * num_recv_tokens, cudaMemcpyHostToDevice, stream));

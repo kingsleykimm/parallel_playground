@@ -1,5 +1,8 @@
 // Python bindings for moe_cuda via pybind11.
 
+#include "c10/cuda/CUDAStream.h"
+#include "moe_cuda/types.h"
+#include "tk_bindings.h"
 #include <ATen/cuda/CUDAContext.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -12,15 +15,16 @@
 #include <stdexcept>
 #include <string>
 
-#include <apis/moe_forward.hpp>
+#include <jit/compiler.hpp>
+#include <kernels/internal_api.hpp>
 #include <runtime/parallel.h>
+#include <runtime/utils.h>
 
-#ifdef MOE_CUDA_USE_MPI
-#include <all2all/all2all.hpp>
-#include <mpi.h>
-#endif
+#include <all2all/all2all_base.hpp>
 
-namespace py = pybind11;
+
+
+
 
 namespace {
 
@@ -35,12 +39,12 @@ std::string normalize_dtype_name(std::string name) {
     return name;
 }
 
-c10::ScalarType parse_scalar_type(const py::handle& value, const char* arg_name) {
-    if (py::isinstance<py::int_>(value)) {
+c10::ScalarType parse_scalar_type(const pybind11::handle& value, const char* arg_name) {
+    if (pybind11::isinstance<pybind11::int_>(value)) {
         return static_cast<c10::ScalarType>(value.cast<int>());
     }
 
-    std::string name = normalize_dtype_name(py::str(value).cast<std::string>());
+    std::string name = normalize_dtype_name(pybind11::str(value).cast<std::string>());
     if (name == "torch.float32" || name == "float32" || name == "float" || name == "fp32") {
         return c10::ScalarType::Float;
     }
@@ -64,10 +68,10 @@ c10::ScalarType parse_scalar_type(const py::handle& value, const char* arg_name)
     }
 
     throw std::invalid_argument(std::string("Unsupported dtype for ") + arg_name + ": " +
-                                py::str(value).cast<std::string>());
+                                pybind11::str(value).cast<std::string>());
 }
 
-std::optional<c10::ScalarType> parse_optional_scalar_type(const py::object& value,
+std::optional<c10::ScalarType> parse_optional_scalar_type(const pybind11::object& value,
                                                           const char* arg_name) {
     if (value.is_none()) {
         return std::nullopt;
@@ -75,83 +79,65 @@ std::optional<c10::ScalarType> parse_optional_scalar_type(const py::object& valu
     return parse_scalar_type(value, arg_name);
 }
 
-#ifdef MOE_CUDA_USE_MPI
-void ensure_mpi_initialized() {
-    int initialized = 0;
-    MPI_Initialized(&initialized);
-    if (!initialized) {
-        int argc = 0;
-        char** argv = nullptr;
-        MPI_Init(&argc, &argv);
-    }
-}
+
 
 class PyAll2All {
 public:
     PyAll2All(uint32_t max_num_tokens,
               uint32_t num_experts,
+              uint32_t experts_per_token,
               uint32_t expert_padding,
               uint32_t hidden_dim,
               std::optional<uint32_t> hidden_dim_scale,
-              const py::object& in_dtype,
-              const py::object& out_dtype,
-              const py::object& scale_dtype,
-              uint32_t num_experts_per_token,
+              at::ScalarType& in_dtype,
+              at::ScalarType& out_dtype,
+              std::optional<at::ScalarType>& scale_dtype,
               std::optional<uint32_t> max_private_tokens,
               std::optional<uint32_t> dp_group_size,
               std::optional<uint32_t> node_group_size,
-              int device)
-        : rank_(0), world_size_(1), device_(device), global_group_(), node_group_() {
-        ensure_mpi_initialized();
+              std::optional<uint32_t> ep_group_size,
+              int device, at::cuda::CUDAStream& stream)
+        : rank_(0), world_size_(1), device_(device){
 
-        int rank = 0;
         int world_size = 1;
-        MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-        MPI_Comm_size(MPI_COMM_WORLD, &world_size);
-        rank_ = rank;
-        world_size_ = world_size;
 
-        if (device_ < 0) {
-            device_ = rank_;
-        }
+        rank_ = device;
 
         const uint32_t node_size = node_group_size.value_or(static_cast<uint32_t>(world_size_));
-        if (node_size == 0 || world_size_ % static_cast<int>(node_size) != 0) {
-            throw std::invalid_argument("node_group_size must divide MPI world size");
+        const uint32_t dp_size = dp_group_size.value_or(1);
+        const uint32_t ep_size = ep_group_size.value_or(1);
+        if (node_size == 0 || world_size_ % node_size != 0) {
+            throw std::invalid_argument("node_group_size must divide world size");
         }
-        if (dp_group_size.has_value()) {
-            if (*dp_group_size == 0 || world_size_ % static_cast<int>(*dp_group_size) != 0) {
-                throw std::invalid_argument("dp_group_size must divide MPI world size");
-            }
-            dp_group_.emplace(rank_, *dp_group_size);
+        if (dp_size == 0 || world_size_ % dp_size != 0) {
+            throw std::invalid_argument("dp_group_size must divide world size");
         }
+        if (ep_size == 0 || world_size_ % ep_size != 0) {
+            throw std::invalid_argument("ep_group_size must divide world size");
+        }
+        
+        ParallelConfig parallel_config = {
+            .tp_size = 1, // not set for now
+            .dp_size = dp_size,
+            .ep_size = ep_size,
+            .node_size = node_size,
+            .world_size = node_size, // for single node for now
+        };
+        
+        auto current_stream = stream.stream();
 
-        global_group_ = ParallelGroup(rank_, world_size_);
-        node_group_ = ParallelGroup(rank_, node_size);
-
-        handle_ = std::make_unique<moe_cuda::All2All>(
-            max_num_tokens,
-            num_experts,
-            expert_padding,
-            hidden_dim,
-            hidden_dim_scale,
-            parse_scalar_type(in_dtype, "in_dtype"),
-            parse_scalar_type(out_dtype, "out_dtype"),
-            parse_optional_scalar_type(scale_dtype, "scale_dtype"),
-            num_experts_per_token,
-            max_private_tokens,
-            dp_group_,
-            node_group_,
-            device_,
-            global_group_,
-            current_stream());
+        handle_ = moe_cuda::make_all2all(
+            max_num_tokens, num_experts, experts_per_token, expert_padding, 
+            hidden_dim, hidden_dim_scale, in_dtype, out_dtype, scale_dtype, 
+            max_private_tokens, rank_, parallel_config, current_stream
+        );
     }
 
     void dispatch(at::Tensor& out_expert_num_tokens,
                   at::Tensor& out_expert_x,
-                  std::optional<at::Tensor> out_expert_x_scale,
+                  std::optional<at::Tensor>& out_expert_x_scale,
                   at::Tensor& dp_x,
-                  std::optional<at::Tensor> dp_x_scale,
+                  std::optional<at::Tensor>& dp_x_scale,
                   at::Tensor& indices,
                   at::Tensor& weights,
                   std::optional<at::Tensor> bound_m,
@@ -177,31 +163,34 @@ public:
     int rank() const { return rank_; }
     int world_size() const { return world_size_; }
     int device() const { return device_; }
-
-private:
+    std::shared_ptr<moe_cuda::All2AllBase> handle() const {return handle_; }
+    private:
     int rank_;
     int world_size_;
     int device_;
-    std::optional<ParallelGroup> dp_group_;
-    ParallelGroup global_group_;
-    ParallelGroup node_group_;
-    std::unique_ptr<moe_cuda::All2All> handle_;
+    ParallelConfig parallel_config;
+    std::shared_ptr<moe_cuda::All2AllBase> handle_;
 };
-#endif
 
 }  // namespace
 
 PYBIND11_MODULE(moe_cuda, m) {
     m.doc() = "MoE CUDA kernels for H100 (SM90a)";
 
-    py::enum_<GemmType>(m, "GemmType")
+    bind_tk_parallel_tensor(m);
+
+    // wrapper around the parallel tensor in thunderkittens
+
+    pybind11::enum_<GemmType>(m, "GemmType")
         .value("Normal", GemmType::Normal)
         .value("MGroupedContiguous", GemmType::MGroupedContiguous)
         .value("MGroupedMasked", GemmType::MGroupedMasked)
         .value("Batched", GemmType::Batched)
         .export_values();
 
-    m.def("init", &moe_cuda::init, py::arg("library_root"), py::arg("cuda_home"),
+    m.def("init", [](const std::string& library_root, const std::string& cuda_home) {
+        Compiler::init_static_vars(library_root, cuda_home);
+    }, pybind11::arg("library_root"), pybind11::arg("cuda_home"),
           "Initialize moe_cuda JIT runtime paths.");
 
     m.def(
@@ -212,12 +201,12 @@ PYBIND11_MODULE(moe_cuda, m) {
             auto stream = current_stream();
             int* grouped_layout_ptr =
                 grouped_layout.has_value() ? grouped_layout->data_ptr<int>() : nullptr;
-            moe_cuda::bf16_gemm(a, b, c, d, gemm_type, compiled_dims, grouped_layout_ptr,
+            moe_cuda::kernels::bf16_gemm(a, b, c, d, gemm_type, compiled_dims, grouped_layout_ptr,
                                 stream);
         },
-        py::arg("a"), py::arg("b"), py::arg("d"), py::arg("c") = py::none(),
-        py::arg("gemm_type") = GemmType::Normal, py::arg("compiled_dims") = "",
-        py::arg("grouped_layout") = py::none(),
+        pybind11::arg("a"), pybind11::arg("b"), pybind11::arg("d"), pybind11::arg("c") = pybind11::none(),
+        pybind11::arg("gemm_type") = GemmType::Normal, pybind11::arg("compiled_dims") = "",
+        pybind11::arg("grouped_layout") = pybind11::none(),
         "Launch the BF16 GEMM entrypoint on the current CUDA stream.");
 
     m.def(
@@ -228,79 +217,168 @@ PYBIND11_MODULE(moe_cuda, m) {
             auto stream = current_stream();
             int* grouped_layout_ptr =
                 grouped_layout.has_value() ? grouped_layout->data_ptr<int>() : nullptr;
-            moe_cuda::fp8_gemm_nt({act, act_scale}, {weight, weight_scale}, output, gemm_type,
+            moe_cuda::kernels::fp8_gemm_nt(act, act_scale, weight, weight_scale, output, gemm_type,
                                   compiled_dims, grouped_layout_ptr, stream);
         },
-        py::arg("act"), py::arg("act_scale"), py::arg("weight"), py::arg("weight_scale"),
-        py::arg("output"), py::arg("gemm_type") = GemmType::Normal,
-        py::arg("compiled_dims") = "", py::arg("grouped_layout") = py::none(),
+        pybind11::arg("act"), pybind11::arg("act_scale"), pybind11::arg("weight"), pybind11::arg("weight_scale"),
+        pybind11::arg("output"), pybind11::arg("gemm_type") = GemmType::Normal,
+        pybind11::arg("compiled_dims") = "", pybind11::arg("grouped_layout") = pybind11::none(),
         "Launch the FP8 GEMM NT entrypoint on the current CUDA stream.");
 
     m.def(
         "fp8_grouped_gemm_nt",
         [](at::Tensor& act, at::Tensor& act_scale, at::Tensor& weight, at::Tensor& weight_scale,
-           at::Tensor& output, GemmType gemm_type, std::optional<at::Tensor> grouped_layout) {
-            auto stream = current_stream();
+           at::Tensor& output, GemmType gemm_type, std::optional<at::Tensor> grouped_layout, at::cuda::CUDAStream & stream) {
+            auto current_stream = stream.stream();
             int* grouped_layout_ptr =
                 grouped_layout.has_value() ? grouped_layout->data_ptr<int>() : nullptr;
-            moe_cuda::fp8_grouped_gemm_nt({act, act_scale}, {weight, weight_scale}, output,
-                                          gemm_type, grouped_layout_ptr, stream);
+            moe_cuda::kernels::fp8_grouped_gemm_nt(act, act_scale, weight, weight_scale, output,
+                                          gemm_type, grouped_layout_ptr, current_stream);
         },
-        py::arg("act"), py::arg("act_scale"), py::arg("weight"), py::arg("weight_scale"),
-        py::arg("output"), py::arg("gemm_type") = GemmType::MGroupedContiguous,
-        py::arg("grouped_layout") = py::none(),
+        pybind11::arg("act"), pybind11::arg("act_scale"), pybind11::arg("weight"), pybind11::arg("weight_scale"),
+        pybind11::arg("output"), pybind11::arg("gemm_type") = GemmType::MGroupedContiguous,
+        pybind11::arg("grouped_layout") = pybind11::none(), pybind11::arg("stream"),
         "Launch the grouped FP8 GEMM entrypoint on the current CUDA stream.");
 
-#ifdef MOE_CUDA_USE_MPI
-    m.def("mpi_is_initialized", []() {
-        int initialized = 0;
-        MPI_Initialized(&initialized);
-        return initialized != 0;
-    });
-
-    m.def("mpi_init", []() { ensure_mpi_initialized(); });
-
-    m.def("mpi_world_info", []() {
-        ensure_mpi_initialized();
-        int rank = 0;
-        int world_size = 1;
-        MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-        MPI_Comm_size(MPI_COMM_WORLD, &world_size);
-        return py::make_tuple(rank, world_size);
-    });
-
-    py::class_<PyAll2All>(m, "All2All")
-        .def(py::init<uint32_t, uint32_t, uint32_t, uint32_t, std::optional<uint32_t>,
-                      const py::object&, const py::object&, const py::object&, uint32_t,
-                      std::optional<uint32_t>, std::optional<uint32_t>, std::optional<uint32_t>,
-                      int>(),
-             py::arg("max_num_tokens"), py::arg("num_experts"), py::arg("expert_padding"),
-             py::arg("hidden_dim"), py::arg("hidden_dim_scale") = py::none(),
-             py::arg("in_dtype") = py::str("bfloat16"),
-             py::arg("out_dtype") = py::str("bfloat16"),
-             py::arg("scale_dtype") = py::none(), py::arg("num_experts_per_token") = 1,
-             py::arg("max_private_tokens") = py::none(), py::arg("dp_group_size") = py::none(),
-             py::arg("node_group_size") = py::none(), py::arg("device") = -1)
-        .def(
-            "dispatch",
-            [](PyAll2All& self, at::Tensor& out_expert_num_tokens, at::Tensor& out_expert_x,
-               at::Tensor& dp_x, at::Tensor& indices, at::Tensor& weights,
-               std::optional<at::Tensor> out_expert_x_scale,
-               std::optional<at::Tensor> dp_x_scale, std::optional<at::Tensor> bound_m,
-               bool do_send, bool do_recv) {
-                self.dispatch(out_expert_num_tokens, out_expert_x, out_expert_x_scale, dp_x,
-                              dp_x_scale, indices, weights, bound_m, do_send, do_recv);
+        m.def("fp8_grouped_gemm_swiglu", 
+            [](at::Tensor& A, at::Tensor& scale_a, at::Tensor& gate_weight, at::Tensor& gate_scale, at::Tensor& up_weight,
+            at::Tensor& up_scale, at::Tensor& D, at::Tensor& scale_d, GemmType& gemm_type, at::Tensor& grouped_layout, at::cuda::CUDAStream& stream ) {
+                auto current_stream = stream.stream();
+                HOST_ASSERT(grouped_layout.scalar_type() == at::ScalarType::Int, "invalid grouped layout type");
+                HOST_ASSERT(D.size(-1) / 128 == scale_d.size(-2), "incorrect output scale d layout");
+                moe_cuda::kernels::fp8_grouped_gemm_swiglu(A, gate_weight, up_weight, scale_a, gate_scale, up_scale, scale_d, D, GemmType::MGroupedContiguous, 
+                    grouped_layout.data_ptr<int>(), current_stream);
             },
-            py::arg("out_expert_num_tokens"), py::arg("out_expert_x"), py::arg("dp_x"),
-            py::arg("indices"), py::arg("weights"), py::arg("out_expert_x_scale") = py::none(),
-            py::arg("dp_x_scale") = py::none(), py::arg("bound_m") = py::none(),
-            py::arg("do_send") = true, py::arg("do_recv") = true)
-        .def("combine", &PyAll2All::combine, py::arg("out_tokens"), py::arg("indices"),
-             py::arg("weights"), py::arg("expert_y"), py::arg("bound_m") = py::none(),
-             py::arg("do_send") = true, py::arg("do_recv") = true,
-             py::arg("accumulate") = false)
-        .def_property_readonly("rank", &PyAll2All::rank)
-        .def_property_readonly("world_size", &PyAll2All::world_size)
-        .def_property_readonly("device", &PyAll2All::device);
-#endif
+            pybind11::arg("A"), pybind11::arg("scale_a"), pybind11::arg("gate_weight"), pybind11::arg("gate_scale"), pybind11::arg("up_weight"), 
+            pybind11::arg("up_scale"), pybind11::arg("D"), pybind11::arg("scale_d"), pybind11::arg("gemm_type"), pybind11::arg("grouped_layout"), pybind11::arg("stream"), 
+            "Launch the grouped gemm swiglu entrypoint on the current CUDA stream"
+        );
+
+    // note : fp8 output scale d will be in mn major
+    m.def("fp8_grouped_gemm_swiglu_contiguous", 
+    [](at::Tensor& A, at::Tensor& scale_a, at::Tensor& gate_weight, at::Tensor& gate_scale, at::Tensor& up_weight,
+    at::Tensor& up_scale, at::Tensor& D, at::Tensor& scale_d, at::Tensor& grouped_layout, at::cuda::CUDAStream& stream ) {
+        auto current_stream = stream.stream();
+        HOST_ASSERT(grouped_layout.scalar_type() == at::ScalarType::Int, "invalid grouped layout type");
+        HOST_ASSERT(D.size(-1) / 128 == scale_d.size(-2), "incorrect output scale d layout");
+        moe_cuda::kernels::fp8_grouped_gemm_swiglu(A, gate_weight, up_weight, scale_a, gate_scale, up_scale, scale_d, D, GemmType::MGroupedContiguous, 
+            grouped_layout.data_ptr<int>(), current_stream);
+    },
+    pybind11::arg("A"), pybind11::arg("scale_a"), pybind11::arg("gate_weight"), pybind11::arg("gate_scale"), pybind11::arg("up_weight"), 
+    pybind11::arg("up_scale"), pybind11::arg("D"), pybind11::arg("scale_d"), pybind11::arg("grouped_layout"), pybind11::arg("stream"), 
+    "Launch the grouped gemm swiglu entrypoint on the current CUDA stream"
+);
+m.def("fp8_grouped_gemm_swiglu_masked", 
+    [](at::Tensor& A, at::Tensor& scale_a, at::Tensor& gate_weight, at::Tensor& gate_scale, at::Tensor& up_weight,
+    at::Tensor& up_scale, at::Tensor& D, at::Tensor& scale_d, at::Tensor& grouped_layout, at::cuda::CUDAStream& stream ) {
+        auto current_stream = stream.stream();
+        HOST_ASSERT(grouped_layout.scalar_type() == at::ScalarType::Int, "invalid grouped layout type");
+        HOST_ASSERT(D.size(-1) / 128 == scale_d.size(-2), "incorrect output scale d layout");
+        moe_cuda::kernels::fp8_grouped_gemm_swiglu(A, gate_weight, up_weight, scale_a, gate_scale, up_scale, scale_d, D, GemmType::MGroupedMasked, 
+            grouped_layout.data_ptr<int>(), current_stream);
+    },
+    pybind11::arg("A"), pybind11::arg("scale_a"), pybind11::arg("gate_weight"), pybind11::arg("gate_scale"), pybind11::arg("up_weight"), 
+    pybind11::arg("up_scale"), pybind11::arg("D"), pybind11::arg("scale_d"), pybind11::arg("grouped_layout"), pybind11::arg("stream"), 
+    "Launch the grouped gemm swiglu entrypoint on the current CUDA stream"
+);
+m.def("fp8_grouped_gemm_swiglu_pp", 
+    [](at::Tensor& A, at::Tensor& scale_a, at::Tensor& gate_weight, at::Tensor& gate_scale, at::Tensor& up_weight,
+    at::Tensor& up_scale, at::Tensor& D, at::Tensor& scale_d, GemmType& gemm_type, at::Tensor& grouped_layout, at::cuda::CUDAStream& stream ) {
+        auto current_stream = stream.stream();
+        HOST_ASSERT(grouped_layout.scalar_type() == at::ScalarType::Int, "invalid grouped layout type");
+        HOST_ASSERT(D.size(-1) / 128 == scale_d.size(-2), "incorrect output scale d layout");
+        moe_cuda::kernels::fp8_grouped_gemm_swiglu_consumer_pp(A, gate_weight, up_weight, scale_a, gate_scale, up_scale, scale_d, D, gemm_type, 
+            grouped_layout.data_ptr<int>(), current_stream);
+    },
+    pybind11::arg("A"), pybind11::arg("scale_a"), pybind11::arg("gate_weight"), pybind11::arg("gate_scale"), pybind11::arg("up_weight"), 
+    pybind11::arg("up_scale"), pybind11::arg("D"), pybind11::arg("scale_d"), pybind11::arg("gemm_type"), pybind11::arg("grouped_layout"), pybind11::arg("stream"), 
+    "Launch the grouped gemm swiglu entrypoint with consumer WG pingpong scheduling on the current stream"
+);
+m.def("fp8_grouped_gemm_swiglu_contiguous_pp", 
+    [](at::Tensor& A, at::Tensor& scale_a, at::Tensor& gate_weight, at::Tensor& gate_scale, at::Tensor& up_weight,
+    at::Tensor& up_scale, at::Tensor& D, at::Tensor& scale_d, at::Tensor& grouped_layout, at::cuda::CUDAStream& stream ) {
+        auto current_stream = stream.stream();
+        HOST_ASSERT(grouped_layout.scalar_type() == at::ScalarType::Int, "invalid grouped layout type");
+        HOST_ASSERT(D.size(-1) / 128 == scale_d.size(-2), "incorrect output scale d layout");
+        moe_cuda::kernels::fp8_grouped_gemm_swiglu_consumer_pp(A, gate_weight, up_weight, scale_a, gate_scale, up_scale, scale_d, D, GemmType::MGroupedContiguous, 
+            grouped_layout.data_ptr<int>(), current_stream);
+    },
+    pybind11::arg("A"), pybind11::arg("scale_a"), pybind11::arg("gate_weight"), pybind11::arg("gate_scale"), pybind11::arg("up_weight"), 
+    pybind11::arg("up_scale"), pybind11::arg("D"), pybind11::arg("scale_d"), pybind11::arg("grouped_layout"), pybind11::arg("stream"), 
+    "Launch the grouped gemm swiglu entrypoint on the current CUDA stream"
+);
+
+m.def("fp8_grouped_gemm_swiglu_masked_pp", 
+    [](at::Tensor& A, at::Tensor& scale_a, at::Tensor& gate_weight, at::Tensor& gate_scale, at::Tensor& up_weight,
+    at::Tensor& up_scale, at::Tensor& D, at::Tensor& scale_d, at::Tensor& grouped_layout, at::cuda::CUDAStream& stream ) {
+        auto current_stream = stream.stream();
+        HOST_ASSERT(grouped_layout.scalar_type() == at::ScalarType::Int, "invalid grouped layout type");
+        HOST_ASSERT(D.size(-1) / 128 == scale_d.size(-2), "incorrect output scale d layout");
+        moe_cuda::kernels::fp8_grouped_gemm_swiglu_consumer_pp(A, gate_weight, up_weight, scale_a, gate_scale, up_scale, scale_d, D, GemmType::MGroupedMasked, 
+            grouped_layout.data_ptr<int>(), current_stream);
+    },
+    pybind11::arg("A"), pybind11::arg("scale_a"), pybind11::arg("gate_weight"), pybind11::arg("gate_scale"), pybind11::arg("up_weight"), 
+    pybind11::arg("up_scale"), pybind11::arg("D"), pybind11::arg("scale_d"), pybind11::arg("grouped_layout"), pybind11::arg("stream"), 
+    "Launch the grouped gemm swiglu entrypoint on the current CUDA stream"
+);
+
+m.def("cast", [](at::Tensor& inp, at::Tensor& out, std::optional<at::Tensor>& scale, at::cuda::CUDAStream& stream) {
+    auto current_stream = stream.stream();
+    moe_cuda::kernels::cast(inp, out, scale, current_stream);
+}, pybind11::arg("inp"), pybind11::arg("out"), pybind11::arg("scale") = pybind11::none(), pybind11::arg("stream"));
+
+
+m.def("fused_silu_mul_quant", [](at::Tensor &gemm_out, at::Tensor &swiglu_out,
+    at::Tensor &scale, at::cuda::CUDAStream& stream) {
+        auto current_stream = stream.stream();
+        moe_cuda::kernels::fused_silu_mul_quant(gemm_out, swiglu_out, scale, current_stream);
+}, pybind11::arg("gemm_out"), pybind11::arg("swiglu_out"), pybind11::arg("scale"), pybind11::arg("stream"));
+
+pybind11::class_<PyAll2All>(m, "All2All")
+    .def(pybind11::init<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, std::optional<uint32_t>,
+                    at::ScalarType&, at::ScalarType&, std::optional<at::ScalarType>&,
+                    std::optional<uint32_t>, std::optional<uint32_t>, std::optional<uint32_t>, std::optional<uint32_t>,
+                    int, at::cuda::CUDAStream&>(),
+            pybind11::arg("max_num_tokens"), pybind11::arg("num_experts"), pybind11::arg("experts_per_token"), pybind11::arg("expert_padding"),
+            pybind11::arg("hidden_dim"), pybind11::arg("hidden_dim_scale") = pybind11::none(),
+            pybind11::arg("in_dtype"),
+            pybind11::arg("out_dtype"),
+            pybind11::arg("scale_dtype") = pybind11::none(),
+            pybind11::arg("max_private_tokens") = pybind11::none(), pybind11::arg("dp_group_size") = pybind11::none(),
+            pybind11::arg("node_group_size") = pybind11::none(), pybind11::arg("ep_group_size") = pybind11::none(), pybind11::arg("device") = -1,
+            pybind11::arg("stream"))
+    .def("dispatch", &PyAll2All::dispatch,
+        pybind11::arg("out_expert_num_tokens"),
+        pybind11::arg("out_expert_x"),
+        pybind11::arg("out_expert_x_scale") = pybind11::none(),
+        pybind11::arg("dp_x"),
+        pybind11::arg("dp_x_scale") = pybind11::none(),
+        pybind11::arg("indices"),
+        pybind11::arg("weights"),
+        pybind11::arg("bound_m") = pybind11::none(),
+        pybind11::arg("do_send") = true,
+        pybind11::arg("do_recv") = true)
+    .def("combine", &PyAll2All::combine, pybind11::arg("out_tokens"), pybind11::arg("indices"),
+            pybind11::arg("weights"), pybind11::arg("expert_y"), pybind11::arg("bound_m") = pybind11::none(),
+            pybind11::arg("do_send") = true, pybind11::arg("do_recv") = true,
+            pybind11::arg("accumulate") = false)
+    .def_property_readonly("rank", &PyAll2All::rank)
+    .def_property_readonly("world_size", &PyAll2All::world_size)
+    .def_property_readonly("device", &PyAll2All::device)
+    .def_property_readonly("handle", &PyAll2All::handle);
+
+
+    m.def("naive_moe_forward_dispatch", [] (PyAll2All& all2all,  uint32_t num_experts,
+        uint32_t experts_per_token, uint32_t hidden_dim,
+    GemmType gemm_type, at::Tensor &input,
+    at::Tensor &input_scales, at::Tensor &gate,
+    at::Tensor &gate_scales, at::Tensor &up,
+    at::Tensor &up_scales, at::Tensor &down,
+    at::Tensor &down_scales, at::Tensor &indices,
+    at::Tensor &weights, at::cuda::CUDAStream& stream) {
+        auto current_stream = stream.stream();
+        moe_cuda::All2AllBase& a2a = *all2all.handle().get();
+        naive_moe_forward_dispatch(a2a, num_experts, experts_per_token, hidden_dim, gemm_type, 
+    input, input_scales, gate, gate_scales, up, up_scales, down, down_scales, indices, weights, stream);
+    });
 }

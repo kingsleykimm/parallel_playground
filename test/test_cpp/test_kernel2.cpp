@@ -9,7 +9,7 @@
 #include <torch/torch.h>
 
 #include "test_utils.h"
-#include <apis/moe_forward.hpp>
+#include <kernels/internal_api.hpp>
 #include <jit/compiler.hpp>
 #include <jit_kernels/impls/sm90_fp8_gemm_1d2d.hpp>
 #include <moe_cuda/types.h>
@@ -168,24 +168,22 @@ static bool parse_args(int argc, char** argv, Config& cfg) {
 
 static void launch_contiguous_impl(
     Config::Impl impl,
-    std::pair<at::Tensor&, at::Tensor&> act,
-    std::pair<at::Tensor&, at::Tensor&> weight,
+    at::Tensor& act,
+    at::Tensor& act_scale,
+    at::Tensor& weight,
+    at::Tensor& weight_scale,
     at::Tensor& out,
     int* grouped_layout,
     cudaStream_t& stream) {
     if (impl == Config::Impl::Kernel2) {
-        moe_cuda::fp8_grouped_gemm_nt(
-            act, weight, out, GemmType::MGroupedContiguous, grouped_layout,
-            stream);
+        moe_cuda::kernels::fp8_grouped_gemm_nt(
+            act, act_scale, weight, weight_scale, out, GemmType::MGroupedContiguous,
+            grouped_layout, stream);
         return;
     }
 
-    auto& A = act.first;
-    auto& sfa = act.second;
-    auto& B = weight.first;
-    auto& sfb = weight.second;
-    sm90_fp8_grouped_gemm_1d2d_contiguous_ref(A, B, sfa, sfb, out,
-                                              grouped_layout, stream);
+    sm90_fp8_grouped_gemm_1d2d_contiguous_ref(act, weight, act_scale, weight_scale,
+                                              out, grouped_layout, stream);
 }
 
 static bool run_contiguous(int64_t expected_per_group_M, int64_t N, int64_t K,
@@ -242,15 +240,12 @@ static bool run_contiguous(int64_t expected_per_group_M, int64_t N, int64_t K,
 
     torch::Tensor out = torch::zeros({total_M, N}, out_opts);
     at::Tensor A_t = A_fp8, B_t = B_fp8, sfa_t = sfa, sfb_t = sfb, out_t = out;
-    std::pair<at::Tensor&, at::Tensor&> act{A_t, sfa_t};
-    std::pair<at::Tensor&, at::Tensor&> weight{B_t, sfb_t};
 
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
     auto t0 = std::chrono::high_resolution_clock::now();
-    moe_cuda::fp8_grouped_gemm_nt(
-        act, weight, out_t, GemmType::MGroupedContiguous, layout_gpu.data_ptr<int>(),
-        stream);
+    launch_contiguous_impl(impl, A_t, sfa_t, B_t, sfb_t, out_t,
+                           layout_gpu.data_ptr<int>(), stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     auto t1 = std::chrono::high_resolution_clock::now();
     CUDA_CHECK(cudaStreamDestroy(stream));
@@ -341,13 +336,11 @@ static bool run_masked(int64_t max_M, int64_t expected_per_group_M, int64_t N,
     // D: (total_M, N) — factory uses C.cols = total_N / num_groups = N
     torch::Tensor out = torch::zeros({total_M, N}, out_opts);
     at::Tensor A_t = A_fp8, B_t = B_fp8, sfa_t = sfa, sfb_t = sfb, out_t = out;
-    std::pair<at::Tensor&, at::Tensor&> act{A_t, sfa_t};
-    std::pair<at::Tensor&, at::Tensor&> weight{B_t, sfb_t};
 
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
     auto t0 = std::chrono::high_resolution_clock::now();
-    moe_cuda::fp8_grouped_gemm_nt(act, weight, out_t,
+    moe_cuda::kernels::fp8_grouped_gemm_nt(A_t, sfa_t, B_t, sfb_t, out_t,
                                    GemmType::MGroupedMasked,
                                    layout_gpu.data_ptr<int>(), stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));

@@ -17,12 +17,14 @@ CUresult launch_kernel(KernelHandle& kernel, const LaunchConfigHandle& launch_co
     // const_cast needed because CUDA API takes void** but doesn't modify the data
     void* kernelParams[] = {const_cast<void*>(static_cast<const void*>(&args))...};
     
-    printf("  Launching kernel: grid=(%u,%u,%u), block=(%u,%u,%u), smem=%u, numAttrs=%u\n",
-           launch_config.gridDimX, launch_config.gridDimY, launch_config.gridDimZ,
-           launch_config.blockDimX, launch_config.blockDimY, launch_config.blockDimZ,
-           launch_config.sharedMemBytes, launch_config.numAttrs);
-    fflush(stdout);
-    
+    if (get_env<int>("JIT_DEBUG") > 0) {
+        printf("  Launching kernel: grid=(%u,%u,%u), block=(%u,%u,%u), smem=%u, numAttrs=%u\n",
+               launch_config.gridDimX, launch_config.gridDimY, launch_config.gridDimZ,
+               launch_config.blockDimX, launch_config.blockDimY, launch_config.blockDimZ,
+               launch_config.sharedMemBytes, launch_config.numAttrs);
+        fflush(stdout);
+    }
+
     CUresult result = cuLaunchKernelEx(&launch_config, kernel, kernelParams, nullptr);
     
     if (result != CUDA_SUCCESS) {
@@ -74,8 +76,10 @@ inline LaunchConfigHandle create_launch_config(
         launch_handle.attrs = &attr;
         launch_handle.numAttrs = 1;
         
-        printf("  Cluster launch: grid=%u, cluster=%u\n",
-               gridDim.x, num_multicast);
+        if (get_env<int>("JIT_DEBUG") > 0) {
+            printf("  Cluster launch: grid=%u, cluster=%u\n",
+                   gridDim.x, num_multicast);
+        }
     }
     return launch_handle;
 }

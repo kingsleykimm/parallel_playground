@@ -31,3 +31,13 @@ extern "C" void tk_build_kernel3_globals(int bm, int bn, int bk,
     void* A, void* gate, void* up, void* C,
     void* scale_a, void* scale_gate, void* scale_up, void* out_scales,
     void* grouped_layout, size_t total_M, size_t total_N, size_t K);
+
+// kernel4 globals (kernel4::globals) — ping-pong consumer scheduled FP8 GEMM
+// BM is fixed at 64; only BN and BK are needed for config dispatch.
+extern "C" size_t tk_kernel4_globals_size(int bn, int bk,
+    int gemm_type, c10::ScalarType c_dtype);
+extern "C" void tk_build_kernel4_globals(int bn, int bk,
+    int gemm_type, int num_groups, c10::ScalarType c_dtype, void* out,
+    void* A, void* gate, void* up, void* D,
+    void* scale_a, void* scale_gate, void* scale_up, void* scale_d,
+    void* grouped_layout, size_t total_M, size_t total_N, size_t K);

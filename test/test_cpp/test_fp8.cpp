@@ -7,7 +7,7 @@
 #include <torch/torch.h>
 
 #include "test_utils.h"
-#include <apis/moe_forward.hpp>
+#include <kernels/internal_api.hpp>
 #include <jit/compiler.hpp>
 #include <moe_cuda/types.h>
 #include <runtime/utils.h>
@@ -139,13 +139,10 @@ static bool run_normal(int64_t M, int64_t N, int64_t K,
     at::Tensor sfb_t = sfb;
     at::Tensor out_t = out;
 
-    std::pair<at::Tensor&, at::Tensor&> act{A_t, sfa_t};
-    std::pair<at::Tensor&, at::Tensor&> weight{B_t, sfb_t};
-
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
     auto start = std::chrono::high_resolution_clock::now();
-    moe_cuda::fp8_gemm_nt(act, weight, out_t, GemmType::Normal, "", nullptr, stream);
+    moe_cuda::kernels::fp8_gemm_nt(A_t, sfa_t, B_t, sfb_t, out_t, GemmType::Normal, "", nullptr, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     auto end = std::chrono::high_resolution_clock::now();
     CUDA_CHECK(cudaStreamDestroy(stream));

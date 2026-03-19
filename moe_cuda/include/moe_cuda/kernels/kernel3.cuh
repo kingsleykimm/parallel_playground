@@ -168,7 +168,7 @@ struct matmul_template {
     // layout::BK);
 
     int Rblocks = constexpr_ti_ceil_div(_M, NUM_TILES * layout::c_tile::rows),
-        Cblocks = constexpr_ti_ceil_div(_N / 2, layout::c_tile::cols);
+        Cblocks = constexpr_ti_ceil_div(_N, layout::c_tile::cols);
     int task_id = args.task_iter * gridDim.x + blockIdx.x;
 
     args.common.Rblocks = Rblocks;
@@ -245,7 +245,7 @@ struct matmul_template {
                           args.inputs_arrived);
         }
         const int b_element_row =
-            get_global_idx<true>(_N / 2, args.common.coord.y * layout::BN, args,
+            get_global_idx<true>(_N, args.common.coord.y * layout::BN, args,
                                  args.common.m_block_idx);
         tma::load_async(
             args.input.gate, args.globals.gate,
@@ -261,10 +261,11 @@ struct matmul_template {
 
   struct consumer {
 
+    // convertor wrapper for fp8e4m3 -> float
+
     using consumers = group<NUM_CONSUMER_WARPS>;
     static constexpr int shape_k_scales = constexpr_ti_ceil_div(_K, layout::BK);
-    static constexpr int shape_n_sfb =
-        constexpr_ti_ceil_div(_N / 2, layout::BK);
+    static constexpr int shape_n_sfb = constexpr_ti_ceil_div(_N, layout::BK);
     static constexpr uint32_t stride_n_sfb = shape_k_scales;
     static constexpr uint32_t stride_k_sfb = 1;
 
@@ -280,12 +281,13 @@ struct matmul_template {
                              (args.common.coord.y * layout::BN) % layout::BK)) /
             8;
         args.state.num_full_iters =
-            min(layout::BN, (_N / 2 - args.common.coord.y * layout::BN)) / 8;
+            min(layout::BN, (_N - args.common.coord.y * layout::BN)) / 8;
       } else {
         args.state.num_former_iters = args.state.num_full_iters =
             layout::BN / 8;
       }
     }
+
     __device__ static void compute(consumer_compute_args<layout> args) {
 
       const bool computation_valid = is_computation_valid(args);
@@ -368,8 +370,6 @@ struct matmul_template {
           warp::mul_col(args.state.per_k_up_accum, args.state.per_k_up_accum,
                         up_col_scale_b);
         }
-
-        // silu here
         args.state.gate_accum += args.state.per_k_gate_accum;
         args.state.up_accum += args.state.per_k_up_accum;
       }
@@ -398,57 +398,11 @@ struct matmul_template {
         // need to quantize to FP8, which is args.state.up_accum / row_amaxes_rv
         // across rows
         warp::div_row(args.state.up_accum, args.state.up_accum, row_amaxes_rv);
-        {
-          using U2 = fp8e4m3_2;
-          using T2 = float2;
-          using SRCT = decltype(args.state.up_accum);
 
-          int warp_laneid = kittens::laneid();
-          int local_warpid = warpgroup::warpid();
-          constexpr int warp_height = SRCT::height; // 16
+        rt<fp8e4m3, 16, layout::BN> fp8_output_tile;
+        warp::copy(fp8_output_tile, args.state.up_accum);
 
-          uint32_t shared_addr = static_cast<uint32_t>(
-              __cvta_generic_to_shared(&args.state.up_accum.data[0]));
-#pragma unroll
-          for (int i = 0; i < SRCT::height; i++) {
-#pragma unroll
-            for (int j = 0; j < SRCT::width; j++) {
-              int warp_group_16 =
-                  (warp_laneid /
-                   16); // divide each warp into two groups of 16 threads
-              int lane_in_16 =
-                  warp_laneid % 16; // position in group of 16 threads
-              int row = (local_warpid * warp_height + i) *
-                            args.state.up_accum.tile_size_row +
-                        (lane_in_16 %
-                         16); // find base row for warp in warpgroup and then
-              // distribute the 16 threads in the warp across the rows
-              int col = j * args.state.up_accum.tile_size_col +
-                        warp_group_16 * 16; // find base column and then *16 for
-                                            // second half of the warp
-
-              U2 tmp[4];
-              tmp[0] = base_types::convertor<U2, T2>::convert(
-                  args.state.up_accum.tiles[i][j].data[0]);
-              tmp[1] = base_types::convertor<U2, T2>::convert(
-                  args.state.up_accum.tiles[i][j].data[1]);
-              tmp[2] = base_types::convertor<U2, T2>::convert(
-                  args.state.up_accum.tiles[i][j].data[2]);
-              tmp[3] = base_types::convertor<U2, T2>::convert(
-                  args.state.up_accum.tiles[i][j].data[3]);
-              // if constexpr (std::is_same_v<typename SRCT::layout,
-              //                              ducks::rt_layout::row>) {
-              //   move<U2>::stsm4(args.finish.c[warpgroup::groupid()].idx(
-              //                       shared_addr, {row, col}),
-              //                   tmp[0], tmp[1], tmp[2], tmp[3]);
-              // } else {
-              //   move<U2>::stsm4t(args.finish.c[warpgroup::groupid()].idx(
-              //                        shared_addr, {row, col}),
-              //                    tmp[0], tmp[2], tmp[1], tmp[3]);
-              // }
-            }
-          }
-        }
+        warpgroup::store(args.finish.c[warpgroup::groupid()], fp8_output_tile);
         warpgroup::store(args.finish.out_scales[warpgroup::groupid()],
                          row_amaxes_rv);
         warpgroup::sync(warpgroup::groupid() + 4);

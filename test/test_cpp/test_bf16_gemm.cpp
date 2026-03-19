@@ -29,7 +29,7 @@
 #include <torch/torch.h>
 
 #include "test_utils.h"
-#include <apis/moe_forward.hpp>
+#include <kernels/internal_api.hpp>
 #include <jit/compiler.hpp>
 #include <moe_cuda/dtype.h>
 #include <runtime/tensor.h>
@@ -268,7 +268,7 @@ bool test_bf16_normal(int64_t M, int64_t N, int64_t K, float atol, float rtol, b
     std::string compiled_dims = "";
 
     auto start = std::chrono::high_resolution_clock::now();
-    moe_cuda::bf16_gemm(A_custom, B_custom, C_opt, D_custom, type, compiled_dims, nullptr, stream);
+    moe_cuda::kernels::bf16_gemm(A_custom, B_custom, C_opt, D_custom, type, compiled_dims, nullptr, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
@@ -326,7 +326,7 @@ bool test_bf16_batched(int64_t M, int64_t N, int64_t K, int num_groups, float at
     std::string compiled_dims = "";
 
     auto start = std::chrono::high_resolution_clock::now();
-    moe_cuda::bf16_gemm(A_custom, B_custom, C_opt, D_custom, type, compiled_dims, nullptr, stream);
+    moe_cuda::kernels::bf16_gemm(A_custom, B_custom, C_opt, D_custom, type, compiled_dims, nullptr, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
@@ -408,7 +408,7 @@ bool test_bf16_grouped_contiguous(int64_t M, int64_t N, int64_t K, int num_group
     std::string compiled_dims = "";
 
     auto start = std::chrono::high_resolution_clock::now();
-    moe_cuda::bf16_gemm(A_custom, B_custom, C_opt, D_custom, type, compiled_dims, grouped_layout, stream);
+    moe_cuda::kernels::bf16_gemm(A_custom, B_custom, C_opt, D_custom, type, compiled_dims, grouped_layout, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
@@ -490,7 +490,7 @@ bool test_bf16_grouped_masked(int64_t M, int64_t N, int64_t K, int num_groups, f
 
     
     auto start = std::chrono::high_resolution_clock::now();
-    moe_cuda::bf16_gemm(A_custom, B_custom, C_opt, D_custom, type, compiled_dims, grouped_layout, stream);
+    moe_cuda::kernels::bf16_gemm(A_custom, B_custom, C_opt, D_custom, type, compiled_dims, grouped_layout, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);

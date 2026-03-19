@@ -206,10 +206,8 @@ endif()
 
 add_library(moe_cuda_lib STATIC
     src/moe_ops.cu
-    csrc/apis/moe_forward.cpp
     csrc/jit_kernels/fp8_tk_globals_factory.cu
 )
-set_source_files_properties(csrc/apis/moe_forward.cpp PROPERTIES LANGUAGE CUDA)
 
 target_include_directories(moe_cuda_lib
     PUBLIC
@@ -235,14 +233,7 @@ target_link_libraries(moe_cuda_lib PUBLIC
     fmt::fmt
 )
 
-target_compile_definitions(moe_cuda_lib PUBLIC FMT_USE_INT128=0)
-
-# ThunderKittens system/TMA headers are gated on KITTENS_HOPPER.
-set_source_files_properties(
-    csrc/jit_kernels/fp8_tk_globals_factory.cu
-    src/moe_ops.cu
-    PROPERTIES COMPILE_DEFINITIONS "KITTENS_HOPPER"
-)
+target_compile_definitions(moe_cuda_lib PUBLIC FMT_USE_INT128=0 KITTENS_HOPPER)
 
 set_target_properties(moe_cuda_lib PROPERTIES
     CUDA_SEPARABLE_COMPILATION OFF
@@ -269,7 +260,8 @@ if(BUILD_PYBIND)
     if(NOT Python3_Development_FOUND)
         find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
     endif()
-    Python3_add_library(moe_cuda MODULE WITH_SOABI csrc/python_api.cpp)
+    Python3_add_library(moe_cuda MODULE WITH_SOABI csrc/python_api.cpp csrc/tk_bindings.cu)
+    set_source_files_properties(csrc/tk_bindings.cu PROPERTIES LANGUAGE CUDA)
     set_target_properties(moe_cuda PROPERTIES PREFIX "")
     target_include_directories(moe_cuda PRIVATE
         ${CMAKE_SOURCE_DIR}/moe_cuda/include
@@ -301,6 +293,7 @@ if(BUILD_PYBIND)
     target_compile_definitions(moe_cuda PRIVATE
         FMT_USE_INT128=0
         TORCH_EXTENSION_NAME=moe_cuda
+        KITTENS_HOPPER
     )
     target_compile_options(moe_cuda PRIVATE
         $<$<COMPILE_LANGUAGE:CXX>:-O3 -fPIC>

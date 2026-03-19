@@ -1,7 +1,6 @@
 #pragma once
 #include "a2a_kernels.h"
 #include "pyutils/torchutils.cuh"
-#include <moe_cuda/kernels/common/launch_utils.cuh>
 
 #include <cooperative_groups.h>
 #include <cuda.h>
@@ -36,10 +35,10 @@ template <int TOKEN_DIM> struct globals {
                              config::NUM_DEVICES, false>;
 
   using in_tokens_layout =
-      gl<uint8_t, -1, -1, -1,
+      gl<bf16, -1, -1, -1,
          TOKEN_DIM>; // converted to a std::byte format for easier transferring
   using recv_buffer_layout =
-      pgl<gl<uint8_t, -1, -1, -1, TOKEN_DIM>, config::NUM_DEVICES, false>;
+      pgl<gl<bf16, -1, -1, -1, -1>, config::NUM_DEVICES, false>;
 
   in_tokens_layout in_tokens;
   recv_buffer_layout recv_buffer;
@@ -50,11 +49,10 @@ template <int TOKEN_DIM> struct globals {
   uint32_t *__restrict__ source_rank;
   uint32_t *__restrict__ padded_index;
   uint32_t *__restrict__ sync_counter;
-  const int x_elemsize;
   const int num_recv_tokens;
   const int rank;
   const int dp_group;
-
+  const int dp_size;
   __host__ inline int dynamic_shared_memory() {
     return sizeof(Stage) * config::NUM_STAGES;
   }
@@ -87,8 +85,9 @@ template <int TOKEN_DIM> __device__ inline void kernel(globals<TOKEN_DIM> &G) {
 
   if (warp_id == 0) {
     if constexpr (NUM_DEVICES > 1) {
+      auto local_rank = G.rank % NUM_DEVICES;
       if (lane_id < NUM_DEVICES) {
-        node_sync::wait(G.barrier, {G.rank}, lane_id, counter);
+        node_sync::wait(G.barrier, {lane_id}, local_rank, counter);
       }
     }
   } else if (warp_id == 1) {
@@ -100,7 +99,6 @@ template <int TOKEN_DIM> __device__ inline void kernel(globals<TOKEN_DIM> &G) {
     }
   }
   everyone::sync(1);
-  *G.sync_counter = counter + 1;
 
   shared_to_local();
   grid.sync();
@@ -119,15 +117,14 @@ template <int TOKEN_DIM> __device__ inline void kernel(globals<TOKEN_DIM> &G) {
 
     uint4 values[NUM_STAGES];
     // loop across token dimension
-    for (int i = threadIdx.x; i * sizeof(uint4) < TOKEN_DIM * G.x_elemsize;
+    for (int i = threadIdx.x; i * sizeof(uint4) < TOKEN_DIM * 2;
          i += config::NUM_THREADS) {
 
       // load loop per stage
 #pragma unroll NUM_STAGES
       for (int s = 0;
            s < NUM_STAGES && token + s * gridDim.x < G.num_recv_tokens; s++) {
-        uint4 *ptr =
-            (uint4 *)(&G.in_tokens[{token + local_stages[s].index, 0}]);
+        uint4 *ptr = (uint4 *)(&G.in_tokens[{static_cast<int>(local_stages[s].index), 0}]);
         values[s] = ld_global_nc_uint4(&ptr[i]);
       }
 
@@ -145,7 +142,7 @@ template <int TOKEN_DIM> __device__ inline void kernel(globals<TOKEN_DIM> &G) {
         int first_peer = (token_rank / G.dp_size) * G.dp_size;
         for (int dp_peer = 0; dp_peer < G.dp_size; dp_peer++) {
           int cur_rank = (first_peer + dp_peer) % NUM_DEVICES;
-          uint4 *dst_ptr = G.recv_buffer[cur_rank][{offset, 0}];
+          uint4 *dst_ptr = (uint4 *)((&G.recv_buffer[cur_rank][{offset, 0}]));
           st_global_nc_uint4(values[s], &dst_ptr[i]);
         }
       }
@@ -162,14 +159,16 @@ template <int TOKEN_DIM> __device__ inline void kernel(globals<TOKEN_DIM> &G) {
     shared_to_local();
   }
 
-  grid.sync();
-
-  if (blockIdx.x == 0) {
-    if constexpr (NUM_DEVICES > 1) {
+  if constexpr (NUM_DEVICES > 1) {
+    grid.sync();
+    if (blockIdx.x == 0) {
+      if (threadIdx.x == 0) {
+        *G.sync_counter = counter + 1;
+      }
       if (threadIdx.x < NUM_DEVICES) {
-        auto local_rank = threadIdx.x % NUM_DEVICES;
-        signal(G.barrier, {local_rank + NUM_DEVICES}, G.rank,
-               counter); // this rank is done, signal to all other ranks
+        auto local_rank = G.rank % NUM_DEVICES;
+        node_sync::signal(G.barrier, {local_rank + NUM_DEVICES}, threadIdx.x,
+                          1); // this rank is done, signal to all other ranks
       }
     }
   }
@@ -184,13 +183,13 @@ __global__ void __launch_bounds__(a2a_combine_send::config::NUM_THREADS, 1)
 
 template <int TOKEN_DIM>
 cudaError_t a2a_kernels::a2a_combine_send_tk(
-    at::Tensor &in_tokens_tensor, size_t x_elemsize,
+    at::Tensor &in_tokens_tensor,
     kittens::py::TKParallelTensor &recv_buffer_tensor,
     kittens::py::TKParallelTensor &barrier_tensor,
     uint32_t *combine_send_offset, uint32_t *source_rank,
     uint32_t *padded_index, uint32_t *sync_counter, int num_recv_tokens,
-    int rank, int dp_group, cudaStream_t stream) {
-  const size_t token_dim = TOKEN_DIM * x_elemsize;
+    int rank, int dp_group, int dp_size, cudaStream_t stream) {
+  const size_t token_dim = TOKEN_DIM * 2; // bf16 / fp16 types only
   HOST_ASSERT(token_dim % sizeof(uint4) == 0,
               "TOKEN_DIM does not fit alignment requirements");
 
@@ -202,18 +201,19 @@ cudaError_t a2a_kernels::a2a_combine_send_tk(
   GLOBALS global_args = {
       .in_tokens =
           kittens::py::tensor_to_gl<in_tokens_layout, false>(in_tokens_tensor),
-      .recv_buffer = kittens::py::parallel_tensor_to_pgl<recv_buffer_layout>(
-          recv_buffer_tensor),
+      .recv_buffer =
+          kittens::py::parallel_tensor_to_pgl<recv_buffer_layout, false>(
+              recv_buffer_tensor),
       .barrier = kittens::py::parallel_tensor_to_pgl<barrier_layout, false>(
           barrier_tensor),
       .combine_send_offset = combine_send_offset,
       .source_rank = source_rank,
       .padded_index = padded_index,
       .sync_counter = sync_counter,
-      .x_elemsize = x_elemsize,
       .num_recv_tokens = num_recv_tokens,
       .rank = rank,
-      .dp_group = dp_group};
+      .dp_group = dp_group,
+      .dp_size = dp_size};
 
   void *args[] = {&global_args};
 
@@ -221,8 +221,8 @@ cudaError_t a2a_kernels::a2a_combine_send_tk(
   cudaError_t status = cudaLaunchCooperativeKernel(
       &combine_send_global_kernel<TOKEN_DIM>,
       dim3(a2a_combine_send::config::NUM_BLOCKS, 1, 1),
-      dim3(a2a_combine_send::config::NUM_THREADS, 1, 1), global_args,
-      GLOBALS::dynamic_shared_memory(), stream);
+      dim3(a2a_combine_send::config::NUM_THREADS, 1, 1), args,
+      global_args.dynamic_shared_memory(), stream);
 
   nvtxRangePop();
 

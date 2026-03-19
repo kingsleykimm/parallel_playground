@@ -92,6 +92,36 @@ inline int get_tk_lcf_kernel3_smem_size(
     return scratch_alloc_size + num_stages * input_alloc_size + finish_block_size + 2 * 1024;
 }
 
+inline int get_tk_lcf_kernel4_smem_size(
+    const int block_m, const int block_n, const int block_k,
+    const int num_stages, const size_t cd_size
+) {
+    const int num_tiles = (block_m > 64) ? 2 : 1;
+
+    // scratch_alloc_block: padder<empty, 1024> — 1024 bytes regardless of content
+    const int scratch_alloc_size = 1024;
+
+    // input_block raw bytes: a_tile[num_tiles] + gate_tile + up_tile + sfa_tile[num_tiles]
+    //   a_tile    = st_fp8e4m3<64, BK>  : 64 * BK bytes (fp8 = 1 byte)
+    //   gate_tile = st_fp8e4m3<BN, BK>  : BN * BK bytes
+    //   up_tile   = st_fp8e4m3<BN, BK>  : BN * BK bytes
+    //   sfa_tile  = sv<float, 64>       : 64 * 4 bytes
+    const int input_block_bytes = num_tiles * 64 * block_k
+                                + 2 * block_n * block_k   // gate + up
+                                + num_tiles * 64 * (int)sizeof(float);
+    const int input_alloc_size = host_align(input_block_bytes, 1024);
+
+    // finish_block: c_tile[num_tiles] + out_scales[num_tiles]
+    //   c_tile     = st<c_dtype, 64, BN> : 64 * BN * cd_size bytes
+    //   out_scales = sv<float, 64>       : 64 * 4 bytes
+    const int finish_block_size = num_tiles * 64 * block_n * (int)cd_size
+                                + num_tiles * 64 * (int)sizeof(float);
+
+    // Total: scratch | stages*input | gap | finish — +2*1024 ensures
+    // SAFE_STAGES_BETWEEN_BLOCKS == num_stages (producer never stalls on finish_finished).
+    return scratch_alloc_size + num_stages * input_alloc_size + host_align(finish_block_size * 2, 1024) + 2 * 1024;
+}
+
 inline GemmConfig get_kernel3_config(
     GemmType gemm_type,
     uint32_t M,
@@ -102,7 +132,8 @@ inline GemmConfig get_kernel3_config(
     Major BMajor,
     Major CMajor,
     c10::ScalarType AB_type, c10::ScalarType CD_type,
-    const uint32_t& num_sms
+    const uint32_t& num_sms,
+    bool is_consumer_pp = false
 ) {
     const uint32_t block_k = 128 / get_type_size(AB_type);
 
@@ -122,6 +153,10 @@ inline GemmConfig get_kernel3_config(
         block_m_candidates = {128};
     } else if (gemm_type == GemmType::MGroupedMasked) {
         block_m_candidates = {64, 128};
+    }
+
+    if (is_consumer_pp) {
+        block_m_candidates = {64};
     }
 
     // kernel3 requires BN % 128 == 0 (grouped_matmul_layout static_assert)
@@ -179,14 +214,24 @@ inline GemmConfig get_kernel3_config(
         }
     }
 
-    const auto& [num_tma_threads, num_math_threads] = SM90Arch::get_num_threads(best_block_m);
+    auto [num_tma_threads, num_math_threads] = SM90Arch::get_num_threads(best_block_m);
+    if (is_consumer_pp) {
+        num_math_threads = 256; // two consumer warpgroups
+    }
 
     constexpr int smem_capacity = SM90Arch::kMaxSharedMemoryPerBlock;
     SharedMemoryConfig smem_config;
     int best_num_stages = 0;
     const size_t cd_size = get_type_size(CD_type);
     for (int num_stages = 16; num_stages > 0; num_stages--) {
-        int smem_size = get_tk_lcf_kernel3_smem_size(best_block_m, best_block_n, block_k, num_stages, cd_size);
+        int smem_size;
+        if (is_consumer_pp) {
+            smem_size = get_tk_lcf_kernel4_smem_size(best_block_m, best_block_n, block_k, num_stages, cd_size);
+
+        }
+        else {
+            smem_size = get_tk_lcf_kernel3_smem_size(best_block_m, best_block_n, block_k, num_stages, cd_size);
+        }
         if (smem_size <= smem_capacity) {
             best_num_stages = num_stages;
             smem_config.smem_size = smem_size;

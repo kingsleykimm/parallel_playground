@@ -1,9 +1,11 @@
 #pragma once
 
+#include "moe_cuda/types.h"
 #include <jit_kernels/impls/sm90_bf16_gemm.hpp>
 #include <jit_kernels/impls/sm90_fp8_gemm_1d2d.hpp>
 #include <jit_kernels/impls/kernel2.hpp>
 #include <jit_kernels/impls/kernel3.hpp>
+#include <jit_kernels/impls/kernel4.hpp>
 #include <jit_kernels/heuristics/common.hpp>
 #include <runtime/device.hpp>
 #include <runtime/tensor_compat.h>
@@ -13,23 +15,23 @@ namespace api {
 
 
 // we always assume SFA is K-major
-inline void fp8_gemm_nt(std::pair<at::Tensor&, at::Tensor&> act,
-                     std::pair<at::Tensor&, at::Tensor&> weight,
+inline void fp8_gemm_nt(at::Tensor& act,
+                     at::Tensor& act_scale,
+                     at::Tensor& weight,
+                     at::Tensor& weight_scale,
                      at::Tensor& output,
                      GemmType gemm_type,
                      const std::string& compiled_dims,
                      int* grouped_layout,
                      cudaStream_t& stream) {
     if (gemm_type != GemmType::MGroupedMasked) {
-        HOST_ASSERT(act.first.dim() < 3, "A tensor for FP8 GEMM must have less than three dims");
+        HOST_ASSERT(act.dim() < 3, "A tensor for FP8 GEMM must have less than three dims");
     }
 
-
-
-    auto sfa_mn_major = act.second.transpose(-1, -2).contiguous();
+    auto sfa_mn_major = act_scale.transpose(-1, -2).contiguous();
 
     if (gemm_type == GemmType::Normal) {
-        sm90_fp8_gemm_1d2d_nt(act.first, weight.first, sfa_mn_major, weight.second, output, stream);
+        sm90_fp8_gemm_1d2d_nt(act, weight, sfa_mn_major, weight_scale, output, stream);
     }
     //  else if (gemm_type == GemmType::MGroupedContiguous) {
     //     HOST_ASSERT(grouped_layout != nullptr, "grouped_layout cannot be null for grouped FP8 GEMM");
@@ -45,23 +47,22 @@ inline void fp8_gemm_nt(std::pair<at::Tensor&, at::Tensor&> act,
     }
 }
 
-inline void fp8_grouped_gemm(std::pair<at::Tensor&, at::Tensor&> act,
-    std::pair<at::Tensor&, at::Tensor&> weight,
+inline void fp8_grouped_gemm(at::Tensor& act,
+    at::Tensor& act_scale,
+    at::Tensor& weight,
+    at::Tensor& weight_scale,
     at::Tensor& output,
     GemmType gemm_type,
     int* grouped_layout,
     cudaStream_t& stream) {
-    // HOST_ASSERT(major_of(act.second) == Major::MN,
-    //             "grouped FP8 GEMM expects scale_a in MN-major layout");
-
     if (gemm_type == GemmType::MGroupedContiguous) {
         HOST_ASSERT(grouped_layout != nullptr, "grouped_layout cannot be null for grouped FP8 GEMM");
         sm90_fp8_grouped_gemm_contiguous(
-            act.first, weight.first, act.second, weight.second, output, grouped_layout, stream);
+            act, weight, act_scale, weight_scale, output, grouped_layout, stream);
     } else if (gemm_type == GemmType::MGroupedMasked) {
         HOST_ASSERT(grouped_layout != nullptr, "grouped_layout cannot be null for grouped FP8 GEMM");
         sm90_fp8_grouped_gemm_masked(
-            act.first, weight.first, act.second, weight.second, output, grouped_layout, stream);
+            act, weight, act_scale, weight_scale, output, grouped_layout, stream);
     } else {
         HOST_ASSERT(false, "fp8_grouped_gemm only supports MGroupedContiguous and MGroupedMasked");
     }
@@ -93,7 +94,7 @@ inline void bf16_gemm(at::Tensor& A,
     }
 }
 
-inline void fp8_grouped_gemm_swiglu_contiguous(
+inline void fp8_grouped_gemm_swiglu(
     at::Tensor& A,
     at::Tensor& gate_weight,
     at::Tensor& up_weight,
@@ -102,15 +103,23 @@ inline void fp8_grouped_gemm_swiglu_contiguous(
     at::Tensor& scale_up,
     at::Tensor& scale_d,
     at::Tensor& D,
+    GemmType gemm_type,
     int* grouped_layout,
     cudaStream_t& stream) {
     HOST_ASSERT(grouped_layout != nullptr,
                 "grouped_layout cannot be null for grouped FP8 swiglu GEMM");
-    kernel3_contiguous(A, up_weight, gate_weight, scale_a, scale_up, scale_gate,
-                       scale_d, D, grouped_layout, stream);
+    if (gemm_type == GemmType::MGroupedMasked) {
+        kernel3_masked(A, up_weight, gate_weight, scale_a, scale_up, scale_gate,
+            scale_d, D, grouped_layout, stream);
+    }
+    else {
+        kernel3_contiguous(A, up_weight, gate_weight, scale_a, scale_up, scale_gate,
+                           scale_d, D, grouped_layout, stream);
+    }
 }
 
-inline void fp8_grouped_gemm_swiglu_masked(
+
+void fp8_grouped_gemm_swiglu_consumer_pp(
     at::Tensor& A,
     at::Tensor& gate_weight,
     at::Tensor& up_weight,
@@ -119,12 +128,18 @@ inline void fp8_grouped_gemm_swiglu_masked(
     at::Tensor& scale_up,
     at::Tensor& scale_d,
     at::Tensor& D,
+    GemmType gemm_type,
     int* grouped_layout,
     cudaStream_t& stream) {
+
     HOST_ASSERT(grouped_layout != nullptr,
-                "grouped_layout cannot be null for masked grouped FP8 swiglu GEMM");
-    kernel3_masked(A, up_weight, gate_weight, scale_a, scale_up, scale_gate,
-                   scale_d, D, grouped_layout, stream);
+                "grouped_layout cannot be null for masked grouped FP8 swiglu GEMM consumer PP");
+    if (gemm_type == GemmType::MGroupedMasked) {
+        kernel4_masked(A, gate_weight, up_weight, scale_a, scale_gate, scale_up, scale_d, D, grouped_layout, stream);
+    }
+    else {
+    kernel4_contiguous(A, gate_weight, up_weight, scale_a, scale_gate, scale_up, scale_d, D, grouped_layout, stream);
+    }
 }
 
 }  // namespace api

@@ -69,15 +69,23 @@ cudaError_t fp8e4m3_a2a_dispatch_recv(
     uint32_t num_recv_tokens, int rank, int dp_size, cudaStream_t stream);
 
 
-    template <int TOKEN_DIM>
-    cudaError_t
-    a2a_combine_send_tk(at::Tensor &in_tokens_tensor, size_t x_elemsize,
+template <int TOKEN_DIM>
+cudaError_t a2a_combine_send_tk(at::Tensor &in_tokens_tensor,
                                   kittens::py::TKParallelTensor &recv_buffer_tensor,
                                   kittens::py::TKParallelTensor &barrier_tensor,
                                   uint32_t *combine_send_offset,
                                   uint32_t *source_rank, uint32_t *padded_index,
                                   uint32_t *sync_counter, int num_recv_tokens,
-                                  int rank, int dp_group, cudaStream_t stream);
+                                  int rank, int dp_group, int dp_size, cudaStream_t stream);
+    
+template <int EXPERTS_PER_TOKEN, int NUM_EXPERTS, int TOKEN_DIM>
+cudaError_t a2a_combine_recv_tk(
+    kittens::py::TKParallelTensor &barrier_tensor,
+    kittens::py::TKParallelTensor &recv_buffer_tensor,
+    at::Tensor &out_tokens_tensor, at::Tensor &indices_tensor,
+    at::Tensor &weights_tensor, uint32_t *token_offset,
+    uint32_t *expert_offsets, uint32_t *sync_counter, int num_tokens,
+    bool accumulate, int rank, int dp_group, cudaStream_t stream);
 }
 
 
