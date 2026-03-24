@@ -38,6 +38,8 @@ public:
         bool accumulate = false,
         cudaStream_t stream = nullptr
     ) = 0;
+
+    virtual uint32_t max_recv_tokens() const = 0;
 };
 
 std::shared_ptr<All2AllBase> make_all2all(
@@ -63,6 +65,9 @@ void naive_moe_forward_dispatch(All2AllBase &a2a_base,
                        at::Tensor &gate_scales, at::Tensor &up,
                        at::Tensor &up_scales, at::Tensor &down,
                        at::Tensor &down_scales, at::Tensor &indices,
-                       at::Tensor &weights, cudaStream_t stream);
+                       at::Tensor &weights, at::Tensor &out_tokens,
+                       at::Tensor &expert_x, at::Tensor &expert_x_scales,
+                       at::Tensor &inter_y, at::Tensor &inter_y_scales,
+                       at::Tensor &expert_y, cudaStream_t stream);
 
 } // namespace moe_cuda

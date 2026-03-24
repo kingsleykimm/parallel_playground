@@ -125,8 +125,6 @@ kernel(const globals<EXPERTS_PER_TOKEN, NUM_EXPERTS, TOKEN_DIM> &G) {
   tokens_per_expert_layout(&tokens_per_expert) = // size (NUM_EXPERTS)
       alloc.allocate<tokens_per_expert_layout>();
 
-  int counter = *G.sync_counter;
-
   if (blockIdx.x == 0) {
     warp::zero(tokens_per_expert); // -> don't assume TK warp operations are
                                    // auto sychronized across a CTA!
@@ -213,6 +211,7 @@ kernel(const globals<EXPERTS_PER_TOKEN, NUM_EXPERTS, TOKEN_DIM> &G) {
 
   // NVLink barrier set up to wait for previous combine kernels to finish before
   // writing into send buffer
+  int counter = *G.sync_counter;
   if constexpr (NUM_DEVICES > 1) {
     if (blockIdx.x == 0) {
       for (int peer = threadIdx.x; peer < NUM_DEVICES; peer += NUM_THREADS) {
@@ -269,8 +268,8 @@ kernel(const globals<EXPERTS_PER_TOKEN, NUM_EXPERTS, TOKEN_DIM> &G) {
               const bool has_scale = i < TOKEN_DIM / 128;
               st_global_nc_uint4(vals[s], &recv_token_ptr[i]);
               if (has_scale) {
-                move<float>::stg(
-                    &G.out_scales[dst_rank][{i, token_position}], scales[s]);
+                move<float>::stg(&G.out_scales[dst_rank][{i, token_position}],
+                                 scales[s]);
               }
             }
           }
@@ -284,8 +283,8 @@ kernel(const globals<EXPERTS_PER_TOKEN, NUM_EXPERTS, TOKEN_DIM> &G) {
             const bool has_scale = i < TOKEN_DIM / 128;
             st_global_nc_uint4(vals[s], &send_token_ptr[i]);
             if (has_scale) {
-              move<float>::stg(
-                  &G.send_scale_buffer[G.rank][{i, (int)position}], scales[s]);
+              move<float>::stg(&G.send_scale_buffer[G.rank][{i, (int)position}],
+                               scales[s]);
             }
           }
         }
@@ -301,7 +300,7 @@ kernel(const globals<EXPERTS_PER_TOKEN, NUM_EXPERTS, TOKEN_DIM> &G) {
       }
       if (threadIdx.x < NUM_DEVICES) {
         node_sync::signal(G.barrier, {G.rank + NUM_DEVICES},
-                          static_cast<int>(threadIdx.x), 1);
+                          static_cast<int>(threadIdx.x), counter + 1);
       }
     }
   }

@@ -49,11 +49,13 @@ export JIT_USE_NVRTC=1
 # Roadmap:
 - [ ] implement a fused dispatch + swiglu grouped gemm
     - [ ] inside here, enforce transposed sfa majors
+    - [ ] keep linking this together, and also remember to zero out the comm_comp_barriers after each dispatch
 - [] fuse gate matmul + grouped topk kernels into one kernel
 - [ ] look at fusing SP + TP kernels to match megatron forward pass
 
 
 # TO-DO today:
+- [ ] ncu swiglu grouped gemm across different shapes and tactics
 - [ ] work on testing and benchmarking swiglu + full a2a, find optimization spots
 - [ ] i suspect a dispatch gemm is what's next
 - [ ] compare performance of fused swiglu with liger kernel

@@ -294,13 +294,7 @@ struct matmul_template {
       args.common.computation_valid = computation_valid;
       if (computation_valid) {
 
-        warp::zero(args.state.per_k_gate_accum);
-        warp::zero(args.state.per_k_up_accum);
-
-        warpgroup::mma_ABt(args.state.per_k_gate_accum,
-                           args.input.a[warpgroup::groupid()], args.input.gate);
-        warpgroup::mma_ABt(args.state.per_k_up_accum,
-                           args.input.a[warpgroup::groupid()], args.input.up);
+        // Compute scale pointer offsets once (independent of WGMMA results)
         const auto previous_group_offset = get_global_idx<true>(
             shape_k_scales * shape_n_sfb, 0, args, args.common.m_block_idx);
         const uint32_t scale_b_offset =
@@ -310,67 +304,91 @@ struct matmul_template {
         float *local_gate_sfb =
             args.globals.scale_gate.raw_ptr + scale_b_offset;
         float *local_up_sfb = args.globals.scale_up.raw_ptr + scale_b_offset;
-        float gate_scale_0;
-        float up_scale_0;
-        float gate_scale_1;
-        float up_scale_1;
 
+        // === Phase 1: issue gate WGMMA ===
+        warp::zero(args.state.per_k_gate_accum);
+        warpgroup::mma_ABt(args.state.per_k_gate_accum,
+                           args.input.a[warpgroup::groupid()], args.input.gate);
+
+        // === Phase 2: while gate WGMMA runs, load gate scales + scale_a,
+        //              and build the per-column gate scale vector ===
+        float gate_scale_0, gate_scale_1, up_scale_0, up_scale_1;
         move<float>::ldg(gate_scale_0, local_gate_sfb);
-        move<float>::ldg(up_scale_0, local_up_sfb);
         if constexpr (!layout::kIsUniformScales) {
-          if (args.state.num_full_iters > args.state.num_former_iters) {
+          if (args.state.num_full_iters > args.state.num_former_iters)
             move<float>::ldg(gate_scale_1, local_gate_sfb + stride_n_sfb);
-            move<float>::ldg(up_scale_1, local_up_sfb + stride_n_sfb);
+        }
+
+        typename decltype(args.state.per_k_gate_accum)::col_vec scale_a_rv;
+        warpgroup::load(scale_a_rv, args.input.sfa[warpgroup::groupid()]);
+
+        row_vec<rt<float, 16, layout::BN>> gate_col_scale_b, up_col_scale_b;
+        if constexpr (!layout::kIsUniformScales) {
+#pragma unroll
+          for (uint32_t i = 0; i < layout::BN / 16; i++) {
+            const uint32_t column_chunk = i * 2;
+            float first = column_chunk < args.state.num_former_iters
+                              ? gate_scale_0
+                              : gate_scale_1;
+            float second = column_chunk + 1 < args.state.num_former_iters
+                               ? gate_scale_0
+                               : gate_scale_1;
+            gate_col_scale_b[i][0] = make_float2(first, first);
+            gate_col_scale_b[i][1] = make_float2(second, second);
           }
         }
 
-        // once WGMMA is completed, apply scale promotion from FP22 -> FP32
-
-        // col_vec<rt<float, 16, layout::BN>> scale_a;
-        // WGMMA instructions always have that the register tile is row major,
-        // so the scale_a is orthogonal
-        typename decltype(args.state.per_k_gate_accum)::col_vec scale_a_rv;
-        warpgroup::load(scale_a_rv, args.input.sfa[warpgroup::groupid()]);
+        // === Phase 3: wait for gate WGMMA ===
         warpgroup::mma_async_wait();
 
+        // === Phase 4: issue up WGMMA ===
+        warp::zero(args.state.per_k_up_accum);
+        warpgroup::mma_ABt(args.state.per_k_up_accum,
+                           args.input.a[warpgroup::groupid()], args.input.up);
+
+        // === Phase 5: while up WGMMA runs:
+        //   a) apply scale promotion to gate result and accumulate
+        //   b) load up scales and build per-column up scale vector ===
         warp::mul_row(args.state.per_k_gate_accum, args.state.per_k_gate_accum,
                       scale_a_rv);
-        warp::mul_row(args.state.per_k_up_accum, args.state.per_k_up_accum,
-                      scale_a_rv);
-        if constexpr (layout::kIsUniformScales) { // single scale case
+        if constexpr (layout::kIsUniformScales) {
           args.state.per_k_gate_accum *= gate_scale_0;
-          args.state.per_k_up_accum *= up_scale_0;
         } else {
-          row_vec<rt<float, 16, layout::BN>> gate_col_scale_b;
-          row_vec<rt<float, 16, layout::BN>> up_col_scale_b;
-#pragma unroll
-          for (uint32_t i = 0; i < layout::BN / 16; i++) {
-
-            const uint32_t column_chunk = i * 2;
-            float first_scale = column_chunk < args.state.num_former_iters
-                                    ? gate_scale_0
-                                    : gate_scale_1;
-            float second_scale = column_chunk + 1 < args.state.num_former_iters
-                                     ? gate_scale_0
-                                     : gate_scale_1;
-            gate_col_scale_b[i][0] = make_float2(first_scale, first_scale);
-            gate_col_scale_b[i][1] = make_float2(second_scale, second_scale);
-
-            first_scale = column_chunk < args.state.num_former_iters
-                              ? up_scale_0
-                              : up_scale_1;
-            second_scale = column_chunk + 1 < args.state.num_former_iters
-                               ? up_scale_0
-                               : up_scale_1;
-            up_col_scale_b[i][0] = make_float2(first_scale, first_scale);
-            up_col_scale_b[i][1] = make_float2(second_scale, second_scale);
-          }
           warp::mul_col(args.state.per_k_gate_accum,
                         args.state.per_k_gate_accum, gate_col_scale_b);
+        }
+        args.state.gate_accum += args.state.per_k_gate_accum;
+
+        move<float>::ldg(up_scale_0, local_up_sfb);
+        if constexpr (!layout::kIsUniformScales) {
+          if (args.state.num_full_iters > args.state.num_former_iters)
+            move<float>::ldg(up_scale_1, local_up_sfb + stride_n_sfb);
+#pragma unroll
+          for (uint32_t i = 0; i < layout::BN / 16; i++) {
+            const uint32_t column_chunk = i * 2;
+            float first = column_chunk < args.state.num_former_iters
+                              ? up_scale_0
+                              : up_scale_1;
+            float second = column_chunk + 1 < args.state.num_former_iters
+                               ? up_scale_0
+                               : up_scale_1;
+            up_col_scale_b[i][0] = make_float2(first, first);
+            up_col_scale_b[i][1] = make_float2(second, second);
+          }
+        }
+
+        // === Phase 6: wait for up WGMMA ===
+        warpgroup::mma_async_wait();
+
+        // === Phase 7: apply scale promotion to up result and accumulate ===
+        warp::mul_row(args.state.per_k_up_accum, args.state.per_k_up_accum,
+                      scale_a_rv);
+        if constexpr (layout::kIsUniformScales) {
+          args.state.per_k_up_accum *= up_scale_0;
+        } else {
           warp::mul_col(args.state.per_k_up_accum, args.state.per_k_up_accum,
                         up_col_scale_b);
         }
-        args.state.gate_accum += args.state.per_k_gate_accum;
         args.state.up_accum += args.state.per_k_up_accum;
       }
       if (laneid() == 0)
@@ -401,7 +419,7 @@ struct matmul_template {
 
         rt<fp8e4m3, 16, layout::BN> fp8_output_tile;
         warp::copy(fp8_output_tile, args.state.up_accum);
-
+        tma::store_async_read_wait();
         warpgroup::store(args.finish.c[warpgroup::groupid()], fp8_output_tile);
         warpgroup::store(args.finish.out_scales[warpgroup::groupid()],
                          row_amaxes_rv);
@@ -418,7 +436,6 @@ struct matmul_template {
                                args.common.coord.y,
                                get_global_idx<isGroupedMasked>(
                                    _M, args.common.coord.x * 64, args)});
-          tma::store_async_read_wait();
         }
       }
 

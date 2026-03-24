@@ -9,6 +9,7 @@
 #include "c10/core/ScalarType.h"
 #include "c10/core/TensorOptions.h"
 #include <apis/moe.hpp>
+#include <jit_kernels/impls/kernel5.hpp>
 
 // ================================================
 // Kernel APIs
@@ -68,6 +69,29 @@ void fp8_grouped_gemm_swiglu_consumer_pp(
                                            gemm_type, grouped_layout, stream);
 };
 
+void fused_dispatch_grouped_gemm_swiglu(
+    kittens::py::TKParallelTensor &in_tokens,
+    kittens::py::TKParallelTensor &in_tokens_scales,
+    at::Tensor &expert_x_tokens, at::Tensor &expert_x_tokens_scale,
+    at::Tensor &comm_comp_barrier, at::Tensor &gate, at::Tensor &up,
+    at::Tensor &C, at::Tensor &scale_gate, at::Tensor &scale_up,
+    at::Tensor &out_scales, at::Tensor &indices,
+    kittens::py::TKParallelTensor &global_num_routed,
+    kittens::py::TKParallelTensor &expert_to_token_map,
+    at::Tensor &padded_expert_counts, at::Tensor &src_token_idx,
+    at::Tensor &src_dev_idx, kittens::py::TKParallelTensor &barrier,
+    int num_tokens, int *num_recv_tokens, int dp_rank, int rank, int dp_size,
+    int cur_dp_group, int num_dp_groups, int num_experts, int experts_per_token,
+    int num_comm_sms, int num_comp_sms, cudaStream_t &stream) {
+  ::fused_dispatch_grouped_gemm_swiglu(
+      in_tokens, in_tokens_scales, expert_x_tokens, expert_x_tokens_scale,
+      comm_comp_barrier, gate, up, C, scale_gate, scale_up, out_scales, indices,
+      global_num_routed, expert_to_token_map, padded_expert_counts,
+      src_token_idx, src_dev_idx, barrier, num_tokens, num_recv_tokens, dp_rank,
+      rank, dp_size, cur_dp_group, num_dp_groups, num_experts,
+      experts_per_token, num_comm_sms, num_comp_sms, stream);
+}
+
 void fp8_gemm_nt(at::Tensor &act, at::Tensor &act_scale, at::Tensor &weight,
                  at::Tensor &weight_scale, at::Tensor &output,
                  GemmType gemm_type, const std::string &compiled_dims,
@@ -103,46 +127,37 @@ void naive_moe_forward(All2All<EXPERTS_PER_TOKEN, NUM_EXPERTS, TOKEN_DIM> &a2a,
                        at::Tensor &gate_scales, at::Tensor &up,
                        at::Tensor &up_scales, at::Tensor &down,
                        at::Tensor &down_scales, at::Tensor &indices,
-                       at::Tensor &weights, cudaStream_t stream) {
+                       at::Tensor &weights, at::Tensor &out_tokens,
+                       at::Tensor &expert_x, at::Tensor &expert_x_scales,
+                       at::Tensor &inter_y, at::Tensor &inter_y_scales,
+                       at::Tensor &expert_y, cudaStream_t stream) {
 
   uint32_t max_recv_tokens = a2a.max_recv_tokens();
   at::TensorOptions options = at::TensorOptions().device(torch::kCUDA);
   at::Tensor out_expert_num_tokens =
       at::empty(std::vector<int64_t>{a2a.num_experts_per_rank()},
-                options.dtype(torch::kInt32));
+                options.dtype(torch::kUInt32));
 
   int H = input.size(-1);
-  int I = input.size(-2);
+  int I = gate.size(-2);
 
   // to maintain consistency with opt api
   std::optional<at::Tensor> input_scales_opt = input_scales;
-
-  at::Tensor expert_x = at::empty(std::vector<int64_t>(max_recv_tokens, H),
-                                  options.dtype(torch::kFloat8_e4m3fn));
-  std::optional<at::Tensor> expert_x_scales =
-      at::empty(std::vector<int64_t>(H / 128, max_recv_tokens),
-                options.dtype(torch::kFloat32));
-  at::Tensor inter_y = at::empty(std::vector<int64_t>(max_recv_tokens, I),
-                                 options.dtype(torch::kFloat8_e4m3fn));
-  at::Tensor inter_y_scales =
-      at::empty(std::vector<int64_t>(I / 128, max_recv_tokens),
-                options.dtype(torch::kFloat32));
-  at::Tensor expert_y = at::empty(std::vector<int64_t>(max_recv_tokens, H),
-                                  options.dtype(torch::kBFloat16));
+  std::optional<at::Tensor> expert_x_scales_opt = expert_x_scales;
   std::optional<at::Tensor> bound_m = std::nullopt;
-  a2a.dispatch(out_expert_num_tokens, expert_x, expert_x_scales, input,
+  a2a.dispatch(out_expert_num_tokens, expert_x, expert_x_scales_opt, input,
                input_scales_opt, indices, weights, bound_m, true, true, stream);
 
-  int *grouped_layout =
-      gemm_type == GemmType::MGroupedMasked
-          ? (int *)(a2a.context().worker.padded_offsets)
-          : (int *)(a2a.context().worker.tokens_per_expert_host.data());
-  fp8_grouped_gemm_swiglu(expert_x, gate, up, expert_x_scales.value(),
-                          gate_scales, up_scales, inter_y_scales, inter_y,
-                          gemm_type, grouped_layout, stream);
+  int *grouped_layout = gemm_type == GemmType::MGroupedMasked
+                            ? (int *)(a2a.context().worker.padded_offsets)
+                            : (int *)(a2a.context().worker.tokens_per_expert);
+  fp8_grouped_gemm_swiglu(expert_x, gate, up, expert_x_scales, gate_scales,
+                          up_scales, inter_y_scales, inter_y, gemm_type,
+                          grouped_layout, stream);
   fp8_grouped_gemm_nt(inter_y, inter_y_scales, down, down_scales, expert_y,
                       gemm_type, grouped_layout, stream);
-  a2a.combine(input, indices, weights, expert_y, bound_m, true, true, stream);
+  a2a.combine(out_tokens, indices, weights, expert_y, bound_m, true, true,
+              stream);
 }
 
 } // namespace kernels
@@ -168,14 +183,15 @@ make_all2all(uint32_t max_num_tokens, uint32_t num_experts,
         })});
   });
 }
-void naive_moe_forward_dispatch(All2AllBase &a2a_base, uint32_t num_experts,
-                                uint32_t experts_per_token, uint32_t hidden_dim,
-                                GemmType gemm_type, at::Tensor &input,
-                                at::Tensor &input_scales, at::Tensor &gate,
-                                at::Tensor &gate_scales, at::Tensor &up,
-                                at::Tensor &up_scales, at::Tensor &down,
-                                at::Tensor &down_scales, at::Tensor &indices,
-                                at::Tensor &weights, cudaStream_t stream) {
+void naive_moe_forward_dispatch(
+    All2AllBase &a2a_base, uint32_t num_experts, uint32_t experts_per_token,
+    uint32_t hidden_dim, GemmType gemm_type, at::Tensor &input,
+    at::Tensor &input_scales, at::Tensor &gate, at::Tensor &gate_scales,
+    at::Tensor &up, at::Tensor &up_scales, at::Tensor &down,
+    at::Tensor &down_scales, at::Tensor &indices, at::Tensor &weights,
+    at::Tensor &out_tokens, at::Tensor &expert_x, at::Tensor &expert_x_scales,
+    at::Tensor &inter_y, at::Tensor &inter_y_scales, at::Tensor &expert_y,
+    cudaStream_t stream) {
   LAUNCH_NUM_EXPERTS(num_experts, NUM_EXPERTS, {
     LAUNCH_NUM_EXPERTS_PER_TOKEN(experts_per_token, EXPERTS_PER_TOKEN, {
       LAUNCH_TOKEN_DIM(hidden_dim, TOKEN_DIM, {
@@ -184,7 +200,9 @@ void naive_moe_forward_dispatch(All2AllBase &a2a_base, uint32_t num_experts,
                 a2a_base);
         moe_cuda::kernels::naive_moe_forward(
             a2a, gemm_type, input, input_scales, gate, gate_scales, up,
-            up_scales, down, down_scales, indices, weights, stream);
+            up_scales, down, down_scales, indices, weights, out_tokens,
+            expert_x, expert_x_scales, inter_y, inter_y_scales, expert_y,
+            stream);
       });
     });
   });

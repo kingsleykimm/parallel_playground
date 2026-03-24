@@ -11,7 +11,7 @@ static void HOST_WARNING_(const char * msg, const char * file, int line)
 
 static void HOST_ERROR_(const char * msg, const char * file, int line)
 {
-    printf("ERROR: %s in %s:%d\n", msg, file, line);
+    printf("\033[1;31mERROR: %s in %s:%d\033[0m\n", msg, file, line);
     exit(EXIT_FAILURE);
 }
 

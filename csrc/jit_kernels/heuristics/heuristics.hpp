@@ -96,7 +96,7 @@ inline int get_tk_lcf_kernel4_smem_size(
     const int block_m, const int block_n, const int block_k,
     const int num_stages, const size_t cd_size
 ) {
-    const int num_tiles = (block_m > 64) ? 2 : 1;
+    const int num_tiles = 2;
 
     // scratch_alloc_block: padder<empty, 1024> — 1024 bytes regardless of content
     const int scratch_alloc_size = 1024;
@@ -107,7 +107,7 @@ inline int get_tk_lcf_kernel4_smem_size(
     //   up_tile   = st_fp8e4m3<BN, BK>  : BN * BK bytes
     //   sfa_tile  = sv<float, 64>       : 64 * 4 bytes
     const int input_block_bytes = num_tiles * 64 * block_k
-                                + 2 * block_n * block_k   // gate + up
+                                + num_tiles * 2 * block_n * block_k   // (gate + up) * 2
                                 + num_tiles * 64 * (int)sizeof(float);
     const int input_alloc_size = host_align(input_block_bytes, 1024);
 
@@ -263,6 +263,127 @@ inline GemmConfig get_kernel3_config(
         best_num_stages
     };
 }
+
+/*
+Because the silu-mul-quant epilogue is fused in, we start to get more restrictive shapes.
+block_n = block_k = 128 are fixed, and the num_consumer_warps is either 8 or 4,
+which determines BLOCK_M (128 or 64 respectively). No multicast.
+We determine num_stages based on smem usage matching kernel5's compute_path layout:
+  SAFE_STAGES = (DYNAMIC_SHARED_MEMORY - sizeof(pipeline_outputs) - 1024) / sizeof(pipeline_inputs)
+*/
+inline int get_kernel5_max_stages(const int block_m) {
+    // kernel5 fixed constants
+    constexpr int DYNAMIC_SHARED_MEMORY = 227 * 1024 - 1024;
+    const int num_tiles = (block_m > 64) ? 2 : 1;
+
+    // pipeline_inputs: a_tile[num_tiles] + gate_tile + up_tile + sfa_tile[num_tiles]
+    //   a_tile    = st_fp8e4m3<64, 128>  : 64 * 128 = 8192 bytes
+    //   gate_tile = st_fp8e4m3<128, 128> : 128 * 128 = 16384 bytes
+    //   up_tile   = st_fp8e4m3<128, 128> : 128 * 128 = 16384 bytes
+    //   sfa_tile  = sv<float, 64>        : 64 * 4 = 256 bytes (rounded to 128B on Hopper)
+    const int input_size = num_tiles * (64 * 128)   // a_tile
+                         + 128 * 128                // gate_tile
+                         + 128 * 128                // up_tile
+                         + num_tiles * 256;         // sfa_tile
+
+    // pipeline_outputs: c_tile[num_tiles] + out_scales[num_tiles]
+    //   c_tile     = st<fp8e4m3, 64, 128> : 64 * 128 = 8192 bytes
+    //   out_scales = sv<float, 64>        : 256 bytes
+    const int output_size = num_tiles * (64 * 128)  // c_tile
+                          + num_tiles * 256;        // out_scales
+
+    // matches kernel5 compute_path static_assert:
+    //   FINISH_BLOCK_OFFSET = DYNAMIC_SHARED_MEMORY - sizeof(pipeline_outputs)
+    //   NON_FINISH_BLOCK_SPACE = FINISH_BLOCK_OFFSET - 1024
+    //   SAFE_STAGES = NON_FINISH_BLOCK_SPACE / sizeof(pipeline_inputs)
+    const int finish_block_offset = DYNAMIC_SHARED_MEMORY - output_size;
+    const int non_finish_block_space = finish_block_offset - 1024;
+    return non_finish_block_space / input_size;
+}
+
+inline GemmConfig get_kernel5_config(
+    uint32_t M,
+    uint32_t I,
+    uint32_t num_experts,
+    const uint32_t& num_sms
+) {
+    constexpr uint32_t block_n = 128;
+    constexpr uint32_t block_k = 128;
+    constexpr int KERNEL_SMEM_SIZE = 227 * 1024;
+
+    // candidate configs: {num_consumer_warps, num_producer_warps, block_m}
+    // MAIN_THREADS = 384 = 12 warps total
+    //   8 consumer (2 C_WG) + 4 producer (1 P_WG) -> BM=128
+    //   4 consumer (1 C_WG) + 8 producer (2 P_WG) -> BM=64
+    struct Candidate {
+        uint32_t block_m;
+        uint32_t num_consumer_warps;
+        uint32_t num_producer_warps;
+    };
+    const Candidate candidates[] = {
+        {128, 8, 4},
+        {64,  4, 8},
+    };
+
+    const uint32_t num_c_blocks = I / block_n;
+
+    uint32_t best_block_m = 0;
+    int best_num_stages = 0;
+    uint32_t best_consumer_warps = 0;
+    uint32_t best_producer_warps = 0;
+    int best_num_waves = 0;
+    int best_last_util = 0;
+
+    for (const auto& c : candidates) {
+        int max_stages = get_kernel5_max_stages(c.block_m);
+        if (max_stages <= 0) continue;
+
+        // total blocks = ceil(M / BM) * (I / 128) across all experts
+        uint32_t num_blocks = host_ceil_div(M, c.block_m) * num_c_blocks;
+        int num_waves = host_ceil_div(num_blocks, num_sms);
+        int last_wave_blocks = num_blocks % num_sms;
+        int last_wave_util = (last_wave_blocks == 0) ? (int)num_sms : last_wave_blocks;
+
+        bool success = false;
+        if (best_block_m == 0) {
+            success = true;
+        } else if (num_waves < best_num_waves) {
+            success = true;
+        } else if (num_waves == best_num_waves) {
+            if (last_wave_util > best_last_util) {
+                success = true;
+            } else if (last_wave_util == best_last_util) {
+                // prefer larger BM for better throughput per block
+                success = c.block_m > best_block_m;
+            }
+        }
+
+        if (success) {
+            best_block_m = c.block_m;
+            best_num_stages = max_stages;
+            best_consumer_warps = c.num_consumer_warps;
+            best_producer_warps = c.num_producer_warps;
+            best_num_waves = num_waves;
+            best_last_util = last_wave_util;
+        }
+    }
+    HOST_ASSERT(best_block_m != 0, "Error: kernel5 config search yielded no results");
+
+    return GemmConfig {
+        GemmType::MGroupedContiguous,
+        best_block_m,
+        block_n,
+        block_k,
+        SharedMemoryConfig{KERNEL_SMEM_SIZE, 0, 0, 0},
+        1,      // num_tma_multicast (disabled)
+        false,  // tma_multicast_a
+        best_producer_warps * 32,   // num_tma_threads
+        best_consumer_warps * 32,   // num_math_threads
+        num_sms,
+        best_num_stages
+    };
+}
+
 
 inline GemmConfig search_configs(
     GemmType gemm_type,

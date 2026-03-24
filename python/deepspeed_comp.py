@@ -1,11 +1,60 @@
 from dataclasses import dataclass
 import os
-from pathlib import Path
 import torch
 from deepspeed.moe.layer import MoE
 import moe_cuda
 from argparse import ArgumentParser
-from .common import quantize_1d_128, quantize_2d_128
+from .common import quantize_1d_128, quantize_2d_128, init_distributed_environment, setup
+import torch.nn as nn
+
+import transformer_engine.pytorch as te
+from transformer_engine.common.recipe import Float8BlockScaling
+from transformer_engine.pytorch.tensor.float8_blockwise_tensor import Float8BlockQuantizer, Float8BlockwiseQTensor
+from transformer_engine_torch import DType as TE_DType
+import transformer_engine_torch as tex
+
+from common import generate_m_grouped_contiguous, generate_m_grouped_masked, check_diff
+
+class TESwigluMLP(nn.Module):
+    """
+    Single-expert SwiGLU FFN using te.Linear with blockwise FP8 scaling.
+
+    Float8BlockScaling defaults match our custom kernel's scaling scheme:
+      x_block_scaling_dim=1  →  1×128 rowwise for activations  (== quantize_1d_128)
+      w_block_scaling_dim=2  →  128×128 blockwise for weights   (== quantize_2d_128)
+
+    fc1 packs gate + up projections: weight shape [2*I, H]
+    fc2 is the down projection:      weight shape [H, I]
+    """
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+    ):
+        super().__init__()
+        self.recipe = Float8BlockScaling(
+            x_block_scaling_dim=1,
+            w_block_scaling_dim=2,
+        )
+        self.fc1 = te.Linear(hidden_size, intermediate_size * 2, bias=False)
+        self.fc2 = te.Linear(intermediate_size, hidden_size, bias=False)
+
+    def load_weights(
+        self,
+        gate_weight: torch.Tensor,  # [I, H]
+        up_weight: torch.Tensor,    # [I, H]
+        down_weight: torch.Tensor,  # [H, I]
+    ):
+        """Copy BF16 weights in. TE quantizes them on the first forward pass."""
+        with torch.no_grad():
+            self.fc1.weight.copy_(torch.cat([gate_weight, up_weight], dim=0))
+            self.fc2.weight.copy_(down_weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        with te.fp8_autocast(enabled=True, fp8_recipe=self.recipe):
+            x = self.fc1(x)
+            x = tex.swiglu(x)
+            return self.fc2(x)
 
 @dataclass
 class TestConfig:
@@ -16,32 +65,7 @@ class TestConfig:
     num_iters: int = 5
 
 
-def setup():
-    # initialize distributed environment, env variables
-    library_root_path = os.getenv("LIBRARY_ROOT_PATH")
-    if library_root_path is None:
-        library_root_path = str(Path(__file__)).resolve().parents[2]
-    cuda_home_path = os.getenv("CUDA_HOME_PATH") or os.getenv("CUDA_PATH") or "/usr/loca/cuda/"
-    moe_cuda.init(library_root_path, cuda_home_path)
 
-def init_distributed_environment():
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", 1))
-    rank = int(os.environ.get("RANK, 0"))
-    world_size = int(os.environ.get("WORLD_SIZE", 1))
-
-    assert world_size == local_world_size, "No multi-node configs"
-    assert rank == local_rank, "no multi-node configs"
-    
-    torch.distributed.init_process_group(
-        backend = "nccl", device_id = local_rank, rank = rank, world_size = local_world_size
-    )
-
-    device = torch.device(f"cuda:{local_rank}")
-    torch.cuda.set_device(device)
-    torch.random.manual_seed(local_rank)
-
-    return local_rank, local_world_size
 
 def naive_moe_forward_fp8(
     a2a_handle : moe_cuda.All2All,
@@ -82,10 +106,29 @@ def naive_moe_forward_fp8(
     )
 
 
-def naive_moe_forward_megatron(
 
+
+def naive_moe_forward_megatron(
+    H : int,
+    I : int,
+    num_groups : int,
+    num_experts : int,
+    experts_per_token : int,
+    gemm_type : moe_cuda.GemmType,
+    input_x : torch.Tensor,
+    input_x_scale : torch.Tensor,
+    up_weight : torch.Tensor,
+    up_weight_scale : torch.Tensor,
+    gate_weight : torch.Tensor,
+    gate_weight_scale : torch.Tensor,
+    down_weight : torch.Tensor,
+    ep_size : int
 ):
-    layer = MoE()
+    mlp = TESwigluMLP(H, I, num_groups)
+    mlp.load_weights(gate_weight, up_weight, down_weight)
+    layer = MoE(H, mlp, num_experts, ep_size, experts_per_token)
+
+    layer.forward()
 
 # structure of this file is based off of TK's benchmark.py files in their kernel directory
 def run(

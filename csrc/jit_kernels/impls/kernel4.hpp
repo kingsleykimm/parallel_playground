@@ -87,7 +87,13 @@ auto ptr = reinterpret_cast<void *>(&kernel4::global_kernel4<
             total_M, total_N, args.K);
 
         void* kernelParams[] = { globals_buf };
+        if (get_env<int>("JIT_DEBUG") != 0) {
+            printf("Launching kernel4 in JIT side \n");
+        }
         CUDA_CHECK(cuLaunchKernelEx(&launch_config, kernel, kernelParams, nullptr));
+        if (get_env<int>("JIT_DEBUG") != 0) {
+            CUDA_CHECK(cudaStreamSynchronize(launch_config.hStream));
+        }
     }
 };
 
@@ -157,16 +163,6 @@ inline void kernel4_contiguous(
         .c_dtype = D.scalar_type(),
         .launch_config = launch_config,
     };
-
-    if (get_env<int>("JIT_DEBUG") > 0) {
-        printf("kernel4_contiguous:\n");
-        printf("  total_M=%u N=%u K=%u num_groups=%u\n", total_M, N, K, num_groups);
-        printf("  bm=%d bn=%d bk=%d super_n=%d stages=%d\n",
-               args.bm, args.bn, args.bk, args.super_n, args.num_stages);
-        printf("  smem_size=%d\n", args.smem_size);
-        printf("  num_consumer_warps=%d num_producer_warps=%d\n", args.num_consumer_warps, args.num_producer_warps);
-    }
-
     const std::string& code = LaunchRuntime<Kernel4Runtime>::generate(args);
     std::shared_ptr<KernelRuntime> runtime = compiler->build("kernel4_contiguous", code);
     LaunchRuntime<Kernel4Runtime>::launch(runtime, args);
@@ -220,6 +216,8 @@ inline void kernel4_masked(
         printf("  total_M=%u N=%u K=%u num_groups=%u\n", total_M, N, K, num_groups);
         printf("  bm=%d bn=%d bk=%d super_n=%d stages=%d\n",
                gemm_config.block_m, gemm_config.block_n, gemm_config.block_k, super_n, gemm_config.num_stages);
+        printf("  num_consumer_warps=%d num_producer_warps=%d\n", num_consumer_warps, num_producer_warps);
+        printf("  smem_size=%d\n", gemm_config.smem_config.smem_size);
     }
     const Kernel4Runtime::Args args = {
         .M = max_M, .N = N, .K = K,
@@ -237,13 +235,6 @@ inline void kernel4_masked(
         .launch_config = launch_config,
     };
 
-    if (get_env<int>("JIT_DEBUG") > 0) {
-        printf("kernel4_masked:\n");
-        printf("  total_M=%u N=%u K=%u num_groups=%u max_M=%u\n",
-               total_M, N, K, num_groups, max_M);
-        printf("  bm=%d bn=%d bk=%d super_n=%d stages=%d\n",
-               args.bm, args.bn, args.bk, args.super_n, args.num_stages);
-    }
 
     const std::string& code = LaunchRuntime<Kernel4Runtime>::generate(args);
     std::shared_ptr<KernelRuntime> runtime = compiler->build("kernel4_masked", code);

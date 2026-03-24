@@ -151,8 +151,9 @@ kernel(const globals<EXPERTS_PER_TOKEN, NUM_EXPERTS, TOKEN_DIM> &G) {
       auto val = ld_global_nc_uint4(&x_token_src[i]);
       if (has_scale) {
         float scale = use_send_buffer
-            ? G.send_scale_buffer[scale_src_rank][{(int)i, scale_src_position}]
-            : G.in_scales[G.rank][{(int)i, scale_src_position}];
+                          ? G.send_scale_buffer[scale_src_rank]
+                                               [{(int)i, scale_src_position}]
+                          : G.in_scales[G.rank][{(int)i, scale_src_position}];
         G.out_scales[{(int)i, (int)padded_index}] = scale;
       }
       st_global_nc_uint4(val, &x_token_dst[i]);
@@ -177,9 +178,12 @@ kernel(const globals<EXPERTS_PER_TOKEN, NUM_EXPERTS, TOKEN_DIM> &G) {
   if constexpr (NUM_DEVICES > 1) {
     grid.sync();
     if (blockIdx.x == 0) {
+      if (threadIdx.x == 0) {
+        *G.sync_counter = counter + 1;
+      }
       auto local_rank = G.rank % NUM_DEVICES;
       if (threadIdx.x < NUM_DEVICES)
-        node_sync::signal(G.barrier, {local_rank}, threadIdx.x, 1);
+        node_sync::signal(G.barrier, {local_rank}, threadIdx.x, counter + 1);
     }
   }
 }

@@ -8,6 +8,8 @@
 #include <string>
 #include <utility>
 
+namespace kittens { namespace py { struct TKParallelTensor; } }
+
 namespace moe_cuda {
 namespace kernels {
 
@@ -86,6 +88,23 @@ void bf16_gemm(
     int* grouped_layout,
     cudaStream_t& stream);
 
+
+void fused_dispatch_grouped_gemm_swiglu(
+    kittens::py::TKParallelTensor &in_tokens,
+    kittens::py::TKParallelTensor &in_tokens_scales,
+    at::Tensor &expert_x_tokens, at::Tensor &expert_x_tokens_scale,
+    at::Tensor &comm_comp_barrier, at::Tensor &gate, at::Tensor &up,
+    at::Tensor &C, at::Tensor &scale_gate, at::Tensor &scale_up,
+    at::Tensor &out_scales, at::Tensor &indices,
+    kittens::py::TKParallelTensor &global_num_routed,
+    kittens::py::TKParallelTensor &expert_to_token_map,
+    at::Tensor &padded_expert_counts, at::Tensor &src_token_idx,
+    at::Tensor &src_dev_idx, kittens::py::TKParallelTensor &barrier,
+    int num_tokens, int *num_recv_tokens,
+    int dp_rank, int rank, int dp_size, int cur_dp_group, int num_dp_groups,
+    int num_experts, int experts_per_token,
+    int num_comm_sms, int num_comp_sms,
+    cudaStream_t &stream);
 
 }  // namespace kernels
 }  // namespace moe_cuda

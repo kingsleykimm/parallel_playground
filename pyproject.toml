@@ -7,7 +7,7 @@ name = "moe-cuda"
 version = "0.1.0"
 description = "High-performance MoE CUDA kernels optimized for NVIDIA H100 GPUs"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.14"
 authors = [
     {name = "Kingsley Kim"},
 ]
@@ -28,13 +28,24 @@ classifiers = [
 dependencies = [
     "deepspeed>=0.18.8",
     "liger-kernel>=0.7.0",
+    "pre-commit>=4.5.1",
     "torch>=2.0.0",
+    "torchvision>=0.25.0",
     "transformer-engine[pytorch]>=2.12.0",
     "vllm>=0.17.1",
 ]
 
 [tool.uv.extra-build-dependencies]
 moe-cuda = ["torch>=2.8.0"]
+
+[[tool.uv.index]]
+name = "pytorch-cu129"
+url = "https://download.pytorch.org/whl/cu129"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu129" }
+torchvision = { index = "pytorch-cu129" }
 
 [tool.uv.workspace]
 members = [

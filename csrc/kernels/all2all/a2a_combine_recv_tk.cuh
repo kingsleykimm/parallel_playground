@@ -89,9 +89,11 @@ __device__ void kernel(globals<EXPERTS_PER_TOKEN, NUM_EXPERTS, TOKEN_DIM> &G) {
       const int global_slot = EXPERTS_PER_TOKEN * token + route;
       const int local_slot = EXPERTS_PER_TOKEN * local_token + route;
 
-      const uint32_t expert =
-          G.indices[{static_cast<int>(token), static_cast<int>(route)}]; // this uses the global expert, needed
+      const uint32_t expert = G.indices[{
+          static_cast<int>(token),
+          static_cast<int>(route)}]; // this uses the global expert, needed
       const uint32_t offset = G.token_offset[global_slot];
+      DEVICE_ASSERT(expert < NUM_EXPERTS);
       const uint32_t position =
           (expert > 0 ? G.expert_offsets[expert - 1] : 0) + offset;
       positions[local_slot] = position;
@@ -183,7 +185,7 @@ __device__ void kernel(globals<EXPERTS_PER_TOKEN, NUM_EXPERTS, TOKEN_DIM> &G) {
       }
       if (threadIdx.x < config::NUM_DEVICES) {
         auto local_rank = threadIdx.x % config::NUM_DEVICES;
-        node_sync::signal(G.barrier, {G.rank}, local_rank, 1);
+        node_sync::signal(G.barrier, {G.rank}, local_rank, counter + 1);
       }
     }
   }

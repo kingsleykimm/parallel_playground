@@ -32,7 +32,9 @@ mkdir -p moe_cuda/include
 check_dir "ThunderKittens headers"     "${ROOT_DIR}/third-party/ThunderKittens/include"
 
 # Wipe old artifacts to avoid stale extension/binary mismatches.
-rm -rf build build_* dist
+# if possible, do this manually, since if you want to return to using the csrc, refetching and installing libtorch takes a while, upwards of 10 minutes
+# rm -rf build build_* dist 
+
 rm -rf ./*.egg-info
 rm -f ./*.so
 

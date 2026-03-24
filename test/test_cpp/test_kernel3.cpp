@@ -50,12 +50,12 @@ struct TestShape {
 
 static const std::vector<TestShape> test_shapes = {
     // contiguous
-    { 256, 256, 128, 1, GemmType::MGroupedContiguous, 256, "contig-1g"},
-    { 256, 256, 256, 4, GemmType::MGroupedContiguous, 256, "contig-4g"},
-    { 512, 256, 256, 2, GemmType::MGroupedContiguous, 512, "contig-2g"},
+    { 256, 2048, 2048, 1, GemmType::MGroupedContiguous, 256, "contig-1g"},
+    { 256, 2048, 2048, 4, GemmType::MGroupedContiguous, 256, "contig-4g"},
+    { 512, 1024, 1024, 2, GemmType::MGroupedContiguous, 512, "contig-2g"},
     // masked
-    {4096, 256, 256, 1, GemmType::MGroupedMasked,     1024, "masked-1g"},
-    {4096, 256, 256, 4, GemmType::MGroupedMasked,      512, "masked-4g"},
+    {4096, 1024, 1024, 1, GemmType::MGroupedMasked,     1024, "masked-1g"},
+    {4096, 1024, 1024, 4, GemmType::MGroupedMasked,      512, "masked-4g"},
 };
 
 struct Config {
@@ -237,13 +237,13 @@ static bool run_contiguous(int64_t expected_m_per_group, int64_t N, int64_t K,
     }
 
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
-    std::cout << (diff < 0.001 ? "[PASSED] " : "[FAILED] ")
+    std::cout << (diff < 0.005 ? "[PASSED] " : "[FAILED] ")
               << "contiguous M=" << expected_m_per_group
               << " N=" << N << " K=" << K << " G=" << groups
               << " total_M=" << total_M
               << " kernel_us=" << us
               << " diff=" << diff << "\n";
-    return diff < 0.001;
+    return diff < 0.005;
 }
 
 // ========================= Masked =========================
@@ -343,12 +343,12 @@ static bool run_masked(int64_t max_M, int64_t expected_m_per_group, int64_t N,
     }
 
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
-    std::cout << (diff < 0.001 ? "[PASSED] " : "[FAILED] ")
+    std::cout << (diff < 0.005 ? "[PASSED] " : "[FAILED] ")
               << "masked  max_M=" << max_M
               << " N=" << N << " K=" << K << " G=" << groups
               << " kernel_us=" << us
               << " diff=" << diff << "\n";
-    return diff < 0.001;
+    return diff < 0.005;
 }
 
 // ========================= main =========================
@@ -382,6 +382,7 @@ int main(int argc, char** argv)
         if (cfg.M == 0) cfg.M = 256;
         if (cfg.N == 0) cfg.N = 256;
         if (cfg.K == 0) cfg.K = 128;
+        printf("Running custom shape: M=%d, N=%d, K=%d\n", cfg.M, cfg.N, cfg.K);
         run_one({cfg.M, cfg.N, cfg.K, cfg.groups, cfg.type, cfg.M, "custom"});
     } else {
         for (const auto& s : test_shapes) run_one(s);

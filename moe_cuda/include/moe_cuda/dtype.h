@@ -1,6 +1,6 @@
 #pragma once
 // utilities for cuda / cpu dtypes
-
+#include "error.hpp"
 #include "cuda_common.h"
 #include <c10/core/ScalarType.h>
 #include <cassert>
@@ -25,7 +25,7 @@ inline size_t get_type_size(c10::ScalarType type) {
         case c10::ScalarType::Bool:
             return 1;
     }
-    return 0;
+    HOST_ERROR("Unsupported dtype");
 }
 
 inline std::string type_to_string(c10::ScalarType type) {
@@ -40,7 +40,7 @@ inline std::string type_to_string(c10::ScalarType type) {
         case c10::ScalarType::Bool: return "BOOL";
         case c10::ScalarType::Float8_e4m3fn: return "FP8";
     }
-    return "";
+    HOST_ERROR("Unsupported dtype");
 }
 
 // Torch type conversion functions are in dtype_torch.h to avoid c10 dependency
@@ -99,8 +99,7 @@ inline const DTypeFInfo& get_finfo_from_typename() {
         return finfo_table[7];
     }
     else {
-        printf("DType is not supported yet");
-        assert (false);
+        HOST_ERROR("DType is not supported yet");
         return finfo_table[0];
     }
 }

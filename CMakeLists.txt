@@ -297,6 +297,12 @@ if(BUILD_PYBIND)
     )
     target_compile_options(moe_cuda PRIVATE
         $<$<COMPILE_LANGUAGE:CXX>:-O3 -fPIC>
+        $<$<COMPILE_LANGUAGE:CUDA>:
+            -O3
+            --expt-relaxed-constexpr
+            --expt-extended-lambda
+            -Xcompiler=-fPIC
+        >
     )
 endif()
 

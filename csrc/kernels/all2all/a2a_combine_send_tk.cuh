@@ -124,7 +124,9 @@ template <int TOKEN_DIM> __device__ inline void kernel(globals<TOKEN_DIM> &G) {
 #pragma unroll NUM_STAGES
       for (int s = 0;
            s < NUM_STAGES && token + s * gridDim.x < G.num_recv_tokens; s++) {
-        uint4 *ptr = (uint4 *)(&G.in_tokens[{static_cast<int>(local_stages[s].index), 0}]);
+        uint4 *ptr =
+            (uint4
+                 *)(&G.in_tokens[{static_cast<int>(local_stages[s].index), 0}]);
         values[s] = ld_global_nc_uint4(&ptr[i]);
       }
 
@@ -167,8 +169,9 @@ template <int TOKEN_DIM> __device__ inline void kernel(globals<TOKEN_DIM> &G) {
       }
       if (threadIdx.x < NUM_DEVICES) {
         auto local_rank = G.rank % NUM_DEVICES;
-        node_sync::signal(G.barrier, {local_rank + NUM_DEVICES}, threadIdx.x,
-                          1); // this rank is done, signal to all other ranks
+        node_sync::signal(
+            G.barrier, {local_rank + NUM_DEVICES}, threadIdx.x,
+            counter + 1); // this rank is done, signal to all other ranks
       }
     }
   }

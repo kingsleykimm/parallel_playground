@@ -82,10 +82,10 @@ struct globals {
   // these are conditional on the number of warps
   // remember that sfa is loaded in MN-major
   struct pipeline_inputs {
-    a_tile a;
-    gate_tile gate;
-    up_tile up;
-    sfa_tile sfa;
+    a_tile a[2];
+    gate_tile gate[2];
+    up_tile up[2];
+    sfa_tile sfa[2];
   };
 
   struct pipeline_outputs {
@@ -170,7 +170,7 @@ struct globals {
   __device__ int get_global_idx(
       int shape, int block_offset, common_state common,
       int m_block_idx = 0) const { // m_block_idx is always in units of 64
-    if (isGroupedContiguous) {
+    if constexpr (isGroupedContiguous) {
       const auto offset = kWithGroupOffset
                               ? max(0, __ldg(grouped_layout + m_block_idx * 64))
                               : 0;
@@ -194,6 +194,8 @@ struct globals {
       auto group_limit = __ldg(grouped_layout + common.cur_group_idx);
       return (common.m_block_idx) * 64 < group_limit;
     }
+
+    return true;
   }
 };
 template <int _M, int _N, int _K, int _BM, int _BN, int _BK, int NUM_GROUPS,
@@ -218,7 +220,7 @@ kernel4(const globals<_M, _N, _K, _BM, _BN, _BK, NUM_GROUPS,
   pipeline_inputs(&inputs)[NUM_STAGES_] =
       allocator.allocate<pipeline_inputs, NUM_STAGES_>();
   // do some checking first
-
+  constexpr int NUM_CONSUMER_WGS = NUM_CONSUMER_WARPS_ / 4;
   constexpr int shape_k_scales = constexpr_ti_ceil_div(_K, _BK);
   constexpr int shape_n_sfb = constexpr_ti_ceil_div(_N, 128);
   constexpr int stride_n_sfb = shape_k_scales;
@@ -234,22 +236,27 @@ kernel4(const globals<_M, _N, _K, _BM, _BN, _BK, NUM_GROUPS,
   static_assert(SAFE_STAGES_BETWEEN_BLOCKS >= NUM_STAGES_);
 
   pipeline_outputs &outputs = allocator.allocate<pipeline_outputs>();
-  __shared__ semaphore inputs_arrived[NUM_STAGES_];
-  __shared__ semaphore inputs_finished[NUM_STAGES_];
-  __shared__ semaphore finish_finished;
+  __shared__ semaphore inputs_arrived[NUM_CONSUMER_WGS][NUM_STAGES_];
+  __shared__ semaphore inputs_finished[NUM_CONSUMER_WGS][NUM_STAGES_];
   __shared__ semaphore consumer_can_start[2];
-  uint32_t semaphore_bitfield = 0xFFFF0000;
+  uint32_t semaphore_bitfield[NUM_CONSUMER_WGS];
+  for (int wg = 0; wg < NUM_CONSUMER_WGS; wg++) {
+    semaphore_bitfield[wg] = 0xFFFF0000;
+  }
   uint32_t consumer_phasebit =
       0b01; // wg0 can start immediately, while wg 1 needs to wait
 
   if (threadIdx.x == 0) {
 #pragma unroll
-    for (int stage = 0; stage < GLOBALS::NUM_STAGES; stage++) {
-      init_semaphore(inputs_arrived[stage], 1, 0);
-      init_semaphore(inputs_finished[stage], NUM_CONSUMER_WARPS_ / 2, 0);
+    for (int wg = 0; wg < NUM_CONSUMER_WGS; wg++) {
+#pragma unroll
+      for (int stage = 0; stage < GLOBALS::NUM_STAGES; stage++) {
+        init_semaphore(inputs_arrived[wg][stage], 1, 0);
+        init_semaphore(inputs_finished[wg][stage],
+                       NUM_CONSUMER_WARPS_ / NUM_CONSUMER_WGS, 0);
+      }
     }
-    init_semaphore(finish_finished, NUM_CONSUMER_WARPS_, 0);
-    init_semaphore(consumer_can_start[0], NUM_CONSUMER_WARPS_ / 2, 1);
+    init_semaphore(consumer_can_start[0], NUM_CONSUMER_WARPS_ / 2, 0);
     init_semaphore(consumer_can_start[1], NUM_CONSUMER_WARPS_ / 2, 0);
   }
   __syncthreads();
@@ -267,40 +274,50 @@ kernel4(const globals<_M, _N, _K, _BM, _BN, _BK, NUM_GROUPS,
         break;
       }
 
+      int current_math_wg = task_iter % NUM_CONSUMER_WGS;
       int input_ring = 0; // tracks, which input block, reset to 0 per iteration
 
       int load_iter;
       for (load_iter = 0; load_iter < num_iters; load_iter++) {
-        wait(inputs_finished[input_ring],
-             get_phasebit<1>(semaphore_bitfield, input_ring));
-        update_phasebit<1>(semaphore_bitfield, input_ring);
+        wait(inputs_finished[current_math_wg][input_ring],
+             get_phasebit<1>(semaphore_bitfield[current_math_wg], input_ring));
+        update_phasebit<1>(semaphore_bitfield[current_math_wg], input_ring);
         if (warpgroup::laneid() == 0) {
+          // if (blockIdx.x == 0 && warpgroup::laneid() == 0) {
+          //   printf("loading common coords : %d, %d, load_iter : %d, gropu id:
+          //   "
+          //          "%d \n",
+          //          common.coord.x, common.coord.y, load_iter,
+          //          warpgroup::groupid());
+          // }
           const int a_element_row =
               G.template get_global_idx<GLOBALS::isGroupedMasked>(
                   _M, common.coord.x * 64, common);
           const int b_element_row = G.template get_global_idx<true>(
               _N, common.coord.y * _BN, common, common.m_block_idx);
-          tma::expect(inputs_arrived[input_ring], inputs[input_ring]);
+          tma::expect(inputs_arrived[current_math_wg][input_ring],
+                      inputs[input_ring].a[current_math_wg],
+                      inputs[input_ring].sfa[current_math_wg],
+                      inputs[input_ring].gate[current_math_wg],
+                      inputs[input_ring].up[current_math_wg]);
           tma::load_async(
-              inputs[input_ring].a, G.A,
+              inputs[input_ring].a[current_math_wg], G.A,
               coord<ducks::default_type>{a_element_row, load_iter * _BK},
-              inputs_arrived[input_ring]);
-          tma::load_async(inputs[input_ring].sfa, G.scale_a,
+              inputs_arrived[current_math_wg][input_ring]);
+          tma::load_async(inputs[input_ring].sfa[current_math_wg], G.scale_a,
                           coord<ducks::default_type>{load_iter, a_element_row},
-                          inputs_arrived[input_ring]);
+                          inputs_arrived[current_math_wg][input_ring]);
           tma::load_async(
-              inputs[input_ring].gate, G.gate,
+              inputs[input_ring].gate[current_math_wg], G.gate,
               coord<ducks::default_type>{b_element_row, load_iter * _BK},
-              inputs_arrived[input_ring]);
+              inputs_arrived[current_math_wg][input_ring]);
           tma::load_async(
-              inputs[input_ring].up, G.up,
+              inputs[input_ring].up[current_math_wg], G.up,
               coord<ducks::default_type>{b_element_row, load_iter * _BK},
-              inputs_arrived[input_ring]);
+              inputs_arrived[current_math_wg][input_ring]);
         }
         input_ring = ring_advance<NUM_STAGES_>(input_ring);
       }
-
-      producers::sync(13);
     }
   }
 
@@ -316,6 +333,7 @@ kernel4(const globals<_M, _N, _K, _BM, _BN, _BK, NUM_GROUPS,
       if (num_iters < 0) {
         break;
       }
+
       // common.coord.y doesn't change
       int num_former_iters, num_full_iters;
       if constexpr (!GLOBALS::kIsUniformScales) {
@@ -329,15 +347,20 @@ kernel4(const globals<_M, _N, _K, _BM, _BN, _BK, NUM_GROUPS,
 
       int input_ring = 0; // tracks, which input block, reset to 0 per iteration
 
-      wait(consumer_can_start[warpgroup::groupid()],
-           (consumer_phasebit >> (warpgroup::groupid())) & 0b1);
       // update current phasebit (flips every time)
-      consumer_phasebit ^= (1 << warpgroup::groupid());
-      int load_iter;
-      for (load_iter = 0; load_iter < num_iters; load_iter++) {
-        wait(inputs_arrived[input_ring],
-             get_phasebit<0>(semaphore_bitfield, input_ring));
-        update_phasebit<0>(semaphore_bitfield, input_ring);
+
+      int current_math_wg = warpgroup::groupid();
+      // k-loop
+
+      wait(consumer_can_start[current_math_wg],
+           (consumer_phasebit >> (current_math_wg)) & 0b1);
+      consumer_phasebit ^= (1 << current_math_wg);
+
+      for (int load_iter = 0; load_iter < num_iters; load_iter++) {
+        wait(inputs_arrived[current_math_wg][input_ring],
+             get_phasebit<0>(semaphore_bitfield[current_math_wg], input_ring));
+        update_phasebit<0>(semaphore_bitfield[current_math_wg], input_ring);
+
         const int a_element_row =
             G.template get_global_idx<GLOBALS::isGroupedMasked>(
                 _M, common.coord.x * 64, common);
@@ -345,15 +368,8 @@ kernel4(const globals<_M, _N, _K, _BM, _BN, _BK, NUM_GROUPS,
             _N, common.coord.y * _BN, common, common.m_block_idx);
         const bool computation_valid = G.is_computation_valid(common);
         common.computation_valid = computation_valid;
+
         if (computation_valid) {
-
-          warp::zero(state.per_k_gate_accum);
-          warp::zero(state.per_k_up_accum);
-
-          warpgroup::mma_ABt(state.per_k_gate_accum, inputs[input_ring].a,
-                             inputs[input_ring].gate);
-          warpgroup::mma_ABt(state.per_k_up_accum, inputs[input_ring].a,
-                             inputs[input_ring].up);
           const auto previous_group_offset = G.template get_global_idx<true>(
               shape_k_scales * shape_n_sfb, 0, common, common.m_block_idx);
           const uint32_t scale_b_offset =
@@ -362,76 +378,106 @@ kernel4(const globals<_M, _N, _K, _BM, _BN, _BK, NUM_GROUPS,
               (load_iter * stride_k_sfb);
           float *local_gate_sfb = G.scale_gate.raw_ptr + scale_b_offset;
           float *local_up_sfb = G.scale_up.raw_ptr + scale_b_offset;
-          float gate_scale_0;
-          float up_scale_0;
-          float gate_scale_1;
-          float up_scale_1;
 
+          // === Phase 1: issue gate WGMMA ===
+          warp::zero(state.per_k_gate_accum);
+          warpgroup::mma_ABt(state.per_k_gate_accum,
+                             inputs[input_ring].a[current_math_wg],
+                             inputs[input_ring].gate[current_math_wg]);
+
+          // === Phase 2: while gate WGMMA runs, load gate scales + scale_a,
+          //              and build per-column gate scale vector ===
+          float gate_scale_0, gate_scale_1, up_scale_0, up_scale_1;
           move<float>::ldg(gate_scale_0, local_gate_sfb);
-          move<float>::ldg(up_scale_0, local_up_sfb);
           if constexpr (!GLOBALS::kIsUniformScales) {
-            if (num_full_iters > num_former_iters) {
+            if (num_full_iters > num_former_iters)
               move<float>::ldg(gate_scale_1, local_gate_sfb + stride_n_sfb);
-              move<float>::ldg(up_scale_1, local_up_sfb + stride_n_sfb);
+          }
+
+          typename decltype(state.per_k_gate_accum)::col_vec scale_a_rv;
+          warpgroup::load(scale_a_rv, inputs[input_ring].sfa[current_math_wg]);
+
+          row_vec<rt<float, 16, _BN>> gate_col_scale_b, up_col_scale_b;
+          if constexpr (!GLOBALS::kIsUniformScales) {
+#pragma unroll
+            for (uint32_t i = 0; i < _BN / 16; i++) {
+              const uint32_t column_chunk = i * 2;
+              float first =
+                  column_chunk < num_former_iters ? gate_scale_0 : gate_scale_1;
+              float second = column_chunk + 1 < num_former_iters ? gate_scale_0
+                                                                 : gate_scale_1;
+              gate_col_scale_b[i][0] = make_float2(first, first);
+              gate_col_scale_b[i][1] = make_float2(second, second);
             }
           }
 
-          // once WGMMA is completed, apply scale promotion from FP22 -> FP32
-
-          // col_vec<rt<float, 16, layout::BN>> scale_a;
-          // WGMMA instructions always have that the register tile is row major,
-          // so the scale_a is orthogonal
-          typename decltype(state.per_k_gate_accum)::col_vec scale_a_rv;
-          warpgroup::load(scale_a_rv, inputs[input_ring].sfa);
+          // === Phase 3: wait for gate WGMMA ===
           warpgroup::mma_async_wait();
 
+          // === Phase 4: issue up WGMMA ===
+          warp::zero(state.per_k_up_accum);
+          warpgroup::mma_ABt(state.per_k_up_accum,
+                             inputs[input_ring].a[current_math_wg],
+                             inputs[input_ring].up[current_math_wg]);
+
+          // === Phase 5: while up WGMMA runs:
+          //   a) apply gate scale promotion and accumulate
+          //   b) load up scales and build per-column up scale vector ===
           warp::mul_row(state.per_k_gate_accum, state.per_k_gate_accum,
                         scale_a_rv);
-          warp::mul_row(state.per_k_up_accum, state.per_k_up_accum, scale_a_rv);
-          if constexpr (GLOBALS::kIsUniformScales) { // single scale case
+          if constexpr (GLOBALS::kIsUniformScales) {
             state.per_k_gate_accum *= gate_scale_0;
-            state.per_k_up_accum *= up_scale_0;
           } else {
-            row_vec<rt<float, 16, _BN>> gate_col_scale_b;
-            row_vec<rt<float, 16, _BN>> up_col_scale_b;
-#pragma unroll
-            for (uint32_t i = 0; i < _BN / 16; i++) {
-
-              const uint32_t column_chunk = i * 2;
-              float first_scale =
-                  column_chunk < num_former_iters ? gate_scale_0 : gate_scale_1;
-              float second_scale = column_chunk + 1 < num_former_iters
-                                       ? gate_scale_0
-                                       : gate_scale_1;
-              gate_col_scale_b[i][0] = make_float2(first_scale, first_scale);
-              gate_col_scale_b[i][1] = make_float2(second_scale, second_scale);
-
-              first_scale =
-                  column_chunk < num_former_iters ? up_scale_0 : up_scale_1;
-              second_scale =
-                  column_chunk + 1 < num_former_iters ? up_scale_0 : up_scale_1;
-              up_col_scale_b[i][0] = make_float2(first_scale, first_scale);
-              up_col_scale_b[i][1] = make_float2(second_scale, second_scale);
-            }
             warp::mul_col(state.per_k_gate_accum, state.per_k_gate_accum,
                           gate_col_scale_b);
+          }
+          state.gate_accum += state.per_k_gate_accum;
+
+          move<float>::ldg(up_scale_0, local_up_sfb);
+          if constexpr (!GLOBALS::kIsUniformScales) {
+            if (num_full_iters > num_former_iters)
+              move<float>::ldg(up_scale_1, local_up_sfb + stride_n_sfb);
+#pragma unroll
+            for (uint32_t i = 0; i < _BN / 16; i++) {
+              const uint32_t column_chunk = i * 2;
+              float first =
+                  column_chunk < num_former_iters ? up_scale_0 : up_scale_1;
+              float second =
+                  column_chunk + 1 < num_former_iters ? up_scale_0 : up_scale_1;
+              up_col_scale_b[i][0] = make_float2(first, first);
+              up_col_scale_b[i][1] = make_float2(second, second);
+            }
+          }
+
+          // === Phase 6: wait for up WGMMA ===
+          warpgroup::mma_async_wait();
+
+          // === Phase 7: apply up scale promotion and accumulate ===
+          warp::mul_row(state.per_k_up_accum, state.per_k_up_accum, scale_a_rv);
+          if constexpr (GLOBALS::kIsUniformScales) {
+            state.per_k_up_accum *= up_scale_0;
+          } else {
             warp::mul_col(state.per_k_up_accum, state.per_k_up_accum,
                           up_col_scale_b);
           }
-          state.gate_accum += state.per_k_gate_accum;
           state.up_accum += state.per_k_up_accum;
         }
+
         if (laneid() == 0) {
-          arrive(inputs_finished[input_ring]);
+          arrive(inputs_finished[current_math_wg][input_ring]);
         }
         input_ring = ring_advance<NUM_STAGES_>(input_ring);
       }
 
+      // after we're done with the k-loop, signal to the next consumer
+      // warpgroup to begin
+
       if (laneid() == 0) {
         arrive(
-            consumer_can_start[warpgroup::groupid() ^ 1]); // signal other warp
+            consumer_can_start[current_math_wg ^ 1]); // signal other warpgroup
       }
 
+      // epilogue
       if (common.computation_valid) {
         state.up_accum = (state.up_accum * state.gate_accum) /
                          (warp::exp(state.gate_accum * -1.0f) + 1.0f);
@@ -454,25 +500,25 @@ kernel4(const globals<_M, _N, _K, _BM, _BN, _BK, NUM_GROUPS,
         rt<fp8e4m3, 16, _BN> fp8_output_tile;
         warp::copy(fp8_output_tile, state.up_accum);
         tma::store_async_read_wait(); // wait for previous stores to shared
-                                      // memory to finish
-        warpgroup::store(outputs.c[warpgroup::groupid()], fp8_output_tile);
-        warpgroup::store(outputs.out_scales[warpgroup::groupid()],
-                         row_amaxes_rv);
-        warpgroup::sync(warpgroup::groupid() + 4);
+        warpgroup::store(outputs.c[current_math_wg], fp8_output_tile);
+        warpgroup::store(outputs.out_scales[current_math_wg], row_amaxes_rv);
+        warpgroup::sync(current_math_wg + 4);
         if (warpgroup::laneid() == 0) {
           tma::store_async(
-              G.C, outputs.c[warpgroup::groupid()],
+              G.C, outputs.c[current_math_wg],
               coord<ducks::default_type>{
                   G.template get_global_idx<GLOBALS::isGroupedMasked>(
                       _M, common.coord.x * 64, common),
                   common.coord.y * _BN});
           tma::store_async(
-              G.out_scales, outputs.out_scales[warpgroup::groupid()],
+              G.out_scales, outputs.out_scales[current_math_wg],
               coord<ducks::default_type>{
                   common.coord.y,
                   G.template get_global_idx<GLOBALS::isGroupedMasked>(
                       _M, common.coord.x * 64, common, common.m_block_idx)});
         }
+
+        // memory to finish
       }
 
       // once we're done here, signal to the next consumer warpgroup to begin

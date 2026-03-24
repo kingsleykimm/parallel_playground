@@ -6,6 +6,7 @@
 #include <jit_kernels/impls/kernel2.hpp>
 #include <jit_kernels/impls/kernel3.hpp>
 #include <jit_kernels/impls/kernel4.hpp>
+#include <jit_kernels/impls/kernel5.hpp>
 #include <jit_kernels/heuristics/common.hpp>
 #include <runtime/device.hpp>
 #include <runtime/tensor_compat.h>
@@ -106,6 +107,9 @@ inline void fp8_grouped_gemm_swiglu(
     GemmType gemm_type,
     int* grouped_layout,
     cudaStream_t& stream) {
+    if (get_env<int>("MOE_CUDA_DEBUG") != 0) {
+        printf("FP8 Grouped GEMM Swiglu launching in moe.hpp \n");
+    }
     HOST_ASSERT(grouped_layout != nullptr,
                 "grouped_layout cannot be null for grouped FP8 swiglu GEMM");
     if (gemm_type == GemmType::MGroupedMasked) {
@@ -141,6 +145,8 @@ void fp8_grouped_gemm_swiglu_consumer_pp(
     kernel4_contiguous(A, gate_weight, up_weight, scale_a, scale_gate, scale_up, scale_d, D, grouped_layout, stream);
     }
 }
+
+
 
 }  // namespace api
 }  // namespace moe_cuda

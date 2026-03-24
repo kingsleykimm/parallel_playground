@@ -115,7 +115,9 @@ class All2All : public All2AllBase {
                 HOST_ASSERT(scale_dtype.value() == c10::ScalarType::Float, "Only float scales supported");
             }
 
-
+            if (get_env<int>("A2A_DEBUG") > 0) {
+                printf("Initializing All2All context inside cpp file\n");
+            }
             this->context_.emplace(
                 hidden_dim,
                 hidden_dim_scale,
@@ -303,9 +305,10 @@ class All2All : public All2AllBase {
                     printf("launching dispatch send from all2all_tk.hpp\n");
                 }
 
+                at::Tensor dp_x_scale_val = dp_x_scale.value();
                 this->context_->dispatch_send(
                     dp_x,
-                    dp_x_scale.value(),
+                    dp_x_scale_val,
                     indices,
                     weights,
                     this->context_->workspace.sync_counter,
@@ -338,9 +341,10 @@ class All2All : public All2AllBase {
                     CUDA_CHECK(cudaStreamSynchronize(stream));
                     printf("launching dispatch recv from all2all_tk.hpp\n");
                 }
+                at::Tensor out_expert_x_scale_val = out_expert_x_scale.value();
                 this->context_->dispatch_recv(
                     out_expert_x,
-                    out_expert_x_scale.value(),
+                    out_expert_x_scale_val,
                     out_expert_num_tokens_ptr,
                     stream
                 );
@@ -415,7 +419,7 @@ class All2All : public All2AllBase {
 
 
 
-        uint32_t max_recv_tokens() const { return max_recv_tokens_; }
+        uint32_t max_recv_tokens() const override { return max_recv_tokens_; }
         uint32_t num_experts_per_rank() const { return num_experts_per_rank_; }
         All2AllContext<EXPERTS_PER_TOKEN, NUM_EXPERTS, TOKEN_DIM>& context() {
             HOST_ASSERT(context_.has_value(), "All2All context is not initialized");

@@ -1,6 +1,8 @@
 #pragma once
 #include <cstddef>
 #include <c10/core/ScalarType.h>
+#include <ATen/Tensor.h>
+#include <pyutils/parallel_tensor.cuh>
 
 extern "C" size_t tk_globals_size(int bm, int bn, int bk,
     c10::ScalarType c_dtype);
@@ -41,3 +43,20 @@ extern "C" void tk_build_kernel4_globals(int bn, int bk,
     void* A, void* gate, void* up, void* D,
     void* scale_a, void* scale_gate, void* scale_up, void* scale_d,
     void* grouped_layout, size_t total_M, size_t total_N, size_t K);
+
+// kernel5 globals (kernel5::globals) — Fused Dispatch + FC1 of SwiGLU MLP
+size_t tk_kernel5_globals_size();
+void tk_build_kernel5_globals(void* out,
+    kittens::py::TKParallelTensor &in_tokens,
+    kittens::py::TKParallelTensor &in_tokens_scales,
+    at::Tensor &expert_x_tokens, at::Tensor &expert_x_tokens_scale,
+    at::Tensor &comm_comp_barrier, at::Tensor &gate, at::Tensor &up,
+    at::Tensor &C, at::Tensor &scale_gate, at::Tensor &scale_up,
+    at::Tensor &out_scales, at::Tensor &indices,
+    kittens::py::TKParallelTensor &global_num_routed,
+    kittens::py::TKParallelTensor &expert_to_token_map,
+    at::Tensor &padded_expert_counts, at::Tensor &src_token_idx,
+    at::Tensor &src_dev_idx, kittens::py::TKParallelTensor &barrier,
+    int num_tokens, int *num_recv_tokens, int dp_rank,
+    int rank, int dp_size, int cur_dp_group, int num_dp_groups,
+    int num_comm_sms, int num_comp_sms);

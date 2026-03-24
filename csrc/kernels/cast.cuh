@@ -198,14 +198,18 @@ __global__ inline void fused_silu_mul_quant_kernel(__nv_bfloat16 *gemm_out,
 // Launcher functions
 inline void cast_bf16_to_f32(const __nv_bfloat16 *inp, float *out, size_t n,
                              dim3 grid, dim3 block, cudaStream_t stream) {
+  nvtxRangePush("cast_bf16_to_f32");
   cast_kernel_bf16_f32<<<grid, block, 0, stream>>>(
       const_cast<__nv_bfloat16 *>(inp), out, n);
+  nvtxRangePop();
 }
 
 inline void cast_f32_to_bf16(const float *inp, __nv_bfloat16 *out, size_t n,
                              dim3 grid, dim3 block, cudaStream_t stream) {
+  nvtxRangePush("cast_f32_to_bf16");
   cast_kernel_f32_bf16<<<grid, block, 0, stream>>>(const_cast<float *>(inp),
                                                    out, n);
+  nvtxRangePop();
 }
 
 inline void cast_bf16_to_fp8_blkscaled(const __nv_bfloat16 *inp,
@@ -237,7 +241,9 @@ inline void cast_bf16_to_fp8_blkscaled(const __nv_bfloat16 *inp,
       &inp, &out, &scale, &hidden_dim, &num_scales_per_row,
   };
 
+  nvtxRangePush("cast_bf16_to_fp8_blkscaled");
   CUDA_CHECK(cudaLaunchKernel(kernel, dimGrid, dimBlock, args, 0, stream));
+  nvtxRangePop();
   CUDA_SYNC_DEBUG();
 }
 
@@ -268,7 +274,9 @@ inline void fused_silu_mul_quant(__nv_bfloat16 *gemm_out,
   void *args[] = {
       &gemm_out, &swiglu_out, &scale, &hidden_dim, &num_scales_per_row,
   };
+  nvtxRangePush("fused_silu_mul_quant");
   CUDA_CHECK(cudaLaunchKernel(kernel, dimGrid, dimBlock, args, 0, stream));
+  nvtxRangePop();
   CUDA_SYNC_DEBUG();
 }
 

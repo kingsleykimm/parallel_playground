@@ -87,6 +87,10 @@ static void __instantiate_kernel() {{
 
         void* kernelParams[] = { globals_buf };
         CUDA_CHECK(cuLaunchKernelEx(&launch_config, kernel, kernelParams, nullptr));
+
+        if (get_env<int>("JIT_DEBUG") != 0) {
+            CUDA_CHECK(cudaStreamSynchronize(launch_config.hStream));
+        }
     }
 };
 
@@ -126,7 +130,7 @@ inline void kernel3_contiguous(
 
     LaunchConfig launch_config = {
         dim3(gemm_config.num_math_threads + gemm_config.num_tma_threads, 1, 1),
-        dim3(device_prop->get_num_sms()),
+        dim3(132),
         stream,
         gemm_config.smem_config.smem_size,
         1
@@ -198,7 +202,7 @@ inline void kernel3_masked(
 
     LaunchConfig launch_config = {
         dim3(gemm_config.num_math_threads + gemm_config.num_tma_threads, 1, 1),
-        dim3(device_prop->get_num_sms()),
+        dim3(132),
         stream,
         gemm_config.smem_config.smem_size,
         1

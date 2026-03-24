@@ -33,7 +33,8 @@ __forceinline__ __device__ uint32_t pack_float_2(float a, float b) {
 }
 
 // store into shared, "l" = long, "f" = float
-__forceinline__ __device__ void st_shared(const __nv_bfloat16 *ptr, __nv_bfloat16 val) {
+__forceinline__ __device__ void st_shared(const __nv_bfloat16 *ptr,
+                                          __nv_bfloat16 val) {
   uint16_t val16 = __bfloat16_as_ushort(val);
   asm volatile("{ st.shared.u16 [%0], %1; }"
                :
@@ -365,10 +366,10 @@ __device__ static inline void
 signal(const barrier_t &barrier,
        const kittens::coord<kittens::ducks::default_type> &idx,
        const int dst_dev_idx, const int val) {
-  asm volatile("{red.release.sys.global.add.s32 [%0], %1;}" ::"l"(
-                   &barrier[dst_dev_idx][idx]),
-               "r"(val)
-               : "memory");
+  asm volatile(
+      "{st.release.sys.global.s32 [%0], %1;}" ::"l"(&barrier[dst_dev_idx][idx]),
+      "r"(val)
+      : "memory");
 }
 
 template <class barrier_t>
