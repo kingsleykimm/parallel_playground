@@ -20,7 +20,6 @@ namespace kernel5 {
 // persistent kernel settings
 static constexpr int SM_COUNT = 132;
 static constexpr int MAIN_THREADS = 384; // 1 P_WG + 2 C_WG
-static constexpr int DYNAMIC_SHARED_MEMORY = 227 * 1024 - 1024;
 static constexpr int WORLD_SIZE = 4;
 // flow - the first GEMMs must have a block N (intermediate size) of 128. then
 // the output block size
@@ -39,8 +38,10 @@ struct globals {
 
   // we can actually calculate this since we know how much each token will take
   // up in shared memory, with scales
-  static constexpr int TOKENS_PER_BLOCK =
-      constexpr_min((DYNAMIC_SHARED_MEMORY - 1024) / (H), MAIN_THREADS);
+  // static constexpr int TOKENS_PER_BLOCK = constexpr_min(
+  //     (KERNEL_SMEM_SIZE - 1024) / (H + sizeof(kittens::semaphore)),
+  //     MAIN_THREADS);
+  static constexpr int TOKENS_PER_BLOCK = 16;
 
   static constexpr int NUM_PRODUCER_WARPS = NUM_PRODUCER_WARPS_;
   static constexpr int NUM_CONSUMER_WARPS = NUM_CONSUMER_WARPS_;
@@ -49,6 +50,7 @@ struct globals {
   static_assert(BN == 128,
                 "BN Must be divisible by 128 for fused silu-mul-quant");
   // =========== SHARED MEMORY TILES ============== //
+  // These can actually have templated constants
   using a_tile =
       st_fp8e4m3<64, 128>; // this is static, since this has to fit the TK WGMMA
                            // requirement, see warpgroup.cuh
@@ -58,36 +60,40 @@ struct globals {
   using c_tile = st<fp8e4m3, 64, BN>;
   using sfa_tile = sv<float, 64>;
 
-  using token_vec_tile =
-      st_fp8e4m3<1, H, false>; // char is same size as fp8e4m3 but
-                               // avoids TK's sv fp8 static_assert
+  using num_routed_layout = sv<int, constexpr_ti_align(NUM_EXPERTS, 16)>;
+  using tokens_per_expert_layout =
+      sv<int, constexpr_ti_align(NUM_EXPERTS / WORLD_SIZE, 16)>;
+  using expert_sums_layout = sv<int, constexpr_ti_align(MAIN_THREADS / 32, 16)>;
+  using expert_offsets_layout =
+      sv<int, constexpr_ti_align(NUM_EXPERTS / WORLD_SIZE, 16)>;
+  using token_vec_tile = sv_fp8e4m3<H>; // char is same size as fp8e4m3 but
+                                        // avoids TK's sv fp8 static_assert
   // assume this is k-major here, with shape (N / 128, K / 128)
 
-  using num_routed_layout = st<int, 1, NUM_EXPERTS, false>;
-  using tokens_per_expert_layout = st<int, 1, NUM_EXPERTS / WORLD_SIZE, false>;
-  using expert_sums_layout = st<int, 1, MAIN_THREADS / 32, false>;
-  using expert_offsets_layout = st<int, 1, NUM_EXPERTS / WORLD_SIZE, false>;
+  // all shared vector lengths must be padded to the tile dimension of 16, even
+  // if we aren't going to use allof them
 
-  using padded_expert_counts_layout =
-      gl<int, 1, 1, -1, NUM_EXPERTS / WORLD_SIZE>;
+  // ===== GLOBAL MEMORY LAYOUTS ===== //
+  // Because we pull these layouts into host side for the factory function, and
+  // use a convertor method, we want to avoid using templated layouts here
+  using padded_expert_counts_layout = gl<int, 1, 1, -1, -1>;
   using global_num_routed_layout =
-      pgl<gl<int, 1, 1, -1, NUM_EXPERTS>, WORLD_SIZE, false>;
+      pgl<gl<int, 1, 1, -1, -1>, WORLD_SIZE, false>;
   using expert_to_token_map_layout =
-      pgl<gl<int, 1, 1, NUM_EXPERTS, -1>, WORLD_SIZE, false>;
+      pgl<gl<int, 1, 1, -1, -1>, WORLD_SIZE, false>;
 
   using comm_comp_barrier_layout = gl<int, 1, 1, 1, -1>;
 
   using in_tokens_layout =
-      pgl<gl<fp8e4m3, 1, 1, -1, H, token_vec_tile>, WORLD_SIZE, false>;
+      pgl<gl<fp8e4m3, 1, 1, -1, -1, token_vec_tile>, WORLD_SIZE, false>;
   using in_tokens_scales_layout =
-      pgl<gl<float, 1, 1, H / 128, -1>, WORLD_SIZE, false>;
+      pgl<gl<float, 1, 1, -1, -1>, WORLD_SIZE, false>;
   using expert_x_tokens_layout =
-      gl<fp8e4m3, 1, 1, -1, H, a_tile, token_vec_tile>;
-  using expert_x_tokens_scale_layout = gl<float, 1, 1, H / 128, -1, sfa_tile>;
+      gl<fp8e4m3, 1, 1, -1, -1, a_tile, token_vec_tile>;
+  using expert_x_tokens_scale_layout = gl<float, 1, 1, -1, -1, sfa_tile>;
   using src_token_idx_layout = gl<int, 1, 1, -1, -1>;
   using src_dev_idx_layout = gl<int, 1, 1, -1, -1>;
-  using barrier_layout =
-      pgl<gl<int, -1, -1, -1, WORLD_SIZE>, WORLD_SIZE, false>;
+  using barrier_layout = pgl<gl<int, -1, -1, -1, 1>, WORLD_SIZE, false>;
 
   // ================ GLOBAL MEMORY ============= //
 
@@ -100,7 +106,7 @@ struct globals {
   using scale_a_layout = gl<float, 1, 1, -1, -1, sfa_tile>;
   using scale_gate_layout = gl<float, 1, 1, -1, -1>;
   using scale_up_layout = gl<float, 1, 1, -1, -1>;
-  using out_scales_layout = gl<float, 1, 1, _I / 128, -1, sfa_tile>;
+  using out_scales_layout = gl<float, 1, 1, -1, -1, sfa_tile>;
   using indices_layout = gl<int, 1, 1, -1, -1>;
 
   template <typename T = float> using accum_tile = rt<T, 16, c_tile::cols>;
@@ -198,7 +204,7 @@ compute_path(const globals<_M, _I, _H, _BM, _BN, NUM_CONSUMER_WARPS_,
 
   // TODO: stages heuristics needs to be changed here now
   constexpr int FINISH_BLOCK_OFFSET =
-      DYNAMIC_SHARED_MEMORY - sizeof(pipeline_outputs); // single SM persistent
+      KERNEL_SMEM_SIZE - sizeof(pipeline_outputs); // single SM persistent
   static_assert(FINISH_BLOCK_OFFSET >= 0, "not enough shared memory");
   constexpr int NON_FINISH_BLOCK_SPACE = FINISH_BLOCK_OFFSET - 1024;
   // round down number of stages if necessary
@@ -253,32 +259,35 @@ compute_path(const globals<_M, _I, _H, _BM, _BN, NUM_CONSUMER_WARPS_,
 
       for (; task_id < num_blocks; task_id += G.num_comp_sms) {
         // this is persistent sm scheduling here now
-        if (task_id < super_rows * NUM_C_BLOCKS) {
-          common.coord.x =
-              (task_id / super_repeat) * SUPER_M + task_id % SUPER_M;
-          common.coord.y = (task_id % super_repeat) /
-                           SUPER_M; // super_repeat includes all the c blocks
-        } else {
-          int remainder = task_id - super_rows * NUM_C_BLOCKS;
-          common.coord.x = super_rows + (remainder % remaining_rows);
-          common.coord.y = remainder / remaining_rows;
-        }
+        // if (task_id < super_rows * NUM_C_BLOCKS) {
+        //   common.coord.x =
+        //       (task_id / super_repeat) * SUPER_M + task_id % SUPER_M;
+        //   common.coord.y = (task_id % super_repeat) /
+        //                    SUPER_M; // super_repeat includes all the c blocks
+        // } else {
+        //   int remainder = task_id - super_rows * NUM_C_BLOCKS;
+        //   common.coord.x = super_rows + (remainder % remaining_rows);
+        //   common.coord.y = remainder / remaining_rows;
+        // }
+
+        common.coord.x = task_id / NUM_C_BLOCKS + row_block_start;
+        common.coord.y = task_id % NUM_C_BLOCKS;
+
         int counter;
-        asm volatile(
-            "{ld.relaxed.gpu.global.s32 %0, [%1];}"
-            : "=r"(counter)
-            : "l"(&G.comm_comp_barrier[{row_block_start + common.coord.x}])
-            : "memory");
-        while (counter != _BM) {
+        asm volatile("{ld.acquire.gpu.global.s32 %0, [%1];}"
+                     : "=r"(counter)
+                     : "l"(&G.comm_comp_barrier[{common.coord.x}])
+                     : "memory");
+        while (counter < _BM) {
           __nanosleep(16);
-          asm volatile(
-              "{ld.relaxed.gpu.global.s32 %0, [%1];}"
-              : "=r"(counter)
-              : "l"(&G.comm_comp_barrier[{row_block_start + common.coord.x}])
-              : "memory");
+          asm volatile("{ld.acquire.gpu.global.s32 %0, [%1];}"
+                       : "=r"(counter)
+                       : "l"(&G.comm_comp_barrier[{common.coord.x}])
+                       : "memory");
         }
 
         if (warp_id == 0 && lane_id == 0) {
+
           for (int iter = 0; iter < num_iters; iter++) {
             wait(inputs_finished[input_ring],
                  get_phasebit<1>(semaphore_bitfield, input_ring));
@@ -289,16 +298,14 @@ compute_path(const globals<_M, _I, _H, _BM, _BN, NUM_CONSUMER_WARPS_,
             for (int wg_id = 0; wg_id < GLOBALS::NUM_TILES; wg_id++) {
               tma::load_async(
                   inputs[input_ring].a[wg_id], G.expert_x_tokens,
-                  coord<ducks::default_type>{
-                      row_block_start * _BM + common.coord.x * _BM + wg_id * 64,
-                      iter * 128},
+                  coord<ducks::default_type>{common.coord.x * _BM + wg_id * 64,
+                                             iter * 128},
                   inputs_arrived[input_ring]);
-              tma::load_async(
-                  inputs[input_ring].sfa[wg_id], G.expert_x_tokens_scale,
-                  coord<ducks::default_type>{
-                      iter,
-                      (row_block_start * _BM + common.coord.x + wg_id) * 64},
-                  inputs_arrived[input_ring]);
+              tma::load_async(inputs[input_ring].sfa[wg_id],
+                              G.expert_x_tokens_scale,
+                              coord<ducks::default_type>{
+                                  iter, (common.coord.x + wg_id) * 64},
+                              inputs_arrived[input_ring]);
             }
             tma::load_async(inputs[input_ring].up, G.up,
                             coord<ducks::default_type>{
@@ -341,16 +348,19 @@ compute_path(const globals<_M, _I, _H, _BM, _BN, NUM_CONSUMER_WARPS_,
       for (; task_id < num_blocks; task_id += G.num_comp_sms) {
         warp::zero(state.up_accum);
         warp::zero(state.gate_accum);
-        if (task_id < super_rows * NUM_C_BLOCKS) {
-          common.coord.x =
-              (task_id / super_repeat) * SUPER_M + task_id % SUPER_M;
-          common.coord.y = (task_id % super_repeat) /
-                           SUPER_M; // super_repeat includes all the c blocks
-        } else {
-          int remainder = task_id - super_rows * NUM_C_BLOCKS;
-          common.coord.x = super_rows + (remainder % remaining_rows);
-          common.coord.y = remainder / remaining_rows;
-        }
+        // if (task_id < super_rows * NUM_C_BLOCKS) {
+        //   common.coord.x =
+        //       (task_id / super_repeat) * SUPER_M + task_id % SUPER_M;
+        //   common.coord.y = (task_id % super_repeat) /
+        //                    SUPER_M; // super_repeat includes all the c blocks
+        // } else {
+        //   int remainder = task_id - super_rows * NUM_C_BLOCKS;
+        //   common.coord.x = super_rows + (remainder % remaining_rows);
+        //   common.coord.y = remainder / remaining_rows;
+        // }
+
+        common.coord.x = task_id / NUM_C_BLOCKS + row_block_start;
+        common.coord.y = task_id % NUM_C_BLOCKS;
         // for the current task id, we just need to see whether the current
         // assigned row is ready on the barrier
 
@@ -424,16 +434,14 @@ compute_path(const globals<_M, _I, _H, _BM, _BN, NUM_CONSUMER_WARPS_,
 
         warpgroup::sync(wg_id + 3);
         if (warpgroup::laneid() == 0) {
-          tma::store_async(G.C, outputs.c[warpgroup::groupid()],
-                           coord<ducks::default_type>{row_block_start * _BM +
-                                                          common.coord.x * _BM +
-                                                          wg_id * 64,
-                                                      common.coord.y * _BN});
+          tma::store_async(
+              G.C, outputs.c[warpgroup::groupid()],
+              coord<ducks::default_type>{common.coord.x * _BM + wg_id * 64,
+                                         common.coord.y * _BN});
           tma::store_async(
               G.out_scales, outputs.out_scales[warpgroup::groupid()],
-              coord<ducks::default_type>{
-                  +common.coord.y,
-                  row_block_start * _BM + common.coord.x * _BM + wg_id * 64});
+              coord<ducks::default_type>{common.coord.y,
+                                         common.coord.x * _BM + wg_id * 64});
         }
       }
       task_id -= num_blocks;
@@ -477,7 +485,7 @@ __device__ inline void compute_routing_info(
   // check that we're not running out of dynamic shared memory
   DEVICE_ASSERT((allocator.ptr - &__shm[0]) * sizeof(int) +
                     NUM_EXPERTS_PER_DEV * G.num_dp_groups * sizeof(int) <=
-                DYNAMIC_SHARED_MEMORY);
+                KERNEL_SMEM_SIZE);
   int lane_id = kittens::laneid();
   int warp_id = kittens::warpid();
 
@@ -568,46 +576,65 @@ __device__ inline void compute_routing_info(
 
   // each warp will take its warp_id * 32, (warp_id + 1) * 32 range to cumsum
   // first
+  // we need to handle the case where num_experts_per_dev < 32
   int expert_count =
       threadIdx.x < NUM_EXPERTS_PER_DEV ? tokens_per_expert[threadIdx.x] : 0;
-  if (warp_id < NUM_EXPERTS_PER_DEV / 32) {
-    for (int offset = 1; offset < 32; offset <<= 1) {
-      int below_expert_count =
-          __shfl_up_sync(uint32_t(-1), expert_count, offset);
-      if (lane_id >= offset) {
-        expert_count += below_expert_count;
+  if constexpr (NUM_EXPERTS_PER_DEV <= 32) {
+    if (warp_id == 0) {
+      for (int offset = 1; offset < 32; offset <<= 1) {
+        int below_expert_count =
+            __shfl_up_sync(uint32_t(-1), expert_count, offset);
+        if (lane_id >= offset) {
+          expert_count += below_expert_count;
+        }
+      }
+      if (lane_id < NUM_EXPERTS_PER_DEV) {
+        expert_offsets.data[lane_id] = expert_count;
+      }
+      if (lane_id == NUM_EXPERTS_PER_DEV - 1) {
+        *G.num_recv_tokens = expert_count;
       }
     }
-    if (lane_id == 31) {
-      expert_sums.data[warp_id] = expert_count;
+  } else {
+    if (warp_id < NUM_EXPERTS_PER_DEV / 32) {
+      for (int offset = 1; offset < 32; offset <<= 1) {
+        int below_expert_count =
+            __shfl_up_sync(uint32_t(-1), expert_count, offset);
+        if (lane_id >= offset) {
+          expert_count += below_expert_count;
+        }
+      }
+      if (lane_id == 31) {
+        expert_sums.data[warp_id] = expert_count;
+      }
+      // expert_count is cumsum per warp now
     }
-    // expert_count is cumsum per warp now
-  }
 
-  everyone::sync(1);
-  if (warp_id == 0) {
-    int expert_sum =
-        lane_id < NUM_EXPERTS_PER_DEV / 32 ? expert_sums[lane_id] : 0;
-    for (int offset = 1; offset < 32; offset <<= 1) {
-      int below_expert_count = __shfl_up_sync(uint32_t(-1), expert_sum, offset);
-      if (lane_id >= offset) {
-        expert_sum += below_expert_count;
+    everyone::sync(1);
+    if (warp_id == 0) {
+      int expert_sum =
+          lane_id < NUM_EXPERTS_PER_DEV / 32 ? expert_sums[lane_id] : 0;
+      for (int offset = 1; offset < 32; offset <<= 1) {
+        int below_expert_count =
+            __shfl_up_sync(uint32_t(-1), expert_sum, offset);
+        if (lane_id >= offset) {
+          expert_sum += below_expert_count;
+        }
+      }
+
+      if (lane_id < NUM_EXPERTS_PER_DEV / 32) {
+        expert_sums.data[lane_id] =
+            expert_sum; // this is now the absolute expert offset
       }
     }
-
-    if (lane_id < NUM_EXPERTS_PER_DEV / 32) {
-      expert_sums.data[lane_id] =
-          expert_sum; // this is now the absolute expert offset
+    everyone::sync(1);
+    if (threadIdx.x < NUM_EXPERTS_PER_DEV) {
+      expert_offsets.data[threadIdx.x] =
+          ((warp_id > 0) ? expert_sums[warp_id - 1] : 0) + expert_count;
     }
-  }
-
-  everyone::sync(1);
-  if (threadIdx.x < NUM_EXPERTS_PER_DEV) {
-    expert_offsets.data[threadIdx.x] =
-        ((warp_id > 0) ? expert_sums[warp_id - 1] : 0) + expert_count;
-  }
-  if (threadIdx.x == NUM_EXPERTS_PER_DEV - 1) {
-    *G.num_recv_tokens = expert_offsets[threadIdx.x];
+    if (threadIdx.x == NUM_EXPERTS_PER_DEV - 1) {
+      *G.num_recv_tokens = expert_offsets[threadIdx.x];
+    }
   }
   everyone::sync(1);
 
@@ -617,10 +644,18 @@ __device__ inline void compute_routing_info(
   // now in the padded offsets, for each expert, we find the src_rank_offset
   // and iterate through that for the number of tokens, and map this to the
   // padded expert offset index
+
+  // quick debug
+  // if (G.rank == 0 && threadIdx.x < G.num_dp_groups * NUM_EXPERTS_PER_DEV) {
+  //   printf("src_group_offset[%d] = %d\n", threadIdx.x,
+  //          src_group_offset[threadIdx.x]);
+  // }
+  // everyone::sync(1);
+
   int token = threadIdx.x;
-  int local_expert = 0;
   while (token < num_tokens) {
     // expert_offsets[expert] describes the exclusive end index for the token
+    int local_expert = 0;
     while (token >= expert_offsets[local_expert] &&
            local_expert < NUM_EXPERTS_PER_DEV) {
       local_expert++;
@@ -632,6 +667,7 @@ __device__ inline void compute_routing_info(
     int expert_start = local_expert > 0 ? expert_offsets[local_expert - 1] : 0;
     int intra_expert_token = token - expert_start;
     int src_rank_token_offset = intra_expert_token; // start at t
+
     while (intra_expert_token >=
                src_group_offset[local_expert * G.num_dp_groups + src_group] &&
            src_group < G.num_dp_groups) {
@@ -663,35 +699,44 @@ comm_path(const globals<_M, _I, _H, _BM, _BN, NUM_CONSUMER_WARPS_,
                         NUM_PRODUCER_WARPS_, NUM_STAGES_, KERNEL_SMEM_SIZE,
                         NUM_EXPERTS, EXPERTS_PER_TOKEN, SUPER_M> &G,
           const int sm_idx) {
-
   using GLOBALS = globals<_M, _I, _H, _BM, _BN, NUM_CONSUMER_WARPS_,
                           NUM_PRODUCER_WARPS_, NUM_STAGES_, KERNEL_SMEM_SIZE,
                           NUM_EXPERTS, EXPERTS_PER_TOKEN, SUPER_M>;
+  printf("shared vector length: %d\n", GLOBALS::token_vec_tile::length);
+
   int num_recv_tokens = *G.num_recv_tokens;
   extern __shared__ int __shm[];
   // we're also going to rewrite the shared memory with a new allocator now
-  tma_allocator tl(&__shm[0]);
-  typename GLOBALS::token_vec(&token)[GLOBALS::TOKENS_PER_BLOCK] =
-      tl.allocate<typename GLOBALS::token_vec, GLOBALS::TOKENS_PER_BLOCK>();
-  __shared__ semaphore token_arrived[GLOBALS::TOKENS_PER_BLOCK];
-  int phase = 0;
+  tma_allocator tl((int *)&__shm[0]);
+  typename GLOBALS::token_vec_tile(&token)[GLOBALS::TOKENS_PER_BLOCK] =
+      tl.allocate<typename GLOBALS::token_vec_tile,
+                  GLOBALS::TOKENS_PER_BLOCK>();
+  semaphore(&token_arrived)[GLOBALS::TOKENS_PER_BLOCK] =
+      tl.allocate<semaphore, GLOBALS::TOKENS_PER_BLOCK>();
   if (threadIdx.x < GLOBALS::TOKENS_PER_BLOCK) {
-    int token_idx = sm_idx * GLOBALS::TOKENS_PER_BLOCK + threadIdx.x;
-    init_semaphore(token_arrived[threadIdx.x], 0, 1);
     // while (token_idx < num_recv_tokens) {
+    int phase = 0;
 
-    while (token_idx < num_recv_tokens) {
+    init_semaphore(token_arrived[threadIdx.x], 0, 1);
+    for (int token_idx = sm_idx * GLOBALS::TOKENS_PER_BLOCK + threadIdx.x;
+         token_idx < num_recv_tokens;
+         token_idx += GLOBALS::TOKENS_PER_BLOCK * G.num_comm_sms) {
       int src_dev_idx = G.src_dev_idx[{token_idx}];
       int src_token_idx = G.src_token_idx[{token_idx}];
 
       if (src_dev_idx >= 0 && src_token_idx >= 0) {
+
         tma::expect_bytes(token_arrived[threadIdx.x],
-                          sizeof(typename GLOBALS::token_vec));
+                          sizeof(typename GLOBALS::token_vec_tile));
         tma::load_async(token[threadIdx.x], G.in_tokens[src_dev_idx],
-                        {src_token_idx, 0}, token_arrived[threadIdx.x]);
+                        coord<ducks::default_type>{src_token_idx, 0},
+                        token_arrived[threadIdx.x]);
 
         wait(token_arrived[threadIdx.x], phase);
         phase ^= 1;
+        printf("token_idx = %d, src_dev_idx = %d, src_token_idx = %d G.rank = "
+               "%d sm_idx = %d\n",
+               token_idx, src_dev_idx, src_token_idx, G.rank, sm_idx);
 
         tma::store_async(G.expert_x_tokens, token[threadIdx.x], {token_idx, 0});
 
@@ -705,12 +750,16 @@ comm_path(const globals<_M, _I, _H, _BM, _BN, NUM_CONSUMER_WARPS_,
 
         tma::store_async_wait();
       }
+
+      if (G.rank == 0 && sm_idx == 0) {
+        printf("token_idx = %d, src_dev_idx = %d, src_token_idx = %d\n",
+               token_idx, src_dev_idx, src_token_idx);
+      }
       // add to the barrier, even padded tokens
       asm volatile("{red.release.gpu.global.add.s32 [%0], %1;}"
                    :
-                   : "l"(&G.comm_comp_barrier[token_idx / _BM]), "r"(1)
+                   : "l"(&G.comm_comp_barrier[{token_idx / _BM}]), "r"(1)
                    : "memory");
-      token_idx += GLOBALS::TOKENS_PER_BLOCK * G.num_comm_sms;
     }
   }
 }
@@ -728,6 +777,7 @@ __global__ void __launch_bounds__(MAIN_THREADS, 1) global_kernel5(
     compute_routing_info(G);
   }
   grid.sync();
+  printf("finished routing info\n");
   if (blockIdx.x < G.num_comp_sms) {
     compute_path(G, blockIdx.x);
   } else {

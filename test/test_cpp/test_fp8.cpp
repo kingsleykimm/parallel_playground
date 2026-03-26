@@ -7,8 +7,8 @@
 #include <torch/torch.h>
 
 #include "test_utils.h"
-#include <kernels/internal_api.hpp>
 #include <jit/compiler.hpp>
+#include <kernels/internal_api.hpp>
 #include <moe_cuda/types.h>
 #include <runtime/utils.h>
 
@@ -16,11 +16,11 @@ using test_utils::calc_diff;
 using test_utils::shape_to_string;
 
 struct TestShape {
-    int64_t M;
-    int64_t N;
-    int64_t K;
-    int groups;
-    const char* desc;
+  int64_t M;
+  int64_t N;
+  int64_t K;
+  int groups;
+  const char *desc;
 };
 
 static const std::vector<TestShape> normal_shapes = {
@@ -58,120 +58,133 @@ static const std::vector<TestShape> masked_shapes = {
 #endif
 
 struct Config {
-    GemmType type = GemmType::Normal;
-    bool all_shapes = true;
-    int64_t M = 0;
-    int64_t N = 0;
-    int64_t K = 0;
-    int groups = 1;
-    bool verbose = false;
+  GemmType type = GemmType::Normal;
+  bool all_shapes = true;
+  int64_t M = 0;
+  int64_t N = 0;
+  int64_t K = 0;
+  int groups = 1;
+  bool verbose = false;
 };
 
-static const char* type_to_string(GemmType t) {
-    switch (t) {
-        case GemmType::Normal: return "normal";
-        default: return "unknown";
-    }
+static const char *type_to_string(GemmType t) {
+  switch (t) {
+  case GemmType::Normal:
+    return "normal";
+  default:
+    return "unknown";
+  }
 }
 
-static const char* output_type_to_string(c10::ScalarType dtype) {
-    switch (dtype) {
-        case c10::ScalarType::Float: return "float";
-        case c10::ScalarType::BFloat16: return "bf16";
-        default: return "unknown";
-    }
+static const char *output_type_to_string(c10::ScalarType dtype) {
+  switch (dtype) {
+  case c10::ScalarType::Float:
+    return "float";
+  case c10::ScalarType::BFloat16:
+    return "bf16";
+  default:
+    return "unknown";
+  }
 }
 
 static double max_diff_for_output_dtype(c10::ScalarType dtype) {
-    switch (dtype) {
-        default: return 0.001;
-    }
+  switch (dtype) {
+  default:
+    return 0.001;
+  }
 }
 
-static bool parse_args(int argc, char** argv, Config& cfg) {
-    bool type_set = false;
-    for (int i = 1; i < argc; ++i) {
-        std::string a = argv[i];
-        if ((a == "--type") && i + 1 < argc) {
-            std::string t = argv[++i];
-            if (t == "normal") cfg.type = GemmType::Normal;
-            else return false;
-            type_set = true;
-        } else if ((a == "--m") && i + 1 < argc) {
-            cfg.M = std::stoll(argv[++i]);
-            cfg.all_shapes = false;
-        } else if ((a == "--n") && i + 1 < argc) {
-            cfg.N = std::stoll(argv[++i]);
-            cfg.all_shapes = false;
-        } else if ((a == "--k") && i + 1 < argc) {
-            cfg.K = std::stoll(argv[++i]);
-            cfg.all_shapes = false;
-        } else if ((a == "--groups") && i + 1 < argc) {
-            cfg.groups = std::stoi(argv[++i]);
-        } else if (a == "--verbose") {
-            cfg.verbose = true;
-        } else {
-            return false;
-        }
+static bool parse_args(int argc, char **argv, Config &cfg) {
+  bool type_set = false;
+  for (int i = 1; i < argc; ++i) {
+    std::string a = argv[i];
+    if ((a == "--type") && i + 1 < argc) {
+      std::string t = argv[++i];
+      if (t == "normal")
+        cfg.type = GemmType::Normal;
+      else
+        return false;
+      type_set = true;
+    } else if ((a == "--m") && i + 1 < argc) {
+      cfg.M = std::stoll(argv[++i]);
+      cfg.all_shapes = false;
+    } else if ((a == "--n") && i + 1 < argc) {
+      cfg.N = std::stoll(argv[++i]);
+      cfg.all_shapes = false;
+    } else if ((a == "--k") && i + 1 < argc) {
+      cfg.K = std::stoll(argv[++i]);
+      cfg.all_shapes = false;
+    } else if ((a == "--groups") && i + 1 < argc) {
+      cfg.groups = std::stoi(argv[++i]);
+    } else if (a == "--verbose") {
+      cfg.verbose = true;
+    } else {
+      return false;
     }
-    return type_set;
+  }
+  return type_set;
 }
 
 static bool run_normal(int64_t M, int64_t N, int64_t K,
                        c10::ScalarType output_dtype, bool verbose) {
-    auto dev = torch::Device(torch::kCUDA);
-    auto bf16 = torch::TensorOptions().dtype(torch::kBFloat16).device(dev);
-    auto out_options = torch::TensorOptions().dtype(output_dtype).device(dev);
-    double max_diff = max_diff_for_output_dtype(output_dtype);
+  auto dev = torch::Device(torch::kCUDA);
+  auto bf16 = torch::TensorOptions().dtype(torch::kBFloat16).device(dev);
+  auto out_options = torch::TensorOptions().dtype(output_dtype).device(dev);
+  double max_diff = max_diff_for_output_dtype(output_dtype);
 
-    float s = 1.0f / std::sqrt(static_cast<float>(K));
-    torch::Tensor A = torch::randn({M, K}, bf16) * s;
-    torch::Tensor B = torch::randn({N, K}, bf16) * s;
-    torch::Tensor ref = torch::mm(A, B.t());
+  float s = 1.0f / std::sqrt(static_cast<float>(K));
+  torch::Tensor A = torch::randn({M, K}, bf16) * s;
+  torch::Tensor B = torch::randn({N, K}, bf16) * s;
+  torch::Tensor ref = torch::mm(A, B.t());
 
-    auto [A_fp8, sfa] = test_utils::quantize_fp8_1d_block(A, Major::K, dev);
-    auto [B_fp8, sfb] = test_utils::quantize_fp8_2d_block(B, dev);
+  auto [A_fp8, sfa] = test_utils::quantize_fp8_1d_block(A, Major::K, dev);
+  auto [B_fp8, sfb] = test_utils::quantize_fp8_2d_block(B, dev);
 
-    torch::Tensor out = torch::empty({M, N}, out_options);
-    at::Tensor A_t = A_fp8;
-    at::Tensor B_t = B_fp8;
-    at::Tensor sfa_t = sfa;
-    at::Tensor sfb_t = sfb;
-    at::Tensor out_t = out;
+  torch::Tensor out = torch::empty({M, N}, out_options);
+  at::Tensor A_t = A_fp8;
+  at::Tensor B_t = B_fp8;
+  at::Tensor sfa_t = sfa;
+  at::Tensor sfb_t = sfb;
+  at::Tensor out_t = out;
 
-    cudaStream_t stream;
-    CUDA_CHECK(cudaStreamCreate(&stream));
-    auto start = std::chrono::high_resolution_clock::now();
-    moe_cuda::kernels::fp8_gemm_nt(A_t, sfa_t, B_t, sfb_t, out_t, GemmType::Normal, "", nullptr, stream);
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    auto end = std::chrono::high_resolution_clock::now();
-    CUDA_CHECK(cudaStreamDestroy(stream));
+  cudaStream_t stream;
+  CUDA_CHECK(cudaStreamCreate(&stream));
+  auto start = std::chrono::high_resolution_clock::now();
+  moe_cuda::kernels::fp8_gemm_nt(A_t, sfa_t, B_t, sfb_t, out_t,
+                                 GemmType::Normal, "", nullptr, stream);
+  CUDA_CHECK(cudaStreamSynchronize(stream));
+  auto end = std::chrono::high_resolution_clock::now();
+  CUDA_CHECK(cudaStreamDestroy(stream));
 
-    if (verbose) {
-        test_utils::inspect_tensor(ref, 25);
-        test_utils::inspect_tensor(out, 25);
-    }
-    double diff = calc_diff(ref, out);
-    if (verbose) {
-        std::cout << "normal shape=" << shape_to_string(out.sizes().vec())
-                  << " out_dtype=" << output_type_to_string(output_dtype)
-                  << " kernel_us=" << std::chrono::duration_cast<std::chrono::microseconds>(end - start).count()
-                  << " diff=" << diff << "\n";
-    }
-    return diff < max_diff;
+  if (verbose) {
+    test_utils::inspect_tensor(ref, 25);
+    test_utils::inspect_tensor(out, 25);
+  }
+  double diff = calc_diff(ref, out);
+  if (verbose) {
+    std::cout << "normal shape=" << shape_to_string(out.sizes().vec())
+              << " out_dtype=" << output_type_to_string(output_dtype)
+              << " kernel_us="
+              << std::chrono::duration_cast<std::chrono::microseconds>(end -
+                                                                       start)
+                     .count()
+              << " diff=" << diff << "\n";
+  }
+  return diff < max_diff;
 }
 
 // #if 0
 // // Disabled for now: grouped FP8 GEMM tests.
-// static bool run_contiguous(int64_t M, int64_t N, int64_t K, int groups, double max_diff, bool verbose) {
+// static bool run_contiguous(int64_t M, int64_t N, int64_t K, int groups,
+// double max_diff, bool verbose) {
 //     auto dev = torch::Device(torch::kCUDA);
 //     auto bf16 = torch::TensorOptions().dtype(torch::kBFloat16).device(dev);
 
 //     int64_t per_group_M = M / groups;
 //     int total_M = 0;
-//     auto tup = test_utils::generate_contiguous_grouped_layout(total_M, groups, per_group_M, dev);
-//     torch::Tensor grouped_layout = std::get<0>(tup);
-//     std::vector<size_t> actual_ms = std::get<1>(tup);
+//     auto tup = test_utils::generate_contiguous_grouped_layout(total_M,
+//     groups, per_group_M, dev); torch::Tensor grouped_layout =
+//     std::get<0>(tup); std::vector<size_t> actual_ms = std::get<1>(tup);
 //     std::vector<size_t> aligned_ms = std::get<2>(tup);
 
 //     float s = 1.0f / std::sqrt(static_cast<float>(K));
@@ -181,14 +194,16 @@ static bool run_normal(int64_t M, int64_t N, int64_t K,
 //     torch::Tensor ref = torch::zeros({total_M, N}, bf16.device(torch::kCPU));
 //     int row_start = 0;
 //     for (int g = 0; g < groups; ++g) {
-//         auto a_slice = A.index({torch::indexing::Slice(row_start, row_start + static_cast<int>(aligned_ms[g]))});
-//         auto r = torch::mm(a_slice, B[g].t());
-//         ref.index_put_({torch::indexing::Slice(row_start, row_start + static_cast<int>(aligned_ms[g]))}, r);
-//         row_start += static_cast<int>(aligned_ms[g]);
+//         auto a_slice = A.index({torch::indexing::Slice(row_start, row_start +
+//         static_cast<int>(aligned_ms[g]))}); auto r = torch::mm(a_slice,
+//         B[g].t()); ref.index_put_({torch::indexing::Slice(row_start,
+//         row_start + static_cast<int>(aligned_ms[g]))}, r); row_start +=
+//         static_cast<int>(aligned_ms[g]);
 //     }
 
 //     auto [A_fp8, sfa] = test_utils::quantize_fp8_1d_block(A, Major::K, dev);
-//     auto [B_fp8_flat, sfb] = test_utils::quantize_fp8_2d_block(B.reshape({groups * N, K}), dev);
+//     auto [B_fp8_flat, sfb] =
+//     test_utils::quantize_fp8_2d_block(B.reshape({groups * N, K}), dev);
 //     torch::Tensor B_fp8 = B_fp8_flat.reshape({groups, N, K});
 
 //     torch::Tensor out = torch::empty({total_M, N}, bf16);
@@ -204,8 +219,8 @@ static bool run_normal(int64_t M, int64_t N, int64_t K,
 
 //     cudaStream_t stream;
 //     CUDA_CHECK(cudaStreamCreate(&stream));
-//     moe_cuda::fp8_gemm(act, weight, out_t, GemmType::MGroupedContiguous, "", grouped_layout_ptr, stream);
-//     CUDA_CHECK(cudaStreamSynchronize(stream));
+//     moe_cuda::fp8_gemm(act, weight, out_t, GemmType::MGroupedContiguous, "",
+//     grouped_layout_ptr, stream); CUDA_CHECK(cudaStreamSynchronize(stream));
 //     CUDA_CHECK(cudaStreamDestroy(stream));
 
 //     std::vector<torch::Tensor> ref_list;
@@ -213,34 +228,41 @@ static bool run_normal(int64_t M, int64_t N, int64_t K,
 //     row_start = 0;
 //     for (int g = 0; g < groups; ++g) {
 //         uint32_t rows = actual_ms[g];
-//         ref_list.push_back(ref.index({torch::indexing::Slice(row_start, row_start + static_cast<int>(rows))}));
-//         out_list.push_back(out.cpu().index({torch::indexing::Slice(row_start, row_start + static_cast<int>(rows))}));
-//         row_start += static_cast<int>(aligned_ms[g]);
+//         ref_list.push_back(ref.index({torch::indexing::Slice(row_start,
+//         row_start + static_cast<int>(rows))}));
+//         out_list.push_back(out.cpu().index({torch::indexing::Slice(row_start,
+//         row_start + static_cast<int>(rows))})); row_start +=
+//         static_cast<int>(aligned_ms[g]);
 //     }
 
-//     double diff = calc_diff(torch::cat(ref_list, 0), torch::cat(out_list, 0));
-//     if (verbose) {
-//         std::cout << "contiguous total_M=" << total_M << " groups=" << groups << " diff=" << diff << "\n";
+//     double diff = calc_diff(torch::cat(ref_list, 0), torch::cat(out_list,
+//     0)); if (verbose) {
+//         std::cout << "contiguous total_M=" << total_M << " groups=" << groups
+//         << " diff=" << diff << "\n";
 //     }
 //     return diff < max_diff;
 // }
 
-// static bool run_masked(int64_t M, int64_t N, int64_t K, int groups, double max_diff, bool verbose) {
+// static bool run_masked(int64_t M, int64_t N, int64_t K, int groups, double
+// max_diff, bool verbose) {
 //     auto dev = torch::Device(torch::kCUDA);
 //     auto bf16 = torch::TensorOptions().dtype(torch::kBFloat16).device(dev);
 
 //     float s = 1.0f / std::sqrt(static_cast<float>(K));
 //     torch::Tensor A = torch::randn({groups, M, K}, bf16) * s;
 //     torch::Tensor B = torch::randn({groups, N, K}, bf16) * s;
-//     torch::Tensor grouped_layout = test_utils::generate_masked_grouped_layout(M, groups, dev);
+//     torch::Tensor grouped_layout =
+//     test_utils::generate_masked_grouped_layout(M, groups, dev);
 
 //     torch::Tensor ref = torch::einsum("gmk,gnk->gmn", {A, B});
 
-//     auto [A_fp8_flat, sfa_flat] = test_utils::quantize_fp8_1d_block(A.reshape({groups * M, K}), Major::K, dev);
-//     torch::Tensor A_fp8 = A_fp8_flat.reshape({groups, M, K});
+//     auto [A_fp8_flat, sfa_flat] =
+//     test_utils::quantize_fp8_1d_block(A.reshape({groups * M, K}), Major::K,
+//     dev); torch::Tensor A_fp8 = A_fp8_flat.reshape({groups, M, K});
 //     torch::Tensor sfa = sfa_flat.reshape({groups, M, K / 128});
 
-//     auto [B_fp8_flat, sfb] = test_utils::quantize_fp8_2d_block(B.reshape({groups * N, K}), dev);
+//     auto [B_fp8_flat, sfb] =
+//     test_utils::quantize_fp8_2d_block(B.reshape({groups * N, K}), dev);
 //     torch::Tensor B_fp8 = B_fp8_flat.reshape({groups, N, K});
 
 //     torch::Tensor out = torch::empty({groups, M, N}, bf16);
@@ -256,8 +278,8 @@ static bool run_normal(int64_t M, int64_t N, int64_t K,
 
 //     cudaStream_t stream;
 //     CUDA_CHECK(cudaStreamCreate(&stream));
-//     moe_cuda::fp8_gemm(act, weight, out_t, GemmType::MGroupedMasked, "", grouped_layout_ptr, stream);
-//     CUDA_CHECK(cudaStreamSynchronize(stream));
+//     moe_cuda::fp8_gemm(act, weight, out_t, GemmType::MGroupedMasked, "",
+//     grouped_layout_ptr, stream); CUDA_CHECK(cudaStreamSynchronize(stream));
 //     CUDA_CHECK(cudaStreamDestroy(stream));
 
 //     auto layout_cpu = grouped_layout.cpu();
@@ -269,66 +291,71 @@ static bool run_normal(int64_t M, int64_t N, int64_t K,
 //     for (int g = 0; g < groups; ++g) {
 //         uint32_t rows = layout_acc[g];
 //         ref_list.push_back(ref.index({g, torch::indexing::Slice(0, rows)}));
-//         out_list.push_back(out_cpu.index({g, torch::indexing::Slice(0, rows)}));
+//         out_list.push_back(out_cpu.index({g, torch::indexing::Slice(0,
+//         rows)}));
 //     }
 
-//     double diff = calc_diff(torch::cat(ref_list, 0), torch::cat(out_list, 0));
-//     if (verbose) {
-//         std::cout << "masked M=" << M << " groups=" << groups << " diff=" << diff << "\n";
+//     double diff = calc_diff(torch::cat(ref_list, 0), torch::cat(out_list,
+//     0)); if (verbose) {
+//         std::cout << "masked M=" << M << " groups=" << groups << " diff=" <<
+//         diff << "\n";
 //     }
 //     return diff < max_diff;
 // }
 // #endif
 
-int main(int argc, char** argv) {
-    Config cfg;
-    if (!parse_args(argc, argv, cfg)) {
-        std::cerr << "Usage: " << argv[0]
-                  << " --type <normal> [--m M --n N --k K --groups G --verbose]\n";
-        return 1;
+int main(int argc, char **argv) {
+  Config cfg;
+  if (!parse_args(argc, argv, cfg)) {
+    std::cerr << "Usage: " << argv[0]
+              << " --type <normal> [--m M --n N --k K --groups G --verbose]\n";
+    return 1;
+  }
+
+  if (!torch::cuda::is_available()) {
+    std::cerr << "CUDA is unavailable\n";
+    return 1;
+  }
+
+  Compiler::init_static_vars(get_env<std::string>("LIBRARY_ROOT_PATH", ""),
+                             get_env<std::string>("CUDA_HOME_PATH", ""));
+
+  int passed = 0;
+  int failed = 0;
+
+  auto run_one = [&](const TestShape &s) {
+    for (c10::ScalarType output_dtype :
+         {c10::ScalarType::Float, c10::ScalarType::BFloat16}) {
+      bool ok = false;
+      if (cfg.type == GemmType::Normal) {
+        ok = run_normal(s.M, s.N, s.K, output_dtype, cfg.verbose);
+      } else {
+        std::cerr << "Unsupported test type in this test binary\n";
+        ok = false;
+      }
+
+      if (ok)
+        ++passed;
+      else
+        ++failed;
+
+      std::cout << (ok ? "[PASSED] " : "[FAILED] ") << type_to_string(cfg.type)
+                << " M=" << s.M << " N=" << s.N << " K=" << s.K
+                << " G=" << s.groups
+                << " C=" << output_type_to_string(output_dtype)
+                << " max_diff=" << max_diff_for_output_dtype(output_dtype)
+                << " (" << s.desc << ")\n";
     }
+  };
 
-    if (!torch::cuda::is_available()) {
-        std::cerr << "CUDA is unavailable\n";
-        return 1;
-    }
+  if (!cfg.all_shapes) {
+    TestShape s{cfg.M, cfg.N, cfg.K, cfg.groups, "custom"};
+    run_one(s);
+  } else {
+    for (const auto &s : normal_shapes)
+      run_one(s);
+  }
 
-    Compiler::init_static_vars(get_env<std::string>("LIBRARY_ROOT_PATH", ""),
-                               get_env<std::string>("CUDA_HOME_PATH", ""));
-
-    int passed = 0;
-    int failed = 0;
-
-    auto run_one = [&](const TestShape& s) {
-        for (c10::ScalarType output_dtype :
-             {c10::ScalarType::Float, c10::ScalarType::BFloat16}) {
-            bool ok = false;
-            if (cfg.type == GemmType::Normal) {
-                ok = run_normal(s.M, s.N, s.K, output_dtype, cfg.verbose);
-            } else {
-                std::cerr << "Unsupported test type in this test binary\n";
-                ok = false;
-            }
-
-            if (ok) ++passed;
-            else ++failed;
-
-            std::cout << (ok ? "[PASSED] " : "[FAILED] ") << type_to_string(cfg.type)
-                      << " M=" << s.M << " N=" << s.N << " K=" << s.K
-                      << " G=" << s.groups
-                      << " C=" << output_type_to_string(output_dtype)
-                      << " max_diff=" << max_diff_for_output_dtype(output_dtype)
-                      << " (" << s.desc << ")\n";
-        }
-    };
-
-    if (!cfg.all_shapes) {
-        TestShape s{cfg.M, cfg.N, cfg.K, cfg.groups, "custom"};
-        run_one(s);
-    } else {
-        for (const auto& s : normal_shapes) run_one(s);
-    }
-
-    std::cout << "Summary: passed=" << passed << " failed=" << failed << "\n";
-    return failed == 0 ? 0 : 1;
+  std::cout << "Summary: passed=" << passed << " failed=" << failed << "\n";
+  return failed == 0 ? 0 : 1;
 }

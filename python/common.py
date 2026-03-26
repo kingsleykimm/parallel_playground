@@ -8,12 +8,12 @@ import moe_cuda
 from pathlib import Path
 
 
-
 class Major(Enum):
     K = 0
     MN = 1
 
-def calc_cosine_diff(ref : torch.Tensor, out : torch.Tensor) -> float:
+
+def calc_cosine_diff(ref: torch.Tensor, out: torch.Tensor) -> float:
     ref_d = ref.to(torch.double)
     out_d = out.to(torch.double)
     denominator = (ref_d * ref_d + out_d * out_d).sum().item()
@@ -35,15 +35,18 @@ def clean_print(*args, **kwargs):
                 print(f"[Rank {i}]", *args, **kwargs)
             torch.distributed.barrier()
 
+
 def align(val: int, alignment: int) -> int:
     return ((val + alignment - 1) // alignment) * alignment
+
 
 def get_mk_alignment_for_contiguous_layout():
     return 128
 
+
 def check_diff(name: str, A: torch.Tensor, A_ref: torch.Tensor, single: bool = False):
     if single:
-        print(f"===============================================================================")
+        print("===============================================================================")
         print(f"<{name}>")
         print(f"Max diff:  {((A - A_ref).abs().max().item()):.10f}")
         print(f"Mean diff: {((A - A_ref).abs().mean().item()):.10f}")
@@ -52,7 +55,8 @@ def check_diff(name: str, A: torch.Tensor, A_ref: torch.Tensor, single: bool = F
         print(f"Max:       {A.abs().max().item():.10f}")
         print(f"Ref max:   {A_ref.abs().max().item():.10f}")
     else:
-        clean_print(f"===============================================================================", print_once=True)
+        clean_print(
+            "===============================================================================", print_once=True)
         clean_print(f"<{name}>", print_once=True)
         clean_print(f"Max diff:  {((A - A_ref).abs().max().item()):.10f}")
         clean_print(f"Mean diff: {((A - A_ref).abs().mean().item()):.10f}")
@@ -66,8 +70,8 @@ def benchmark_no_l2_clear(
     func: Callable,
     num_warmup_iters: int = 1,
     num_iters: int = 5,
-    single: bool = False, # for the sake of consistency with benchmark_l2_clear
-    use_events: bool = True # only valid if using default stream
+    single: bool = False,  # for the sake of consistency with benchmark_l2_clear
+    use_events: bool = True  # only valid if using default stream
 ) -> float:
     for _ in range(num_warmup_iters):
         func()
@@ -103,7 +107,8 @@ def profile(
     suffix: str = ""
 ) -> None:
     with torch.profiler.profile(
-        activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+        activities=[torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA],
         record_shapes=True,
         profile_memory=True,
         with_modules=True,
@@ -118,39 +123,47 @@ def profile(
     # clean_print(f"Profiler trace exported to {trace_filename}")
 
 
-def quantize_1d_128(input : torch.Tensor):
+def quantize_1d_128(input: torch.Tensor):
     assert input.dtype == torch.float or input.dtype == torch.bfloat16
     flattened = input.reshape(-1, input.size(-1))
     num_blocks = input.size(-1) / 128
 
-    quantized = torch.empty_like(flattened, dtype = torch.float8_e4m3fn, device = flattened.device)
-    scales = torch.empty(flattened.size(0), num_blocks, dtype = torch.float32, device = flattened.device)
+    quantized = torch.empty_like(
+        flattened, dtype=torch.float8_e4m3fn, device=flattened.device)
+    scales = torch.empty(flattened.size(0), num_blocks,
+                         dtype=torch.float32, device=flattened.device)
     for i in range(flattened.size(0)):
 
         for block in range(num_blocks):
-            slice = flattened[i, block * 128 : (block + 1) * 128]
+            slice = flattened[i, block * 128: (block + 1) * 128]
             cur_scale = slice.amax() / 448.0
             scales[i, block] = cur_scale
-            quantized[i, block * 128 : (block + 1) * 128] = (slice / cur_scale).to(torch.float8_e4m3fn)
+            quantized[i, block * 128: (block + 1) * 128] = (slice /
+                                                            cur_scale).to(torch.float8_e4m3fn)
     return quantized, scales
 
-def quantize_2d_128(input : torch.Tensor):
+
+def quantize_2d_128(input: torch.Tensor):
     assert input.dtype == torch.float or input.dtype == torch.bfloat16
     assert input.size(-1) % 128 == 0 and input.size(-2) % 128 == 0
     num_groups = input.size(0)
     num_k_blocks = input.size(-1) / 128
     num_n_blocks = input.size(-2) / 128
 
-    quantized = torch.empty_like(input, dtype = torch.float8_e4m3fn, device = input.device)
-    scales = torch.empty(num_groups, num_n_blocks, num_k_blocks, dtype = torch.float32, device = input.device)
+    quantized = torch.empty_like(
+        input, dtype=torch.float8_e4m3fn, device=input.device)
+    scales = torch.empty(num_groups, num_n_blocks, num_k_blocks,
+                         dtype=torch.float32, device=input.device)
 
     for g in range(num_groups):
         for n_block in range(num_n_blocks):
             for k_block in range(num_k_blocks):
-                slice2d = input[g, n_block * 128 : (n_block + 1) * 128, k_block * 128 : (k_block + 1) * 128]
+                slice2d = input[g, n_block *
+                                128: (n_block + 1) * 128, k_block * 128: (k_block + 1) * 128]
                 cur_scale = slice2d.amax() / 448.0
                 scales[g, n_block, k_block] = cur_scale
-                quantized[g, n_block * 128 : (n_block + 1) * 128, k_block * 128 : (k_block + 1) * 128] = (slice2d / cur_scale).to(torch.float8_e4m3fn)
+                quantized[g, n_block * 128: (n_block + 1) * 128, k_block * 128: (
+                    k_block + 1) * 128] = (slice2d / cur_scale).to(torch.float8_e4m3fn)
     return quantized, scales
 
 
@@ -159,8 +172,10 @@ def setup():
     library_root_path = os.getenv("LIBRARY_ROOT_PATH")
     if library_root_path is None:
         library_root_path = str(Path(__file__)).resolve().parents[2]
-    cuda_home_path = os.getenv("CUDA_HOME_PATH") or os.getenv("CUDA_PATH") or "/usr/loca/cuda/"
+    cuda_home_path = os.getenv("CUDA_HOME_PATH") or os.getenv(
+        "CUDA_PATH") or "/usr/loca/cuda/"
     moe_cuda.init(library_root_path, cuda_home_path)
+
 
 def init_distributed_environment():
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -170,9 +185,9 @@ def init_distributed_environment():
 
     assert world_size == local_world_size, "No multi-node configs"
     assert rank == local_rank, "no multi-node configs"
-    
+
     torch.distributed.init_process_group(
-        backend = "nccl", device_id = local_rank, rank = rank, world_size = local_world_size
+        backend="nccl", device_id=local_rank, rank=rank, world_size=local_world_size
     )
 
     device = torch.device(f"cuda:{local_rank}")
@@ -181,6 +196,7 @@ def init_distributed_environment():
 
     return local_rank, local_world_size
 
+
 def destroy_distributed_environment():
     torch.distributed.destroy_process_group()
 
@@ -188,16 +204,20 @@ def destroy_distributed_environment():
 # from DeepGEMM's python testing suite, modified for this testing
 
 def generate_m_grouped_contiguous(num_groups: int, expected_m_per_group: int, n: int, k: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    actual_ms = [int(expected_m_per_group * random.uniform(0.7, 1.3)) for _ in range(num_groups)]
-    aligned_ms = [align(actual_m, get_mk_alignment_for_contiguous_layout()) for actual_m in actual_ms]
+    actual_ms = [int(expected_m_per_group * random.uniform(0.7, 1.3))
+                 for _ in range(num_groups)]
+    aligned_ms = [align(actual_m, get_mk_alignment_for_contiguous_layout())
+                  for actual_m in actual_ms]
     m = sum(aligned_ms)
 
     a = torch.randn((m, k), device='cuda', dtype=torch.bfloat16) / (k ** 0.5)
-    up = torch.randn((num_groups, n, k), device='cuda', dtype=torch.bfloat16) / (k ** 0.5)
-    gate = torch.randn((num_groups, n, k), device='cuda', dtype=torch.bfloat16) / (k ** 0.5)
-    grouped_layout =  torch.empty(m, device='cuda', dtype=torch.int32)
+    up = torch.randn((num_groups, n, k), device='cuda',
+                     dtype=torch.bfloat16) / (k ** 0.5)
+    gate = torch.randn((num_groups, n, k), device='cuda',
+                       dtype=torch.bfloat16) / (k ** 0.5)
+    grouped_layout = torch.empty(m, device='cuda', dtype=torch.int32)
     d = torch.empty((m, n), device='cuda', dtype=torch.float8_e4m3fn)
-    scale_d = torch.empty((n // 128, m), device = 'cuda', dtype = torch.float32)
+    scale_d = torch.empty((n // 128, m), device='cuda', dtype=torch.float32)
     # ref_d = torch.randn((m, n), device='cuda', dtype=torch.bfloat16)
 
     start = 0
@@ -216,15 +236,21 @@ def generate_m_grouped_contiguous(num_groups: int, expected_m_per_group: int, n:
 
     # assert major_a.is_k_major()
     # a = cast_fp8_fp4_with_major(a, major_a, quant_config.gran_k_a, quant_config.is_fp4_a, use_ue8m0)
-    # b = grouped_cast_fp8_fp4_with_major(b, major_b, quant_config.gran_k_b, quant_config.is_fp4_b, use_ue8m0, use_block_cast_for_fp8=True)    
+    # b = grouped_cast_fp8_fp4_with_major(b, major_b, quant_config.gran_k_b, quant_config.is_fp4_b, use_ue8m0, use_block_cast_for_fp8=True)
     return a, up, gate, grouped_layout, d, scale_d, aligned_ms
 
+
 def generate_m_grouped_masked(num_groups: int, max_m: int, expected_m_per_group: int, n: int, k: int, use_bf16: bool = False,) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    a = torch.randn((num_groups * max_m, k), device='cuda', dtype=torch.bfloat16) / (k ** 0.5)
-    up = torch.randn((num_groups, n, k), device='cuda', dtype=torch.bfloat16) / (k ** 0.5)
-    gate = torch.randn((num_groups, n, k), device='cuda', dtype=torch.bfloat16) / (k ** 0.5)
-    d = torch.empty((num_groups * max_m, n), device='cuda', dtype=torch.float8_e4m3fn)
-    scale_d = torch.empty((n // 128, num_groups * max_m), device = 'cuda', dtype = torch.float32)
+    a = torch.randn((num_groups * max_m, k), device='cuda',
+                    dtype=torch.bfloat16) / (k ** 0.5)
+    up = torch.randn((num_groups, n, k), device='cuda',
+                     dtype=torch.bfloat16) / (k ** 0.5)
+    gate = torch.randn((num_groups, n, k), device='cuda',
+                       dtype=torch.bfloat16) / (k ** 0.5)
+    d = torch.empty((num_groups * max_m, n), device='cuda',
+                    dtype=torch.float8_e4m3fn)
+    scale_d = torch.empty((n // 128, num_groups * max_m),
+                          device='cuda', dtype=torch.float32)
     # ref_d = torch.einsum('gmk,gnk->gmn', a, b)
 
     masked_m = torch.empty((num_groups, ), device='cuda', dtype=torch.int)
@@ -237,7 +263,7 @@ def generate_m_grouped_masked(num_groups: int, max_m: int, expected_m_per_group:
 
     # quant_config = QuantConfig() if quant_config is None else quant_config
     # a = grouped_cast_fp8_fp4_with_major(a, MajorTypeAB.KMajor, quant_config.gran_k_a, quant_config.is_fp4_a, use_ue8m0)
-    # b = grouped_cast_fp8_fp4_with_major(b, MajorTypeAB.KMajor, quant_config.gran_k_b, quant_config.is_fp4_b, use_ue8m0, use_block_cast_for_fp8=True)    
+    # b = grouped_cast_fp8_fp4_with_major(b, MajorTypeAB.KMajor, quant_config.gran_k_b, quant_config.is_fp4_b, use_ue8m0, use_block_cast_for_fp8=True)
 
     return a, up, gate, masked_m, d, scale_d
 
@@ -250,11 +276,6 @@ def enumerate_grouped_gemms() -> Generator:
         for num_groups, expected_m_per_group in m_group_list:
             for n, k in n_k_list:
                 yield num_groups, expected_m_per_group, n, k, gemm_type
-
-
-
-
-
 
 
 # use these later

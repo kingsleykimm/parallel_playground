@@ -26,9 +26,11 @@ class CMakeBuild(build_ext):
 
         cmake_bin = os.environ.get("CMAKE") or shutil.which("cmake")
         if not cmake_bin:
-            raise RuntimeError("cmake not found. Set CMAKE=/path/to/cmake or add cmake to PATH.")
+            raise RuntimeError(
+                "cmake not found. Set CMAKE=/path/to/cmake or add cmake to PATH.")
 
-        cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_HOME_PATH") or "/usr/local/cuda"
+        cuda_home = os.environ.get("CUDA_HOME") or os.environ.get(
+            "CUDA_HOME_PATH") or "/usr/local/cuda"
 
         cmake_args = [
             f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={build_temp}",
@@ -48,8 +50,10 @@ class CMakeBuild(build_ext):
         if "CMAKE_BUILD_PARALLEL_LEVEL" not in os.environ:
             build_args += ["-j4"]
 
-        subprocess.run([cmake_bin, ext.sourcedir, *cmake_args], cwd=build_temp, check=True)
-        subprocess.run([cmake_bin, "--build", ".", *build_args], cwd=build_temp, check=True)
+        subprocess.run([cmake_bin, ext.sourcedir, *cmake_args],
+                       cwd=build_temp, check=True)
+        subprocess.run([cmake_bin, "--build", ".", *build_args],
+                       cwd=build_temp, check=True)
 
         built_files = glob.glob(str(build_temp / "moe_cuda*.so"))
         if not built_files:

@@ -1,8 +1,8 @@
 #pragma once
 
-#include <moe_cuda/kernels/common/sm90_utils.cuh>
-#include <moe_cuda/kernels/common/common.cuh>
 #include <moe_cuda/error.hpp>
+#include <moe_cuda/kernels/common/common.cuh>
+#include <moe_cuda/kernels/common/sm90_utils.cuh>
 
 #include <algorithm>
 #include <cuda_bf16.h>
@@ -313,16 +313,15 @@ inline void cast_(at::Tensor &inp, at::Tensor &out,
   if (dtype_of(inp) == c10::ScalarType::BFloat16 &&
       dtype_of(out) == c10::ScalarType::Float) {
     cast_bf16_to_f32(
-        reinterpret_cast<const __nv_bfloat16 *>(
-            inp.data_ptr<c10::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16 *>(inp.data_ptr<c10::BFloat16>()),
         out.data_ptr<float>(), nelem, grid, block, stream);
     CUDA_SYNC_DEBUG();
   } else if (dtype_of(inp) == c10::ScalarType::Float &&
              dtype_of(out) == c10::ScalarType::BFloat16) {
     cast_f32_to_bf16(
         inp.data_ptr<float>(),
-        reinterpret_cast<__nv_bfloat16 *>(out.data_ptr<c10::BFloat16>()),
-        nelem, grid, block, stream);
+        reinterpret_cast<__nv_bfloat16 *>(out.data_ptr<c10::BFloat16>()), nelem,
+        grid, block, stream);
     CUDA_SYNC_DEBUG();
   } else if (dtype_of(inp) == c10::ScalarType::BFloat16 &&
              dtype_of(out) == c10::ScalarType::Float8_e4m3fn) {
@@ -335,10 +334,8 @@ inline void cast_(at::Tensor &inp, at::Tensor &out,
       num_rows *= inp.size(i);
     }
     cast_bf16_to_fp8_blkscaled(
-        reinterpret_cast<const __nv_bfloat16 *>(
-            inp.data_ptr<c10::BFloat16>()),
-        reinterpret_cast<__nv_fp8_e4m3 *>(
-            out.data_ptr<c10::Float8_e4m3fn>()),
+        reinterpret_cast<const __nv_bfloat16 *>(inp.data_ptr<c10::BFloat16>()),
+        reinterpret_cast<__nv_fp8_e4m3 *>(out.data_ptr<c10::Float8_e4m3fn>()),
         scale->data_ptr<float>(), num_rows, inp.size(-1), stream);
     CUDA_SYNC_DEBUG();
   } else {

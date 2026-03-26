@@ -1,21 +1,23 @@
 #pragma once
 #include "a2a_kernels.h"
-#include <runtime/utils.h>
 #include <cooperative_groups.h>
 #include <cuda.h>
+#include <moe_cuda/dtype.h>
 #include <moe_cuda/kernels/common/common.cuh>
 #include <moe_cuda/kernels/common/launch_utils.cuh>
 #include <moe_cuda/kernels/common/sm90_utils.cuh>
-#include <moe_cuda/dtype.h>
+#include <runtime/utils.h>
 
-template <uint32_t kNumThreads, uint32_t NODE_SIZE, typename T, typename U, typename NumExpertsPerToken_t>
-__global__ void __launch_bounds__(kNumThreads, 1)
-    a2a_combine_recv_kernel(const size_t token_dim, size_t hidden_dim, size_t num_experts, size_t num_experts_per_token,
-                            size_t rank, size_t world_size, size_t num_tokens, const int32_t *bound_m_ptr,
-                            const int32_t *indices_ptr, const size_t indices_stride, const float *weights_ptr,
-                            const size_t weights_stride, U *out_tokens_ptr, size_t out_tokens_stride,
-                            uint8_t accumulate, std::byte *recv_buffer, uint32_t *token_offset,
-                            uint32_t *expert_offsets, uint32_t *sync_counter, uint32_t **sync_ptrs) {
+template <uint32_t kNumThreads, uint32_t NODE_SIZE, typename T, typename U,
+          typename NumExpertsPerToken_t>
+__global__ void __launch_bounds__(kNumThreads, 1) a2a_combine_recv_kernel(
+    const size_t token_dim, size_t hidden_dim, size_t num_experts,
+    size_t num_experts_per_token, size_t rank, size_t world_size,
+    size_t num_tokens, const int32_t *bound_m_ptr, const int32_t *indices_ptr,
+    const size_t indices_stride, const float *weights_ptr,
+    const size_t weights_stride, U *out_tokens_ptr, size_t out_tokens_stride,
+    uint8_t accumulate, std::byte *recv_buffer, uint32_t *token_offset,
+    uint32_t *expert_offsets, uint32_t *sync_counter, uint32_t **sync_ptrs) {
 
   extern __shared__ std::byte shared_memory[];
   auto grid = cooperative_groups::this_grid();
@@ -33,7 +35,8 @@ __global__ void __launch_bounds__(kNumThreads, 1)
       const uint32_t local_token = i / num_experts_per_token;
       const uint32_t token =
           blockIdx.x +
-          local_token * gridDim.x; // this is the actual coordinate, that corresponds to the dispatch kernel as well
+          local_token * gridDim.x; // this is the actual coordinate, that
+                                   // corresponds to the dispatch kernel as well
       const uint32_t route = i % num_experts_per_token;
 
       if (token >= num_send_tokens) {
@@ -44,7 +47,8 @@ __global__ void __launch_bounds__(kNumThreads, 1)
       const uint32_t local_slot = local_token * num_experts_per_token + route;
       const uint32_t expert = indices_ptr[token * indices_stride + route];
       const uint32_t offset = token_offset[global_slot];
-      const uint32_t position = (expert > 0 ? expert_offsets[expert - 1] : 0) + offset;
+      const uint32_t position =
+          (expert > 0 ? expert_offsets[expert - 1] : 0) + offset;
       positions[local_slot] = position;
       i += blockDim.x;
     }
@@ -66,7 +70,8 @@ __global__ void __launch_bounds__(kNumThreads, 1)
   __syncthreads();
 
   // accumulate across topk experts per token using grid strided loop
-  for (uint32_t token = blockIdx.x, local_token = 0; token < num_send_tokens; token += gridDim.x, local_token++) {
+  for (uint32_t token = blockIdx.x, local_token = 0; token < num_send_tokens;
+       token += gridDim.x, local_token++) {
     U *dst_ptr = out_tokens_ptr + token * out_tokens_stride;
     NumExpertsPerToken_t num_experts_per_token_bound(num_experts_per_token);
 
@@ -80,15 +85,18 @@ __global__ void __launch_bounds__(kNumThreads, 1)
     constexpr uint32_t VEC_SIZE = SrcTy::SIZE;
 
     if constexpr (std::is_same_v<NumExpertsPerToken_t, NotFixed>) {
-      for (unsigned j = threadIdx.x * DstTy::SIZE; j < hidden_dim; j += blockDim.x * DstTy::SIZE) {
+      for (unsigned j = threadIdx.x * DstTy::SIZE; j < hidden_dim;
+           j += blockDim.x * DstTy::SIZE) {
 
         // we load accumulators in float
-        uint4 acc = accumulate ? ld_global_nc_uint4((uint4 *)(dst_ptr + j)) : make_uint4(0, 0, 0, 0);
+        uint4 acc = accumulate ? ld_global_nc_uint4((uint4 *)(dst_ptr + j))
+                               : make_uint4(0, 0, 0, 0);
 
 #pragma unroll 8
         for (uint32_t k = 0; k < num_experts_per_token_bound; k++) {
           const float weight = weights_ptr[token * weights_stride + k];
-          const uint32_t position = positions[local_token * num_experts_per_token + k];
+          const uint32_t position =
+              positions[local_token * num_experts_per_token + k];
 
           T *buffer = (T *)(recv_buffer + position * token_dim);
           // this offsetse by position
@@ -125,8 +133,10 @@ __global__ void __launch_bounds__(kNumThreads, 1)
             acc_w_f.x += w_f.x * weight;
             acc_w_f.y += w_f.y * weight;
 
-            st_global_nc_uint4(make_uint4(pack_float_2(acc_x_f.x, acc_x_f.y), pack_float_2(acc_y_f.x, acc_y_f.y),
-                                          pack_float_2(acc_z_f.x, acc_z_f.y), pack_float_2(acc_w_f.x, acc_w_f.y)),
+            st_global_nc_uint4(make_uint4(pack_float_2(acc_x_f.x, acc_x_f.y),
+                                          pack_float_2(acc_y_f.x, acc_y_f.y),
+                                          pack_float_2(acc_z_f.x, acc_z_f.y),
+                                          pack_float_2(acc_w_f.x, acc_w_f.y)),
                                (uint4 *)(dst_ptr + j));
           }
 
@@ -180,13 +190,16 @@ __global__ void __launch_bounds__(kNumThreads, 1)
 
 #pragma unroll NUM_EXPERTS
       for (uint32_t k = 0; k < NUM_EXPERTS; k++) {
-        const uint32_t position = positions[local_token * num_experts_per_token + k];
+        const uint32_t position =
+            positions[local_token * num_experts_per_token + k];
         tokens[k] = (T *)(recv_buffer + position * token_dim);
         weights[k] = weights_ptr[token * weights_stride + k];
       }
 
-      for (uint32_t j = threadIdx.x * VEC_SIZE; j < hidden_dim; j += blockDim.x * VEC_SIZE) {
-        uint4 acc = accumulate ? ld_global_nc_uint4((uint4 *)(dst_ptr + j)) : make_uint4(0, 0, 0, 0);
+      for (uint32_t j = threadIdx.x * VEC_SIZE; j < hidden_dim;
+           j += blockDim.x * VEC_SIZE) {
+        uint4 acc = accumulate ? ld_global_nc_uint4((uint4 *)(dst_ptr + j))
+                               : make_uint4(0, 0, 0, 0);
 
         SrcTy srcs[NUM_EXPERTS];
 
@@ -222,8 +235,10 @@ __global__ void __launch_bounds__(kNumThreads, 1)
             acc_w_f.x += w_f.x * weights[k];
             acc_w_f.y += w_f.y * weights[k];
 
-            st_global_nc_uint4(make_uint4(pack_float_2(acc_x_f.x, acc_x_f.y), pack_float_2(acc_y_f.x, acc_y_f.y),
-                                          pack_float_2(acc_z_f.x, acc_z_f.y), pack_float_2(acc_w_f.x, acc_w_f.y)),
+            st_global_nc_uint4(make_uint4(pack_float_2(acc_x_f.x, acc_x_f.y),
+                                          pack_float_2(acc_y_f.x, acc_y_f.y),
+                                          pack_float_2(acc_z_f.x, acc_z_f.y),
+                                          pack_float_2(acc_w_f.x, acc_w_f.y)),
                                (uint4 *)(dst_ptr + j));
           }
 
@@ -289,14 +304,16 @@ __global__ void __launch_bounds__(kNumThreads, 1)
   }
 }
 
-cudaError_t a2a_kernels::a2a_combine_recv(size_t num_blocks, size_t hidden_dim, size_t x_elemsize, c10::ScalarType in_dtype,
-                                          c10::ScalarType out_dtype, size_t num_experts, size_t num_experts_per_token,
-                                          size_t rank, size_t node_size, size_t world_size, size_t num_tokens,
-                                          int32_t *bound_m_ptr, int32_t *indices_ptr, size_t indices_stride,
-                                          float *weights_ptr, size_t weights_stride, uint8_t *out_tokens_ptr,
-                                          size_t out_tokens_stride, bool accumulate, uint8_t *recv_buffer,
-                                          uint32_t *token_offset, uint32_t *expert_offsets, uint32_t *sync_counter,
-                                          uint32_t **sync_ptrs, cudaStream_t stream) {
+cudaError_t a2a_kernels::a2a_combine_recv(
+    size_t num_blocks, size_t hidden_dim, size_t x_elemsize,
+    c10::ScalarType in_dtype, c10::ScalarType out_dtype, size_t num_experts,
+    size_t num_experts_per_token, size_t rank, size_t node_size,
+    size_t world_size, size_t num_tokens, int32_t *bound_m_ptr,
+    int32_t *indices_ptr, size_t indices_stride, float *weights_ptr,
+    size_t weights_stride, uint8_t *out_tokens_ptr, size_t out_tokens_stride,
+    bool accumulate, uint8_t *recv_buffer, uint32_t *token_offset,
+    uint32_t *expert_offsets, uint32_t *sync_counter, uint32_t **sync_ptrs,
+    cudaStream_t stream) {
   constexpr size_t kNumThreads = 512;
   dim3 dimGrid(num_blocks, 1, 1);
   dim3 dimBlock(kNumThreads, 1, 1);
@@ -327,18 +344,21 @@ cudaError_t a2a_kernels::a2a_combine_recv(size_t num_blocks, size_t hidden_dim, 
       &sync_ptrs,
   };
 
-  const size_t shared_memory = tokens_per_block * num_experts_per_token * sizeof(uint32_t);
+  const size_t shared_memory =
+      tokens_per_block * num_experts_per_token * sizeof(uint32_t);
 
   cudaError_t status;
   nvtxRangePush("combine_recv");
   LAUNCH_WORLD_SIZE(node_size, NODE_SIZE, {
     LAUNCH_ACT_TYPE(in_dtype, InTy, {
       LAUNCH_ACT_TYPE(out_dtype, OutTy, {
-        LAUNCH_NUM_EXPERTS_PER_TOKEN(num_experts_per_token, NumExpertsPerToken_t, {
-          status = cudaLaunchCooperativeKernel(
-              (void *)&a2a_combine_recv_kernel<kNumThreads, NODE_SIZE, InTy, OutTy, NumExpertsPerToken_t>, dimGrid,
-              dimBlock, args, shared_memory, stream);
-        });
+        LAUNCH_NUM_EXPERTS_PER_TOKEN(
+            num_experts_per_token, NumExpertsPerToken_t, {
+              status = cudaLaunchCooperativeKernel(
+                  (void *)&a2a_combine_recv_kernel<kNumThreads, NODE_SIZE, InTy,
+                                                   OutTy, NumExpertsPerToken_t>,
+                  dimGrid, dimBlock, args, shared_memory, stream);
+            });
       });
     });
   });

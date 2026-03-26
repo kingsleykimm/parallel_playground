@@ -634,9 +634,16 @@ extern "C" void tk_build_kernel4_globals(
 // ============== kernel5 factory (kernel5::globals) ======= /
 
 #include <moe_cuda/kernels/kernel5.cuh>
-static constexpr int G_M = 128;
-static constexpr int G_I = 256;
-static constexpr int G_H = 128;
+// IMPORTANT: These constants determine TMA descriptor tile sizes baked into the
+// globals struct. They MUST match the values the JIT kernel is instantiated with,
+// otherwise TMA loads will transfer the wrong number of bytes and mbarrier waits
+// will hang. Constants that affect TMA descriptors:
+//   G_H  → token_vec_tile = sv_fp8e4m3<H>  (used in in_tokens, expert_x_tokens)
+//   G_BN → c_tile = st<fp8e4m3, 64, BN>    (used in c_layout)
+// Constants that only affect static constexprs (not struct layout or TMA): G_M, G_I
+static constexpr int G_M = 1024;
+static constexpr int G_I = 2048;
+static constexpr int G_H = 2048;
 static constexpr int G_BM = 64;
 static constexpr int G_BN = 128;
 static constexpr int G_NUM_CONSUMER_WARPS = 8;

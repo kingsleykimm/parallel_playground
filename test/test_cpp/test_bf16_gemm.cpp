@@ -29,11 +29,11 @@
 #include <torch/torch.h>
 
 #include "test_utils.h"
-#include <kernels/internal_api.hpp>
 #include <jit/compiler.hpp>
+#include <kernels/internal_api.hpp>
 #include <moe_cuda/dtype.h>
-#include <runtime/tensor.h>
 #include <moe_cuda/types.h>
+#include <runtime/tensor.h>
 #include <runtime/utils.h>
 
 using test_utils::check_tensor_close;
@@ -93,7 +93,8 @@ static const std::vector<TestShape> contiguous_shapes = {
     {768, 256, 128, 4, "4 groups small ragged total_M=768"},
 };
 
-// Grouped masked GEMM shapes (MoE with fixed-size masked layout for CUDA graphs)
+// Grouped masked GEMM shapes (MoE with fixed-size masked layout for CUDA
+// graphs)
 static const std::vector<TestShape> masked_shapes = {
     {256, 512, 256, 4, "4 groups masked (256x512x256)"},
     {256, 512, 256, 8, "8 groups masked (256x512x256)"},
@@ -117,7 +118,7 @@ struct TestConfig {
   bool verbose = false;
   float atol = 1e-2f; // BF16 precision
   float rtol = 1e-2f;
-  bool test_fp32_output = true;  // also test FP32 output path
+  bool test_fp32_output = true; // also test FP32 output path
 };
 
 // ============================================================================
@@ -126,10 +127,13 @@ struct TestConfig {
 
 void print_usage(const char *program_name) {
   std::cout << "BF16 GEMM Testing Harness for sm90_bf16_gemm kernels\n\n";
-  std::cout << "Usage: " << program_name << " --type <normal|batched|contiguous|masked> [options]\n\n";
+  std::cout << "Usage: " << program_name
+            << " --type <normal|batched|contiguous|masked> [options]\n\n";
   std::cout << "Options:\n";
-  std::cout << "  --type <type>     Test type: normal, batched, contiguous, or masked (required)\n";
-  std::cout << "  --m <M>           M dimension (default: run all default shapes)\n";
+  std::cout << "  --type <type>     Test type: normal, batched, contiguous, or "
+               "masked (required)\n";
+  std::cout
+      << "  --m <M>           M dimension (default: run all default shapes)\n";
   std::cout << "  --n <N>           N dimension\n";
   std::cout << "  --k <K>           K dimension\n";
   std::cout << "  --groups <G>      Number of groups/batches (default: 1)\n";
@@ -139,10 +143,14 @@ void print_usage(const char *program_name) {
   std::cout << "  --help            Show this help message\n\n";
   std::cout << "Examples:\n";
   std::cout << "  " << program_name << " --type normal\n";
-  std::cout << "  " << program_name << " --type normal --m 512 --n 1024 --k 256\n";
-  std::cout << "  " << program_name << " --type batched --m 256 --n 512 --k 128 --groups 4\n";
-  std::cout << "  " << program_name << " --type contiguous --m 2048 --n 512 --k 256 --groups 8\n";
-  std::cout << "  " << program_name << " --type masked --m 256 --n 512 --k 128 --groups 4\n";
+  std::cout << "  " << program_name
+            << " --type normal --m 512 --n 1024 --k 256\n";
+  std::cout << "  " << program_name
+            << " --type batched --m 256 --n 512 --k 128 --groups 4\n";
+  std::cout << "  " << program_name
+            << " --type contiguous --m 2048 --n 512 --k 256 --groups 8\n";
+  std::cout << "  " << program_name
+            << " --type masked --m 256 --n 512 --k 128 --groups 4\n";
 }
 
 bool parse_args(int argc, char **argv, TestConfig &config) {
@@ -165,7 +173,8 @@ bool parse_args(int argc, char **argv, TestConfig &config) {
       } else if (type_str == "masked") {
         config.gemm_type = GemmType::MGroupedMasked;
       } else {
-        std::cerr << "Error: Invalid type '" << type_str << "'. Use normal, batched, contiguous, or masked.\n";
+        std::cerr << "Error: Invalid type '" << type_str
+                  << "'. Use normal, batched, contiguous, or masked.\n";
         return false;
       }
       type_specified = true;
@@ -228,18 +237,23 @@ const char *gemm_type_to_string(GemmType type) {
 // Test functions for each GEMM type
 // ============================================================================
 
-bool test_bf16_normal(int64_t M, int64_t N, int64_t K, float atol, float rtol, bool verbose,
-                      c10::ScalarType output_dtype = c10::ScalarType::BFloat16) {
-  const char *dtype_str = (output_dtype == c10::ScalarType::Float) ? "FP32" : "BF16";
-  std::cout << "\n=== Testing BF16 Normal GEMM (output=" << dtype_str << "): M=" << M << ", N=" << N << ", K=" << K
-            << " ===\n";
+bool test_bf16_normal(
+    int64_t M, int64_t N, int64_t K, float atol, float rtol, bool verbose,
+    c10::ScalarType output_dtype = c10::ScalarType::BFloat16) {
+  const char *dtype_str =
+      (output_dtype == c10::ScalarType::Float) ? "FP32" : "BF16";
+  std::cout << "\n=== Testing BF16 Normal GEMM (output=" << dtype_str
+            << "): M=" << M << ", N=" << N << ", K=" << K << " ===\n";
 
   try {
     torch::Device device = torch::kCUDA;
-    torch::TensorOptions bf16_options = torch::TensorOptions().dtype(torch::kBFloat16).device(device);
+    torch::TensorOptions bf16_options =
+        torch::TensorOptions().dtype(torch::kBFloat16).device(device);
     bool fp32_output = (output_dtype == c10::ScalarType::Float);
     torch::TensorOptions d_options =
-        fp32_output ? torch::TensorOptions().dtype(torch::kFloat32).device(device) : bf16_options;
+        fp32_output
+            ? torch::TensorOptions().dtype(torch::kFloat32).device(device)
+            : bf16_options;
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
 
@@ -252,8 +266,10 @@ bool test_bf16_normal(int64_t M, int64_t N, int64_t K, float atol, float rtol, b
       reference = reference.to(torch::kFloat32);
 
     if (verbose) {
-      std::cout << "A_bf16 shape: " << shape_to_string(A_bf16.sizes().vec()) << "\n";
-      std::cout << "B_bf16 shape: " << shape_to_string(B_bf16.sizes().vec()) << "\n";
+      std::cout << "A_bf16 shape: " << shape_to_string(A_bf16.sizes().vec())
+                << "\n";
+      std::cout << "B_bf16 shape: " << shape_to_string(B_bf16.sizes().vec())
+                << "\n";
     }
 
     at::Tensor A_custom = (A_bf16);
@@ -268,14 +284,18 @@ bool test_bf16_normal(int64_t M, int64_t N, int64_t K, float atol, float rtol, b
     std::string compiled_dims = "";
 
     auto start = std::chrono::high_resolution_clock::now();
-    moe_cuda::kernels::bf16_gemm(A_custom, B_custom, C_opt, D_custom, type, compiled_dims, nullptr, stream);
+    moe_cuda::kernels::bf16_gemm(A_custom, B_custom, C_opt, D_custom, type,
+                                 compiled_dims, nullptr, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    auto duration =
+        std::chrono::duration_cast<std::chrono::microseconds>(end - start);
     std::cout << "Kernel execution time: " << duration.count() << " us\n";
 
-    bool passed = fp32_output ? check_tensor_close<float>(reference, D_custom, atol, rtol)
-                              : check_tensor_close<__nv_bfloat16>(reference, D_custom, atol, rtol);
+    bool passed =
+        fp32_output ? check_tensor_close<float>(reference, D_custom, atol, rtol)
+                    : check_tensor_close<__nv_bfloat16>(reference, D_custom,
+                                                        atol, rtol);
 
     CUDA_CHECK(cudaStreamDestroy(stream));
     return passed;
@@ -286,32 +306,42 @@ bool test_bf16_normal(int64_t M, int64_t N, int64_t K, float atol, float rtol, b
   }
 }
 
-bool test_bf16_batched(int64_t M, int64_t N, int64_t K, int num_groups, float atol, float rtol, bool verbose,
-                       c10::ScalarType output_dtype = c10::ScalarType::BFloat16) {
-  const char *dtype_str = (output_dtype == c10::ScalarType::Float) ? "FP32" : "BF16";
-  std::cout << "\n=== Testing BF16 Batched GEMM (output=" << dtype_str << "): M=" << M << ", N=" << N << ", K=" << K
+bool test_bf16_batched(
+    int64_t M, int64_t N, int64_t K, int num_groups, float atol, float rtol,
+    bool verbose, c10::ScalarType output_dtype = c10::ScalarType::BFloat16) {
+  const char *dtype_str =
+      (output_dtype == c10::ScalarType::Float) ? "FP32" : "BF16";
+  std::cout << "\n=== Testing BF16 Batched GEMM (output=" << dtype_str
+            << "): M=" << M << ", N=" << N << ", K=" << K
             << ", Batches=" << num_groups << " ===\n";
 
   try {
     torch::Device device = torch::kCUDA;
-    torch::TensorOptions bf16_options = torch::TensorOptions().dtype(torch::kBFloat16).device(device);
+    torch::TensorOptions bf16_options =
+        torch::TensorOptions().dtype(torch::kBFloat16).device(device);
     bool fp32_output = (output_dtype == c10::ScalarType::Float);
     torch::TensorOptions d_options =
-        fp32_output ? torch::TensorOptions().dtype(torch::kFloat32).device(device) : bf16_options;
+        fp32_output
+            ? torch::TensorOptions().dtype(torch::kFloat32).device(device)
+            : bf16_options;
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
 
     float init_scale = 1.0f / sqrt(K);
-    torch::Tensor A_bf16 = torch::randn({num_groups, M, K}, bf16_options) * init_scale;
-    torch::Tensor B_bf16 = torch::randn({num_groups, N, K}, bf16_options) * init_scale;
+    torch::Tensor A_bf16 =
+        torch::randn({num_groups, M, K}, bf16_options) * init_scale;
+    torch::Tensor B_bf16 =
+        torch::randn({num_groups, N, K}, bf16_options) * init_scale;
 
     torch::Tensor reference = torch::einsum("gmk,gnk->gmn", {A_bf16, B_bf16});
     if (fp32_output)
       reference = reference.to(torch::kFloat32);
 
     if (verbose) {
-      std::cout << "A_bf16 shape: " << shape_to_string(A_bf16.sizes().vec()) << "\n";
-      std::cout << "B_bf16 shape: " << shape_to_string(B_bf16.sizes().vec()) << "\n";
+      std::cout << "A_bf16 shape: " << shape_to_string(A_bf16.sizes().vec())
+                << "\n";
+      std::cout << "B_bf16 shape: " << shape_to_string(B_bf16.sizes().vec())
+                << "\n";
     }
 
     at::Tensor A_custom = (A_bf16);
@@ -326,14 +356,18 @@ bool test_bf16_batched(int64_t M, int64_t N, int64_t K, int num_groups, float at
     std::string compiled_dims = "";
 
     auto start = std::chrono::high_resolution_clock::now();
-    moe_cuda::kernels::bf16_gemm(A_custom, B_custom, C_opt, D_custom, type, compiled_dims, nullptr, stream);
+    moe_cuda::kernels::bf16_gemm(A_custom, B_custom, C_opt, D_custom, type,
+                                 compiled_dims, nullptr, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    auto duration =
+        std::chrono::duration_cast<std::chrono::microseconds>(end - start);
     std::cout << "Kernel execution time: " << duration.count() << " us\n";
 
-    bool passed = fp32_output ? check_tensor_close<float>(reference, D_custom, atol, rtol)
-                              : check_tensor_close<__nv_bfloat16>(reference, D_custom, atol, rtol);
+    bool passed =
+        fp32_output ? check_tensor_close<float>(reference, D_custom, atol, rtol)
+                    : check_tensor_close<__nv_bfloat16>(reference, D_custom,
+                                                        atol, rtol);
 
     CUDA_CHECK(cudaStreamDestroy(stream));
     return passed;
@@ -344,18 +378,24 @@ bool test_bf16_batched(int64_t M, int64_t N, int64_t K, int num_groups, float at
   }
 }
 
-bool test_bf16_grouped_contiguous(int64_t M, int64_t N, int64_t K, int num_groups, float atol, float rtol, bool verbose,
-                                  c10::ScalarType output_dtype = c10::ScalarType::BFloat16) {
-  const char *dtype_str = (output_dtype == c10::ScalarType::Float) ? "FP32" : "BF16";
-  std::cout << "\n=== Testing BF16 Grouped Contiguous GEMM (output=" << dtype_str << "): M=" << M << ", N=" << N
-            << ", K=" << K << ", Groups=" << num_groups << " ===\n";
+bool test_bf16_grouped_contiguous(
+    int64_t M, int64_t N, int64_t K, int num_groups, float atol, float rtol,
+    bool verbose, c10::ScalarType output_dtype = c10::ScalarType::BFloat16) {
+  const char *dtype_str =
+      (output_dtype == c10::ScalarType::Float) ? "FP32" : "BF16";
+  std::cout << "\n=== Testing BF16 Grouped Contiguous GEMM (output="
+            << dtype_str << "): M=" << M << ", N=" << N << ", K=" << K
+            << ", Groups=" << num_groups << " ===\n";
 
   try {
     torch::Device device = torch::kCUDA;
-    torch::TensorOptions bf16_options = torch::TensorOptions().dtype(torch::kBFloat16).device(device);
+    torch::TensorOptions bf16_options =
+        torch::TensorOptions().dtype(torch::kBFloat16).device(device);
     bool fp32_output = (output_dtype == c10::ScalarType::Float);
     torch::TensorOptions d_options =
-        fp32_output ? torch::TensorOptions().dtype(torch::kFloat32).device(device) : bf16_options;
+        fp32_output
+            ? torch::TensorOptions().dtype(torch::kFloat32).device(device)
+            : bf16_options;
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
 
@@ -363,14 +403,17 @@ bool test_bf16_grouped_contiguous(int64_t M, int64_t N, int64_t K, int num_group
 
     float init_scale = 1.0f / sqrt(K);
     int total_M;
-    auto tup = test_utils::generate_contiguous_grouped_layout(total_M, num_groups, per_group_M, device);
+    auto tup = test_utils::generate_contiguous_grouped_layout(
+        total_M, num_groups, per_group_M, device);
 
     torch::Tensor grouped_layout_tensor = std::get<0>(tup);
     std::vector<size_t> actual_ms = std::get<1>(tup);
     std::vector<size_t> aligned_ms = std::get<2>(tup);
 
-    torch::Tensor A_bf16 = torch::randn({total_M, K}, bf16_options) * init_scale;
-    torch::Tensor B_bf16 = torch::randn({num_groups, N, K}, bf16_options) * init_scale;
+    torch::Tensor A_bf16 =
+        torch::randn({total_M, K}, bf16_options) * init_scale;
+    torch::Tensor B_bf16 =
+        torch::randn({num_groups, N, K}, bf16_options) * init_scale;
 
     torch::Tensor reference = torch::zeros({total_M, N}, bf16_options);
     torch::Tensor layout_cpu = grouped_layout_tensor.cpu();
@@ -378,10 +421,13 @@ bool test_bf16_grouped_contiguous(int64_t M, int64_t N, int64_t K, int num_group
 
     int row_start = 0;
     for (int g = 0; g < num_groups; g++) {
-      auto valid_slice = A_bf16.index({torch::indexing::Slice(row_start, row_start + aligned_ms[g])});
+      auto valid_slice = A_bf16.index(
+          {torch::indexing::Slice(row_start, row_start + aligned_ms[g])});
       auto group_slice = B_bf16[g];
       auto ref_slice = torch::mm(valid_slice, group_slice.t());
-      reference.index_put_({torch::indexing::Slice(row_start, row_start + aligned_ms[g])}, ref_slice);
+      reference.index_put_(
+          {torch::indexing::Slice(row_start, row_start + aligned_ms[g])},
+          ref_slice);
       row_start += aligned_ms[g];
     }
 
@@ -389,8 +435,10 @@ bool test_bf16_grouped_contiguous(int64_t M, int64_t N, int64_t K, int num_group
       reference = reference.to(torch::kFloat32);
 
     if (verbose) {
-      std::cout << "A_bf16 shape: " << shape_to_string(A_bf16.sizes().vec()) << "\n";
-      std::cout << "B_bf16 shape: " << shape_to_string(B_bf16.sizes().vec()) << "\n";
+      std::cout << "A_bf16 shape: " << shape_to_string(A_bf16.sizes().vec())
+                << "\n";
+      std::cout << "B_bf16 shape: " << shape_to_string(B_bf16.sizes().vec())
+                << "\n";
       std::cout << "Total M: " << total_M << "\n";
     }
 
@@ -408,10 +456,12 @@ bool test_bf16_grouped_contiguous(int64_t M, int64_t N, int64_t K, int num_group
     std::string compiled_dims = "";
 
     auto start = std::chrono::high_resolution_clock::now();
-    moe_cuda::kernels::bf16_gemm(A_custom, B_custom, C_opt, D_custom, type, compiled_dims, grouped_layout, stream);
+    moe_cuda::kernels::bf16_gemm(A_custom, B_custom, C_opt, D_custom, type,
+                                 compiled_dims, grouped_layout, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    auto duration =
+        std::chrono::duration_cast<std::chrono::microseconds>(end - start);
     std::cout << "Kernel execution time: " << duration.count() << " us\n";
 
     std::vector<torch::Tensor> ref_list;
@@ -419,8 +469,10 @@ bool test_bf16_grouped_contiguous(int64_t M, int64_t N, int64_t K, int num_group
     row_start = 0;
     for (int g = 0; g < num_groups; g++) {
       uint32_t num_rows = actual_ms[g];
-      auto ref_group = reference.index({torch::indexing::Slice(row_start, row_start + num_rows)});
-      auto out_group = D_torch.index({torch::indexing::Slice(row_start, row_start + num_rows)});
+      auto ref_group = reference.index(
+          {torch::indexing::Slice(row_start, row_start + num_rows)});
+      auto out_group = D_torch.index(
+          {torch::indexing::Slice(row_start, row_start + num_rows)});
       ref_list.push_back(ref_group);
       D_list.push_back(out_group);
       row_start += aligned_ms[g];
@@ -441,28 +493,37 @@ bool test_bf16_grouped_contiguous(int64_t M, int64_t N, int64_t K, int num_group
   }
 }
 
-bool test_bf16_grouped_masked(int64_t M, int64_t N, int64_t K, int num_groups, float atol, float rtol, bool verbose,
-                              c10::ScalarType output_dtype = c10::ScalarType::BFloat16) {
-  const char *dtype_str = (output_dtype == c10::ScalarType::Float) ? "FP32" : "BF16";
-  std::cout << "\n=== Testing BF16 Grouped Masked GEMM (output=" << dtype_str << "): M=" << M << ", N=" << N
-            << ", K=" << K << ", Groups=" << num_groups << " ===\n";
+bool test_bf16_grouped_masked(
+    int64_t M, int64_t N, int64_t K, int num_groups, float atol, float rtol,
+    bool verbose, c10::ScalarType output_dtype = c10::ScalarType::BFloat16) {
+  const char *dtype_str =
+      (output_dtype == c10::ScalarType::Float) ? "FP32" : "BF16";
+  std::cout << "\n=== Testing BF16 Grouped Masked GEMM (output=" << dtype_str
+            << "): M=" << M << ", N=" << N << ", K=" << K
+            << ", Groups=" << num_groups << " ===\n";
 
   try {
     torch::Device device = torch::kCUDA;
-    torch::TensorOptions bf16_options = torch::TensorOptions().dtype(torch::kBFloat16).device(device);
+    torch::TensorOptions bf16_options =
+        torch::TensorOptions().dtype(torch::kBFloat16).device(device);
     bool fp32_output = (output_dtype == c10::ScalarType::Float);
     torch::TensorOptions d_options =
-        fp32_output ? torch::TensorOptions().dtype(torch::kFloat32).device(device) : bf16_options;
+        fp32_output
+            ? torch::TensorOptions().dtype(torch::kFloat32).device(device)
+            : bf16_options;
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
 
     int64_t max_M = M;
 
     float init_scale = 1.0f / sqrt(K);
-    torch::Tensor A_bf16 = torch::randn({num_groups, max_M, K}, bf16_options) * init_scale;
-    torch::Tensor B_bf16 = torch::randn({num_groups, N, K}, bf16_options) * init_scale;
+    torch::Tensor A_bf16 =
+        torch::randn({num_groups, max_M, K}, bf16_options) * init_scale;
+    torch::Tensor B_bf16 =
+        torch::randn({num_groups, N, K}, bf16_options) * init_scale;
 
-    torch::Tensor grouped_layout_tensor = test_utils::generate_masked_grouped_layout(max_M, num_groups, device);
+    torch::Tensor grouped_layout_tensor =
+        test_utils::generate_masked_grouped_layout(max_M, num_groups, device);
     auto grouped_layout_cpu_tensor = grouped_layout_tensor.cpu();
     int *grouped_layout = grouped_layout_tensor.data_ptr<int>();
     auto layout_acc = grouped_layout_cpu_tensor.accessor<int32_t, 1>();
@@ -472,9 +533,12 @@ bool test_bf16_grouped_masked(int64_t M, int64_t N, int64_t K, int num_groups, f
       reference = reference.to(torch::kFloat32);
 
     if (verbose) {
-      std::cout << "A_bf16 shape: " << shape_to_string(A_bf16.sizes().vec()) << "\n";
-      std::cout << "B_bf16 shape: " << shape_to_string(B_bf16.sizes().vec()) << "\n";
-      std::cout << "grouped_layout shape: " << shape_to_string(grouped_layout_tensor.sizes().vec()) << "\n";
+      std::cout << "A_bf16 shape: " << shape_to_string(A_bf16.sizes().vec())
+                << "\n";
+      std::cout << "B_bf16 shape: " << shape_to_string(B_bf16.sizes().vec())
+                << "\n";
+      std::cout << "grouped_layout shape: "
+                << shape_to_string(grouped_layout_tensor.sizes().vec()) << "\n";
     }
 
     at::Tensor A_custom = (A_bf16);
@@ -488,21 +552,23 @@ bool test_bf16_grouped_masked(int64_t M, int64_t N, int64_t K, int num_groups, f
     GemmType type = GemmType::MGroupedMasked;
     std::string compiled_dims = "";
 
-    
     auto start = std::chrono::high_resolution_clock::now();
-    moe_cuda::kernels::bf16_gemm(A_custom, B_custom, C_opt, D_custom, type, compiled_dims, grouped_layout, stream);
+    moe_cuda::kernels::bf16_gemm(A_custom, B_custom, C_opt, D_custom, type,
+                                 compiled_dims, grouped_layout, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    auto duration =
+        std::chrono::duration_cast<std::chrono::microseconds>(end - start);
     std::cout << "Kernel execution time: " << duration.count() << " us\n";
-    
+
     test_utils::inspect_tensor(D_custom, 10);
     test_utils::inspect_tensor(reference, 10);
     std::vector<torch::Tensor> ref_list;
     std::vector<torch::Tensor> D_list;
     for (int g = 0; g < num_groups; g++) {
       uint32_t num_rows = layout_acc[g];
-      auto ref_group = reference.index({g, torch::indexing::Slice(0, num_rows)});
+      auto ref_group =
+          reference.index({g, torch::indexing::Slice(0, num_rows)});
       auto out_group = D_torch.index({g, torch::indexing::Slice(0, num_rows)});
       ref_list.push_back(ref_group);
       D_list.push_back(out_group);
@@ -512,14 +578,18 @@ bool test_bf16_grouped_masked(int64_t M, int64_t N, int64_t K, int num_groups, f
     auto out = torch::cat(D_list, 0);
 
     if (verbose) {
-      std::cout << "Final ref shape: " << shape_to_string(ref.sizes().vec()) << "\n";
-      std::cout << "Final out shape: " << shape_to_string(out.sizes().vec()) << "\n";
+      std::cout << "Final ref shape: " << shape_to_string(ref.sizes().vec())
+                << "\n";
+      std::cout << "Final out shape: " << shape_to_string(out.sizes().vec())
+                << "\n";
     }
 
     at::Tensor out_custom = (out);
 
-    bool passed = fp32_output ? check_tensor_close<float>(ref, out_custom, atol, rtol)
-                              : check_tensor_close<__nv_bfloat16>(ref, out_custom, atol, rtol);
+    bool passed =
+        fp32_output
+            ? check_tensor_close<float>(ref, out_custom, atol, rtol)
+            : check_tensor_close<__nv_bfloat16>(ref, out_custom, atol, rtol);
 
     CUDA_CHECK(cudaStreamDestroy(stream));
     return passed;
@@ -552,26 +622,31 @@ int main(int argc, char **argv) {
   std::cout << "============================================\n";
 
   int passed = 0, failed = 0;
-  Compiler::init_static_vars(get_env<std::string>("LIBRARY_ROOT_PATH", ""), get_env<std::string>("CUDA_HOME_PATH"));
+  Compiler::init_static_vars(get_env<std::string>("LIBRARY_ROOT_PATH", ""),
+                             get_env<std::string>("CUDA_HOME_PATH"));
 
   auto run_test = [&](const TestShape &shape, c10::ScalarType output_dtype) {
     bool result = false;
 
     switch (config.gemm_type) {
     case GemmType::Normal:
-      result = test_bf16_normal(shape.M, shape.N, shape.K, config.atol, config.rtol, config.verbose, output_dtype);
+      result = test_bf16_normal(shape.M, shape.N, shape.K, config.atol,
+                                config.rtol, config.verbose, output_dtype);
       break;
     case GemmType::Batched:
-      result = test_bf16_batched(shape.M, shape.N, shape.K, shape.num_groups, config.atol, config.rtol, config.verbose,
+      result = test_bf16_batched(shape.M, shape.N, shape.K, shape.num_groups,
+                                 config.atol, config.rtol, config.verbose,
                                  output_dtype);
       break;
     case GemmType::MGroupedContiguous:
-      result = test_bf16_grouped_contiguous(shape.M, shape.N, shape.K, shape.num_groups, config.atol, config.rtol,
-                                            config.verbose, output_dtype);
+      result = test_bf16_grouped_contiguous(
+          shape.M, shape.N, shape.K, shape.num_groups, config.atol, config.rtol,
+          config.verbose, output_dtype);
       break;
     case GemmType::MGroupedMasked:
-      result = test_bf16_grouped_masked(shape.M, shape.N, shape.K, shape.num_groups, config.atol, config.rtol,
-                                        config.verbose, output_dtype);
+      result = test_bf16_grouped_masked(
+          shape.M, shape.N, shape.K, shape.num_groups, config.atol, config.rtol,
+          config.verbose, output_dtype);
       break;
     }
 
@@ -607,7 +682,8 @@ int main(int argc, char **argv) {
       }
     }
   } else {
-    TestShape shape = {config.M, config.N, config.K, config.num_groups, "Custom shape"};
+    TestShape shape = {config.M, config.N, config.K, config.num_groups,
+                       "Custom shape"};
     run_test(shape, c10::ScalarType::BFloat16);
     if (config.test_fp32_output) {
       run_test(shape, c10::ScalarType::Float);
