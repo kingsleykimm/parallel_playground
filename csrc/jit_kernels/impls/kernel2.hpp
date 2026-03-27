@@ -1,5 +1,5 @@
 #pragma once
-#include "c10/core/ScalarType.h"
+#include <torch/headeronly/core/ScalarType.h>
 #include "jit_kernels/heuristics/heuristics.hpp"
 #include "moe_cuda/types.h"
 #include <algorithm>
@@ -14,6 +14,8 @@
 #include <jit_kernels/tk_globals_factory.h>
 #include <runtime/device.hpp>
 #include <runtime/format.hpp>
+#include <torch/csrc/stable/tensor.h>
+
 
 namespace {
 
@@ -99,7 +101,7 @@ public:
     int num_stages;
     int smem_size;
     int gemm_type; // 0 = MGroupedMasked, 1 = MGroupedContiguous
-    at::ScalarType c_dtype;
+    c10::ScalarType c_dtype;
     LaunchConfig launch_config;
   };
 
@@ -178,13 +180,13 @@ static void __instantiate_kernel() {{
 //   scale_b:    (num_groups * N/128, K/128)
 //   grouped_layout: (total_M,) int32 device array — group index per token row
 //   D:          (total_M, N)
-inline void sm90_fp8_grouped_gemm_contiguous(at::Tensor &A, at::Tensor &B,
-                                             at::Tensor &scale_a,
-                                             at::Tensor &scale_b, at::Tensor &D,
+inline void sm90_fp8_grouped_gemm_contiguous(torch::stable::Tensor &A, torch::stable::Tensor &B,
+                                             torch::stable::Tensor &scale_a,
+                                             torch::stable::Tensor &scale_b, torch::stable::Tensor &D,
                                              int *grouped_layout,
                                              cudaStream_t &stream) {
-  HOST_ASSERT(D.scalar_type() == at::ScalarType::BFloat16 ||
-                  D.scalar_type() == at::ScalarType::Float,
+  HOST_ASSERT(D.scalar_type() == c10::ScalarType::BFloat16 ||
+                  D.scalar_type() == c10::ScalarType::Float,
               "unsupported output dtype");
 
   uint32_t total_M = A.size(0);
@@ -258,13 +260,13 @@ inline void sm90_fp8_grouped_gemm_contiguous(at::Tensor &A, at::Tensor &B,
 //   scale_b:    (num_groups * N/128, K/128)
 //   grouped_layout: (num_groups,) int32 device array — actual M per group
 //   D:          (num_groups, max_M,  N)
-inline void sm90_fp8_grouped_gemm_masked(at::Tensor &A, at::Tensor &B,
-                                         at::Tensor &scale_a,
-                                         at::Tensor &scale_b, at::Tensor &D,
+inline void sm90_fp8_grouped_gemm_masked(torch::stable::Tensor &A, torch::stable::Tensor &B,
+                                         torch::stable::Tensor &scale_a,
+                                         torch::stable::Tensor &scale_b, torch::stable::Tensor &D,
                                          int *grouped_layout,
                                          cudaStream_t &stream) {
-  HOST_ASSERT(D.scalar_type() == at::ScalarType::BFloat16 ||
-                  D.scalar_type() == at::ScalarType::Float,
+  HOST_ASSERT(D.scalar_type() == c10::ScalarType::BFloat16 ||
+                  D.scalar_type() == c10::ScalarType::Float,
               "unsupported output dtype");
 
   uint32_t num_groups = B.size(0);

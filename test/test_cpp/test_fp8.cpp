@@ -150,8 +150,7 @@ static bool run_normal(int64_t M, int64_t N, int64_t K,
   cudaStream_t stream;
   CUDA_CHECK(cudaStreamCreate(&stream));
   auto start = std::chrono::high_resolution_clock::now();
-  moe_cuda::kernels::fp8_gemm_nt(A_t, sfa_t, B_t, sfb_t, out_t,
-                                 GemmType::Normal, "", nullptr, stream);
+  moe_cuda::kernels::fp8_gemm_nt(A_t, sfa_t, B_t, sfb_t, out_t, "", stream);
   CUDA_CHECK(cudaStreamSynchronize(stream));
   auto end = std::chrono::high_resolution_clock::now();
   CUDA_CHECK(cudaStreamDestroy(stream));

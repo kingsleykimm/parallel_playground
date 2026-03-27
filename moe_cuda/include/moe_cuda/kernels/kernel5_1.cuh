@@ -10,12 +10,11 @@
 #include "common/sm90_utils.cuh"
 #include "common/util.cuh"
 #include "kittens.cuh"
-#include "ops/group/group.cuh"
-#include "prototype.cuh"
+#include "ops/thread/util/tma.cuh"
 #include <cooperative_groups.h>
 
 using namespace kittens;
-namespace kernel5 {
+namespace kernel5_1 {
 
 // persistent kernel settings
 static constexpr int SM_COUNT = 132;
@@ -57,7 +56,7 @@ struct globals {
 
   using gate_tile = st_fp8e4m3<128, 128>;
   using up_tile = st_fp8e4m3<128, 128>;
-  using c_tile = st<fp8e4m3, 64, BN>;
+  using c_tile = st<fp8e4m3, 64, 128>;
   using sfa_tile = sv<float, 64>;
 
   using num_routed_layout = sv<int, constexpr_ti_align(NUM_EXPERTS, 16)>;
@@ -126,6 +125,8 @@ struct globals {
   out_scales_layout out_scales;
   indices_layout indices;
   global_num_routed_layout global_num_routed;
+  // important: this maps from the destination expert + ith token (out of
+  // NUM_EXPERTS_PER_TOKEN) to the source token idx
   expert_to_token_map_layout expert_to_token_map;
   padded_expert_counts_layout padded_expert_counts;
   src_token_idx_layout src_token_idx;
@@ -259,34 +260,31 @@ compute_path(const globals<_M, _I, _H, _BM, _BN, NUM_CONSUMER_WARPS_,
 
       for (; task_id < num_blocks; task_id += G.num_comp_sms) {
         // this is persistent sm scheduling here now
-        // if (task_id < super_rows * NUM_C_BLOCKS) {
-        //   common.coord.x =
-        //       (task_id / super_repeat) * SUPER_M + task_id % SUPER_M;
-        //   common.coord.y = (task_id % super_repeat) /
-        //                    SUPER_M; // super_repeat includes all the c blocks
-        // } else {
-        //   int remainder = task_id - super_rows * NUM_C_BLOCKS;
-        //   common.coord.x = super_rows + (remainder % remaining_rows);
-        //   common.coord.y = remainder / remaining_rows;
-        // }
-
-        common.coord.x = task_id / NUM_C_BLOCKS + row_block_start;
-        common.coord.y = task_id % NUM_C_BLOCKS;
+        if (task_id < super_rows * NUM_C_BLOCKS) {
+          common.coord.x =
+              (task_id / super_repeat) * SUPER_M + task_id % SUPER_M;
+          common.coord.y = (task_id % super_repeat) /
+                           SUPER_M; // super_repeat includes all the c blocks
+        } else {
+          int remainder = task_id - super_rows * NUM_C_BLOCKS;
+          common.coord.x = super_rows + (remainder % remaining_rows);
+          common.coord.y = remainder / remaining_rows;
+        }
+        common.coord.x += row_block_start;
 
         int counter;
-        asm volatile("{ld.acquire.gpu.global.s32 %0, [%1];}"
+        asm volatile("{ld.relaxed.gpu.global.s32 %0, [%1];}"
                      : "=r"(counter)
                      : "l"(&G.comm_comp_barrier[{common.coord.x}])
                      : "memory");
-        while (counter < _BM) {
+        while (counter != _BM) {
           __nanosleep(16);
           asm volatile("{ld.acquire.gpu.global.s32 %0, [%1];}"
                        : "=r"(counter)
                        : "l"(&G.comm_comp_barrier[{common.coord.x}])
                        : "memory");
         }
-
-        if (warp_id == 0 && lane_id == 0) {
+        if (warpgroup::laneid() == 0) {
 
           for (int iter = 0; iter < num_iters; iter++) {
             wait(inputs_finished[input_ring],
@@ -294,6 +292,7 @@ compute_path(const globals<_M, _I, _H, _BM, _BN, NUM_CONSUMER_WARPS_,
             update_phasebit<1>(semaphore_bitfield, input_ring);
 
             tma::expect(inputs_arrived[input_ring], inputs[input_ring]);
+
 #pragma unroll
             for (int wg_id = 0; wg_id < GLOBALS::NUM_TILES; wg_id++) {
               tma::load_async(
@@ -304,16 +303,16 @@ compute_path(const globals<_M, _I, _H, _BM, _BN, NUM_CONSUMER_WARPS_,
               tma::load_async(inputs[input_ring].sfa[wg_id],
                               G.expert_x_tokens_scale,
                               coord<ducks::default_type>{
-                                  iter, (common.coord.x + wg_id) * 64},
+                                  iter, (common.coord.x * _BM + wg_id * 64)},
                               inputs_arrived[input_ring]);
             }
             tma::load_async(inputs[input_ring].up, G.up,
                             coord<ducks::default_type>{
-                                _I * expert + common.coord.y * _BN, iter},
+                                _I * expert + common.coord.y * _BN, iter * 128},
                             inputs_arrived[input_ring]);
             tma::load_async(inputs[input_ring].gate, G.gate,
                             coord<ducks::default_type>{
-                                _I * expert + common.coord.y * _BN, iter},
+                                _I * expert + common.coord.y * _BN, iter * 128},
                             inputs_arrived[input_ring]);
             input_ring = ring_advance<NUM_STAGES_>(input_ring);
           }
@@ -321,7 +320,6 @@ compute_path(const globals<_M, _I, _H, _BM, _BN, NUM_CONSUMER_WARPS_,
       }
       task_id -= num_blocks;
     }
-
   }
 
   else {
@@ -348,19 +346,18 @@ compute_path(const globals<_M, _I, _H, _BM, _BN, NUM_CONSUMER_WARPS_,
       for (; task_id < num_blocks; task_id += G.num_comp_sms) {
         warp::zero(state.up_accum);
         warp::zero(state.gate_accum);
-        // if (task_id < super_rows * NUM_C_BLOCKS) {
-        //   common.coord.x =
-        //       (task_id / super_repeat) * SUPER_M + task_id % SUPER_M;
-        //   common.coord.y = (task_id % super_repeat) /
-        //                    SUPER_M; // super_repeat includes all the c blocks
-        // } else {
-        //   int remainder = task_id - super_rows * NUM_C_BLOCKS;
-        //   common.coord.x = super_rows + (remainder % remaining_rows);
-        //   common.coord.y = remainder / remaining_rows;
-        // }
+        if (task_id < super_rows * NUM_C_BLOCKS) {
+          common.coord.x =
+              (task_id / super_repeat) * SUPER_M + task_id % SUPER_M;
+          common.coord.y = (task_id % super_repeat) /
+                           SUPER_M; // super_repeat includes all the cblocks
+        } else {
+          int remainder = task_id - super_rows * NUM_C_BLOCKS;
+          common.coord.x = super_rows + (remainder % remaining_rows);
+          common.coord.y = remainder / remaining_rows;
+        }
 
-        common.coord.x = task_id / NUM_C_BLOCKS + row_block_start;
-        common.coord.y = task_id % NUM_C_BLOCKS;
+        common.coord.x += row_block_start;
         // for the current task id, we just need to see whether the current
         // assigned row is ready on the barrier
 
@@ -426,7 +423,7 @@ compute_path(const globals<_M, _I, _H, _BM, _BN, NUM_CONSUMER_WARPS_,
 
         rt<fp8e4m3, 16, _BN> fp8_output_tile;
         warp::copy(fp8_output_tile, state.up_accum);
-        tma::store_async_read_wait(); // wait for previous stores to shared
+        tma::store_async_read_wait(); // wait for previous stores from shared
                                       // memory to finish
         warpgroup::store(outputs.c[warpgroup::groupid()], fp8_output_tile);
         warpgroup::store(outputs.out_scales[warpgroup::groupid()],
@@ -502,6 +499,7 @@ __device__ inline void compute_routing_info(
     int routed_expert = G.indices[{token, slot}];
     int ith_routed_token = atomicAdd(&num_routed.data[routed_expert], 1);
     G.expert_to_token_map[G.rank][{routed_expert, ith_routed_token}] = token;
+
     // expert -> token map for the rounting map
   }
   everyone::sync(1);
@@ -702,8 +700,6 @@ comm_path(const globals<_M, _I, _H, _BM, _BN, NUM_CONSUMER_WARPS_,
   using GLOBALS = globals<_M, _I, _H, _BM, _BN, NUM_CONSUMER_WARPS_,
                           NUM_PRODUCER_WARPS_, NUM_STAGES_, KERNEL_SMEM_SIZE,
                           NUM_EXPERTS, EXPERTS_PER_TOKEN, SUPER_M>;
-  printf("shared vector length: %d\n", GLOBALS::token_vec_tile::length);
-
   int num_recv_tokens = *G.num_recv_tokens;
   extern __shared__ int __shm[];
   // we're also going to rewrite the shared memory with a new allocator now
@@ -734,12 +730,9 @@ comm_path(const globals<_M, _I, _H, _BM, _BN, NUM_CONSUMER_WARPS_,
 
         wait(token_arrived[threadIdx.x], phase);
         phase ^= 1;
-        printf("token_idx = %d, src_dev_idx = %d, src_token_idx = %d G.rank = "
-               "%d sm_idx = %d\n",
-               token_idx, src_dev_idx, src_token_idx, G.rank, sm_idx);
 
         tma::store_async(G.expert_x_tokens, token[threadIdx.x], {token_idx, 0});
-
+        tma::store_async_wait();
         float *scale_ptr =
             &(G.in_tokens_scales[src_dev_idx][{0, src_token_idx}]);
         int stride = G.in_tokens_scales[src_dev_idx].cols();
@@ -747,13 +740,6 @@ comm_path(const globals<_M, _I, _H, _BM, _BN, NUM_CONSUMER_WARPS_,
         for (int s = 0; s < _H / 128; s++) {
           G.expert_x_tokens_scale[{s, token_idx}] = *(scale_ptr + s * stride);
         }
-
-        tma::store_async_wait();
-      }
-
-      if (G.rank == 0 && sm_idx == 0) {
-        printf("token_idx = %d, src_dev_idx = %d, src_token_idx = %d\n",
-               token_idx, src_dev_idx, src_token_idx);
       }
       // add to the barrier, even padded tokens
       asm volatile("{red.release.gpu.global.add.s32 [%0], %1;}"
@@ -767,7 +753,7 @@ comm_path(const globals<_M, _I, _H, _BM, _BN, NUM_CONSUMER_WARPS_,
 template <int _M, int _I, int _H, int _BM, int _BN, int NUM_CONSUMER_WARPS_,
           int NUM_PRODUCER_WARPS_, int NUM_STAGES_, int KERNEL_SMEM_SIZE,
           int NUM_EXPERTS, int EXPERTS_PER_TOKEN, int SUPER_M = 12>
-__global__ void __launch_bounds__(MAIN_THREADS, 1) global_kernel5(
+__global__ void __launch_bounds__(MAIN_THREADS, 1) global_kernel5_1(
     const __grid_constant__ globals<
         _M, _I, _H, _BM, _BN, NUM_CONSUMER_WARPS_, NUM_PRODUCER_WARPS_,
         NUM_STAGES_, KERNEL_SMEM_SIZE, NUM_EXPERTS, EXPERTS_PER_TOKEN, SUPER_M>
@@ -777,11 +763,10 @@ __global__ void __launch_bounds__(MAIN_THREADS, 1) global_kernel5(
     compute_routing_info(G);
   }
   grid.sync();
-  printf("finished routing info\n");
   if (blockIdx.x < G.num_comp_sms) {
     compute_path(G, blockIdx.x);
   } else {
     comm_path(G, blockIdx.x - G.num_comp_sms);
   }
 }
-} // namespace kernel5
+} // namespace kernel5_1

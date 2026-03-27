@@ -18,8 +18,14 @@
 #include <kernels/internal_api.hpp>
 #include <runtime/parallel.h>
 #include <runtime/utils.h>
+#include <torch/headeronly/macros/Macros.h>
+#include <torch/csrc/stable/library.h>
+
 
 #include <all2all/all2all_base.hpp>
+
+
+
 
 namespace {
 
@@ -134,18 +140,18 @@ public:
         max_private_tokens, rank_, parallel_config, input_stream);
   }
 
-  void dispatch(at::Tensor &out_expert_num_tokens, at::Tensor &out_expert_x,
-                std::optional<at::Tensor> &out_expert_x_scale, at::Tensor &dp_x,
-                std::optional<at::Tensor> &dp_x_scale, at::Tensor &indices,
-                at::Tensor &weights, std::optional<at::Tensor> bound_m,
+  void dispatch(torch::stable::Tensor &out_expert_num_tokens, torch::stable::Tensor &out_expert_x,
+                std::optional<torch::stable::Tensor> &out_expert_x_scale, torch::stable::Tensor &dp_x,
+                std::optional<torch::stable::Tensor> &dp_x_scale, torch::stable::Tensor &indices,
+                torch::stable::Tensor &weights, std::optional<torch::stable::Tensor> bound_m,
                 bool do_send, bool do_recv) {
     handle_->dispatch(out_expert_num_tokens, out_expert_x, out_expert_x_scale,
                       dp_x, dp_x_scale, indices, weights, bound_m, do_send,
                       do_recv, current_stream());
   }
 
-  void combine(at::Tensor &out_tokens, at::Tensor &indices, at::Tensor &weights,
-               at::Tensor &expert_y, std::optional<at::Tensor> bound_m,
+  void combine(torch::stable::Tensor &out_tokens, torch::stable::Tensor &indices, torch::stable::Tensor &weights,
+               torch::stable::Tensor &expert_y, std::optional<torch::stable::Tensor> bound_m,
                bool do_send, bool do_recv, bool accumulate) {
     handle_->combine(out_tokens, indices, weights, expert_y, bound_m, do_send,
                      do_recv, accumulate, current_stream());
@@ -188,223 +194,6 @@ PYBIND11_MODULE(moe_cuda, m) {
       },
       pybind11::arg("library_root"), pybind11::arg("cuda_home"),
       "Initialize moe_cuda JIT runtime paths.");
-
-  m.def(
-      "bf16_gemm",
-      [](at::Tensor &a, at::Tensor &b, at::Tensor &d,
-         std::optional<at::Tensor> c, GemmType gemm_type,
-         const std::string &compiled_dims,
-         std::optional<at::Tensor> grouped_layout) {
-        auto stream = current_stream();
-        int *grouped_layout_ptr = grouped_layout.has_value()
-                                      ? grouped_layout->data_ptr<int>()
-                                      : nullptr;
-        moe_cuda::kernels::bf16_gemm(a, b, c, d, gemm_type, compiled_dims,
-                                     grouped_layout_ptr, stream);
-      },
-      pybind11::arg("a"), pybind11::arg("b"), pybind11::arg("d"),
-      pybind11::arg("c") = pybind11::none(),
-      pybind11::arg("gemm_type") = GemmType::Normal,
-      pybind11::arg("compiled_dims") = "",
-      pybind11::arg("grouped_layout") = pybind11::none(),
-      "Launch the BF16 GEMM entrypoint on the current CUDA stream.");
-
-  m.def(
-      "fp8_gemm_nt",
-      [](at::Tensor &act, at::Tensor &act_scale, at::Tensor &weight,
-         at::Tensor &weight_scale, at::Tensor &output, GemmType gemm_type,
-         const std::string &compiled_dims,
-         std::optional<at::Tensor> grouped_layout) {
-        auto stream = current_stream();
-        int *grouped_layout_ptr = grouped_layout.has_value()
-                                      ? grouped_layout->data_ptr<int>()
-                                      : nullptr;
-        moe_cuda::kernels::fp8_gemm_nt(act, act_scale, weight, weight_scale,
-                                       output, gemm_type, compiled_dims,
-                                       grouped_layout_ptr, stream);
-      },
-      pybind11::arg("act"), pybind11::arg("act_scale"), pybind11::arg("weight"),
-      pybind11::arg("weight_scale"), pybind11::arg("output"),
-      pybind11::arg("gemm_type") = GemmType::Normal,
-      pybind11::arg("compiled_dims") = "",
-      pybind11::arg("grouped_layout") = pybind11::none(),
-      "Launch the FP8 GEMM NT entrypoint on the current CUDA stream.");
-
-  m.def(
-      "fp8_grouped_gemm_nt",
-      [](at::Tensor &act, at::Tensor &act_scale, at::Tensor &weight,
-         at::Tensor &weight_scale, at::Tensor &output, GemmType gemm_type,
-         std::optional<at::Tensor> grouped_layout) {
-        auto stream = current_stream();
-        int *grouped_layout_ptr = grouped_layout.has_value()
-                                      ? grouped_layout->data_ptr<int>()
-                                      : nullptr;
-        moe_cuda::kernels::fp8_grouped_gemm_nt(act, act_scale, weight,
-                                               weight_scale, output, gemm_type,
-                                               grouped_layout_ptr, stream);
-      },
-      pybind11::arg("act"), pybind11::arg("act_scale"), pybind11::arg("weight"),
-      pybind11::arg("weight_scale"), pybind11::arg("output"),
-      pybind11::arg("gemm_type") = GemmType::MGroupedContiguous,
-      pybind11::arg("grouped_layout") = pybind11::none(),
-      "Launch the grouped FP8 GEMM entrypoint on the current CUDA stream.");
-
-  m.def(
-      "fp8_grouped_gemm_swiglu",
-      [](at::Tensor &A, at::Tensor &scale_a, at::Tensor &gate_weight,
-         at::Tensor &gate_scale, at::Tensor &up_weight, at::Tensor &up_scale,
-         at::Tensor &D, at::Tensor &scale_d, GemmType &gemm_type,
-         at::Tensor &grouped_layout) {
-        auto stream = current_stream();
-        HOST_ASSERT(grouped_layout.scalar_type() == at::ScalarType::Int,
-                    "invalid grouped layout type");
-        HOST_ASSERT(D.size(-1) / 128 == scale_d.size(-2),
-                    "incorrect output scale d layout");
-        if (get_env<int>("MOE_CUDA_DEBUG") != 0) {
-          printf("Launching kernel on CPP side \n");
-        }
-        moe_cuda::kernels::fp8_grouped_gemm_swiglu(
-            A, gate_weight, up_weight, scale_a, gate_scale, up_scale, scale_d,
-            D, GemmType::MGroupedContiguous, grouped_layout.data_ptr<int>(),
-            stream);
-      },
-      pybind11::arg("A"), pybind11::arg("scale_a"),
-      pybind11::arg("gate_weight"), pybind11::arg("gate_scale"),
-      pybind11::arg("up_weight"), pybind11::arg("up_scale"), pybind11::arg("D"),
-      pybind11::arg("scale_d"), pybind11::arg("gemm_type"),
-      pybind11::arg("grouped_layout"),
-      "Launch the grouped gemm swiglu entrypoint on the current CUDA stream");
-
-  // note : fp8 output scale d will be in mn major
-  m.def(
-      "fp8_grouped_gemm_swiglu_contiguous",
-      [](at::Tensor &A, at::Tensor &scale_a, at::Tensor &gate_weight,
-         at::Tensor &gate_scale, at::Tensor &up_weight, at::Tensor &up_scale,
-         at::Tensor &D, at::Tensor &scale_d, at::Tensor &grouped_layout) {
-        auto stream = current_stream();
-        HOST_ASSERT(grouped_layout.scalar_type() == at::ScalarType::Int,
-                    "invalid grouped layout type");
-        HOST_ASSERT(D.size(-1) / 128 == scale_d.size(-2),
-                    "incorrect output scale d layout");
-        moe_cuda::kernels::fp8_grouped_gemm_swiglu(
-            A, gate_weight, up_weight, scale_a, gate_scale, up_scale, scale_d,
-            D, GemmType::MGroupedContiguous, grouped_layout.data_ptr<int>(),
-            stream);
-      },
-      pybind11::arg("A"), pybind11::arg("scale_a"),
-      pybind11::arg("gate_weight"), pybind11::arg("gate_scale"),
-      pybind11::arg("up_weight"), pybind11::arg("up_scale"), pybind11::arg("D"),
-      pybind11::arg("scale_d"), pybind11::arg("grouped_layout"),
-      "Launch the grouped gemm swiglu entrypoint on the current CUDA stream");
-  m.def(
-      "fp8_grouped_gemm_swiglu_masked",
-      [](at::Tensor &A, at::Tensor &scale_a, at::Tensor &gate_weight,
-         at::Tensor &gate_scale, at::Tensor &up_weight, at::Tensor &up_scale,
-         at::Tensor &D, at::Tensor &scale_d, at::Tensor &grouped_layout) {
-        auto stream = current_stream();
-        HOST_ASSERT(grouped_layout.scalar_type() == at::ScalarType::Int,
-                    "invalid grouped layout type");
-        HOST_ASSERT(D.size(-1) / 128 == scale_d.size(-2),
-                    "incorrect output scale d layout");
-        moe_cuda::kernels::fp8_grouped_gemm_swiglu(
-            A, gate_weight, up_weight, scale_a, gate_scale, up_scale, scale_d,
-            D, GemmType::MGroupedMasked, grouped_layout.data_ptr<int>(),
-            stream);
-      },
-      pybind11::arg("A"), pybind11::arg("scale_a"),
-      pybind11::arg("gate_weight"), pybind11::arg("gate_scale"),
-      pybind11::arg("up_weight"), pybind11::arg("up_scale"), pybind11::arg("D"),
-      pybind11::arg("scale_d"), pybind11::arg("grouped_layout"),
-      "Launch the grouped gemm swiglu entrypoint on the current CUDA stream");
-  m.def(
-      "fp8_grouped_gemm_swiglu_pp",
-      [](at::Tensor &A, at::Tensor &scale_a, at::Tensor &gate_weight,
-         at::Tensor &gate_scale, at::Tensor &up_weight, at::Tensor &up_scale,
-         at::Tensor &D, at::Tensor &scale_d, GemmType &gemm_type,
-         at::Tensor &grouped_layout) {
-        auto stream = current_stream();
-        HOST_ASSERT(grouped_layout.scalar_type() == at::ScalarType::Int,
-                    "invalid grouped layout type");
-        HOST_ASSERT(D.size(-1) / 128 == scale_d.size(-2),
-                    "incorrect output scale d layout");
-        if (get_env<int>("MOE_CUDA_DEBUG") != 0) {
-          printf("Launching kernel on CPP side \n");
-        }
-        moe_cuda::kernels::fp8_grouped_gemm_swiglu_consumer_pp(
-            A, gate_weight, up_weight, scale_a, gate_scale, up_scale, scale_d,
-            D, gemm_type, grouped_layout.data_ptr<int>(), stream);
-      },
-      pybind11::arg("A"), pybind11::arg("scale_a"),
-      pybind11::arg("gate_weight"), pybind11::arg("gate_scale"),
-      pybind11::arg("up_weight"), pybind11::arg("up_scale"), pybind11::arg("D"),
-      pybind11::arg("scale_d"), pybind11::arg("gemm_type"),
-      pybind11::arg("grouped_layout"),
-      "Launch the grouped gemm swiglu entrypoint with consumer WG pingpong "
-      "scheduling on the current stream");
-  m.def(
-      "fp8_grouped_gemm_swiglu_contiguous_pp",
-      [](at::Tensor &A, at::Tensor &scale_a, at::Tensor &gate_weight,
-         at::Tensor &gate_scale, at::Tensor &up_weight, at::Tensor &up_scale,
-         at::Tensor &D, at::Tensor &scale_d, at::Tensor &grouped_layout) {
-        auto stream = current_stream();
-        HOST_ASSERT(grouped_layout.scalar_type() == at::ScalarType::Int,
-                    "invalid grouped layout type");
-        HOST_ASSERT(D.size(-1) / 128 == scale_d.size(-2),
-                    "incorrect output scale d layout");
-        moe_cuda::kernels::fp8_grouped_gemm_swiglu_consumer_pp(
-            A, gate_weight, up_weight, scale_a, gate_scale, up_scale, scale_d,
-            D, GemmType::MGroupedContiguous, grouped_layout.data_ptr<int>(),
-            stream);
-      },
-      pybind11::arg("A"), pybind11::arg("scale_a"),
-      pybind11::arg("gate_weight"), pybind11::arg("gate_scale"),
-      pybind11::arg("up_weight"), pybind11::arg("up_scale"), pybind11::arg("D"),
-      pybind11::arg("scale_d"), pybind11::arg("grouped_layout"),
-      "Launch the grouped gemm swiglu entrypoint on the current CUDA stream");
-
-  m.def(
-      "fp8_grouped_gemm_swiglu_masked_pp",
-      [](at::Tensor &A, at::Tensor &scale_a, at::Tensor &gate_weight,
-         at::Tensor &gate_scale, at::Tensor &up_weight, at::Tensor &up_scale,
-         at::Tensor &D, at::Tensor &scale_d, at::Tensor &grouped_layout) {
-        auto stream = current_stream();
-        HOST_ASSERT(grouped_layout.scalar_type() == at::ScalarType::Int,
-                    "invalid grouped layout type");
-        HOST_ASSERT(D.size(-1) / 128 == scale_d.size(-2),
-                    "incorrect output scale d layout");
-        if (get_env<int>("MOE_CUDA_DEBUG") != 0) {
-          printf("Launching kernel on CPP side \n");
-        }
-        moe_cuda::kernels::fp8_grouped_gemm_swiglu_consumer_pp(
-            A, gate_weight, up_weight, scale_a, gate_scale, up_scale, scale_d,
-            D, GemmType::MGroupedMasked, grouped_layout.data_ptr<int>(),
-            stream);
-      },
-      pybind11::arg("A"), pybind11::arg("scale_a"),
-      pybind11::arg("gate_weight"), pybind11::arg("gate_scale"),
-      pybind11::arg("up_weight"), pybind11::arg("up_scale"), pybind11::arg("D"),
-      pybind11::arg("scale_d"), pybind11::arg("grouped_layout"),
-      "Launch the grouped gemm swiglu entrypoint on the current CUDA stream");
-
-  m.def(
-      "cast",
-      [](at::Tensor &inp, at::Tensor &out, std::optional<at::Tensor> &scale) {
-        auto stream = current_stream();
-        moe_cuda::kernels::cast(inp, out, scale, stream);
-      },
-      pybind11::arg("inp"), pybind11::arg("out"),
-      pybind11::arg("scale") = pybind11::none());
-
-  m.def(
-      "fused_silu_mul_quant",
-      [](at::Tensor &gemm_out, at::Tensor &swiglu_out, at::Tensor &scale) {
-        auto stream = current_stream();
-        moe_cuda::kernels::fused_silu_mul_quant(gemm_out, swiglu_out, scale,
-                                                stream);
-      },
-      pybind11::arg("gemm_out"), pybind11::arg("swiglu_out"),
-      pybind11::arg("scale"));
-
   bind_fused_dispatch_grouped_gemm_swiglu(m);
 
   pybind11::class_<PyAll2All>(m, "All2All")
@@ -448,13 +237,13 @@ PYBIND11_MODULE(moe_cuda, m) {
 
   m.def("naive_moe_forward_dispatch",
         [](PyAll2All &all2all, uint32_t num_experts, uint32_t experts_per_token,
-           uint32_t hidden_dim, GemmType gemm_type, at::Tensor &input,
-           at::Tensor &input_scales, at::Tensor &gate, at::Tensor &gate_scales,
-           at::Tensor &up, at::Tensor &up_scales, at::Tensor &down,
-           at::Tensor &down_scales, at::Tensor &indices, at::Tensor &weights,
-           at::Tensor &out_tokens, at::Tensor &expert_x,
-           at::Tensor &expert_x_scales, at::Tensor &inter_y,
-           at::Tensor &inter_y_scales, at::Tensor &expert_y) {
+           uint32_t hidden_dim, GemmType gemm_type, torch::stable::Tensor &input,
+           torch::stable::Tensor &input_scales, torch::stable::Tensor &gate, torch::stable::Tensor &gate_scales,
+           torch::stable::Tensor &up, torch::stable::Tensor &up_scales, torch::stable::Tensor &down,
+           torch::stable::Tensor &down_scales, torch::stable::Tensor &indices, torch::stable::Tensor &weights,
+           torch::stable::Tensor &out_tokens, torch::stable::Tensor &expert_x,
+           torch::stable::Tensor &expert_x_scales, torch::stable::Tensor &inter_y,
+           torch::stable::Tensor &inter_y_scales, torch::stable::Tensor &expert_y) {
           auto stream = current_stream();
           moe_cuda::All2AllBase &a2a = *all2all.handle().get();
           naive_moe_forward_dispatch(

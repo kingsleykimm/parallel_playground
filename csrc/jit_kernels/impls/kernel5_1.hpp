@@ -1,11 +1,15 @@
 /**
-  @file kernel5.hpp
-  @brief JIT launcher for kernel5 - Fused Dispatch + FC1 of SwiGLU MLP, (Grouped
+  @file kernel5_1.hpp
+  @brief JIT launcher for kernel5_1 - Fused Dispatch + FC1 of SwiGLU MLP, (Grouped
   GEMM) Uses cooperative grid launch for grid-wide sync between routing and
   compute/comm phases.
  */
 #pragma once
-#include "c10/core/ScalarType.h"
+#include <optional>
+#include <torch/headeronly/core/ScalarType.h>
+#include <torch/csrc/stable/tensor.h>
+#include <torch/csrc/stable/device.h>
+#include <torch/csrc/stable/ops.h>
 #include "jit_kernels/heuristics/heuristics.hpp"
 #include "moe_cuda/types.h"
 #include <algorithm>
@@ -21,9 +25,9 @@
 #include <runtime/device.hpp>
 #include <runtime/format.hpp>
 
-class Kernel5Runtime : LaunchRuntime<Kernel5Runtime> {
+class Kernel5_1Runtime : LaunchRuntime<Kernel5_1Runtime> {
 public:
-  // kernel5 constants (mirrored from kernel5.cuh)
+  // kernel5_1 constants (mirrored from kernel5_1.cuh)
   static constexpr int SM_COUNT = 132;
   static constexpr int DYNAMIC_SHARED_MEMORY = 227 * 1024 - 1024;
 
@@ -41,21 +45,21 @@ public:
     // tensor args for globals construction
     kittens::py::TKParallelTensor *in_tokens;
     kittens::py::TKParallelTensor *in_tokens_scales;
-    at::Tensor *expert_x_tokens;
-    at::Tensor *expert_x_tokens_scale;
-    at::Tensor *comm_comp_barrier;
-    at::Tensor *gate;
-    at::Tensor *up;
-    at::Tensor *C;
-    at::Tensor *scale_gate;
-    at::Tensor *scale_up;
-    at::Tensor *out_scales;
-    at::Tensor *indices;
+    torch::stable::Tensor *expert_x_tokens;
+    torch::stable::Tensor *expert_x_tokens_scale;
+    torch::stable::Tensor *comm_comp_barrier;
+    torch::stable::Tensor *gate;
+    torch::stable::Tensor *up;
+    torch::stable::Tensor *C;
+    torch::stable::Tensor *scale_gate;
+    torch::stable::Tensor *scale_up;
+    torch::stable::Tensor *out_scales;
+    torch::stable::Tensor *indices;
     kittens::py::TKParallelTensor *global_num_routed;
     kittens::py::TKParallelTensor *expert_to_token_map;
-    at::Tensor *padded_expert_counts;
-    at::Tensor *src_token_idx;
-    at::Tensor *src_dev_idx;
+    torch::stable::Tensor *padded_expert_counts;
+    torch::stable::Tensor *src_token_idx;
+    torch::stable::Tensor *src_dev_idx;
     kittens::py::TKParallelTensor *barrier;
 
     int num_tokens;
@@ -74,10 +78,10 @@ public:
   static std::string generate_impl(const Args &args) {
     return fmt::format(R"(
 
-#include <moe_cuda/kernels/kernel5.cuh>
+#include <moe_cuda/kernels/kernel5_1.cuh>
 
 static void __instantiate_kernel() {{
-auto ptr = reinterpret_cast<void *>(&kernel5::global_kernel5<
+auto ptr = reinterpret_cast<void *>(&kernel5_1::global_kernel5_1<
         {}, {}, {},
         {},
         {},
@@ -98,13 +102,14 @@ auto ptr = reinterpret_cast<void *>(&kernel5::global_kernel5<
   static void launch_impl(KernelHandle &kernel,
                           const LaunchConfigHandle &launch_config,
                           const Args &args) {
-    // Build globals via the pre-compiled factory
-    size_t gsize = tk_kernel5_globals_size();
+    // Build globals via the pre-compiled factory (dispatched on H for correct
+    // TMA descriptor tile sizes)
+    size_t gsize = tk_kernel5_1_globals_size(args.H);
     alignas(128) char globals_buf[4096];
     assert(gsize <= sizeof(globals_buf));
 
-    tk_build_kernel5_globals(
-        globals_buf, *args.in_tokens, *args.in_tokens_scales,
+    tk_build_kernel5_1_globals(
+        args.H, globals_buf, *args.in_tokens, *args.in_tokens_scales,
         *args.expert_x_tokens, *args.expert_x_tokens_scale,
         *args.comm_comp_barrier, *args.gate, *args.up, *args.C,
         *args.scale_gate, *args.scale_up, *args.out_scales, *args.indices,
@@ -114,12 +119,12 @@ auto ptr = reinterpret_cast<void *>(&kernel5::global_kernel5<
         args.rank, args.dp_size, args.cur_dp_group, args.num_dp_groups,
         args.num_comm_sms, args.num_comp_sms);
 
-    // kernel5 uses cooperative_groups::this_grid().sync(), so we need
+    // kernel5_1 uses cooperative_groups::this_grid().sync(), so we need
     // cooperative launch via CU_LAUNCH_ATTRIBUTE_COOPERATIVE
 
     void *kernelParams[] = {globals_buf};
     if (get_env<int>("JIT_DEBUG") != 0) {
-      printf("Launching kernel5: grid=%u, block=%u, smem=%d, cooperative=1\n",
+      printf("Launching kernel5_1: grid=%u, block=%u, smem=%d, cooperative=1\n",
              launch_config.gridDimX, launch_config.blockDimX,
              launch_config.sharedMemBytes);
     }
@@ -133,14 +138,14 @@ auto ptr = reinterpret_cast<void *>(&kernel5::global_kernel5<
 inline void fused_dispatch_grouped_gemm_swiglu(
     kittens::py::TKParallelTensor &in_tokens,
     kittens::py::TKParallelTensor &in_tokens_scales,
-    at::Tensor &expert_x_tokens, at::Tensor &expert_x_tokens_scale,
-    at::Tensor &gate, at::Tensor &up,
-    at::Tensor &C, at::Tensor &scale_gate, at::Tensor &scale_up,
-    at::Tensor &out_scales, at::Tensor &indices,
+    torch::stable::Tensor &expert_x_tokens, torch::stable::Tensor &expert_x_tokens_scale,
+    torch::stable::Tensor &gate, torch::stable::Tensor &up,
+    torch::stable::Tensor &C, torch::stable::Tensor &scale_gate, torch::stable::Tensor &scale_up,
+    torch::stable::Tensor &out_scales, torch::stable::Tensor &indices,
     kittens::py::TKParallelTensor &global_num_routed,
     kittens::py::TKParallelTensor &expert_to_token_map,
-    at::Tensor &padded_expert_counts, at::Tensor &src_token_idx,
-    at::Tensor &src_dev_idx, kittens::py::TKParallelTensor &barrier,
+    torch::stable::Tensor &padded_expert_counts, torch::stable::Tensor &src_token_idx,
+    torch::stable::Tensor &src_dev_idx, kittens::py::TKParallelTensor &barrier,
     int num_tokens, int *num_recv_tokens, int dp_rank, int rank, int dp_size,
     int cur_dp_group, int num_dp_groups, int world_size, int num_experts, int experts_per_token,
     int num_comm_sms, int num_comp_sms, cudaStream_t &stream) {
@@ -164,7 +169,10 @@ inline void fused_dispatch_grouped_gemm_swiglu(
   uint32_t kernel_smem_size = gemm_config.smem_config.smem_size;
   uint32_t super_m = 8;
 
-  auto comm_comp_barrier = at::zeros(std::vector<int64_t>{host_ceil_div(src_token_idx.size(0), BM)}, at::TensorOptions().device(torch::kCUDA).dtype(torch::kInt32));
+
+  torch::stable::Tensor comm_comp_barrier = new_zeros(
+    src_token_idx, {host_ceil_div(src_token_idx.size(0), BM), (int64_t) BM}, std::make_optional(torch::headeronly::ScalarType::Int), std::nullopt);
+
 
   LaunchConfig launch_config = {
       dim3(gemm_config.num_math_threads + gemm_config.num_tma_threads, 1, 1),
@@ -185,7 +193,7 @@ inline void fused_dispatch_grouped_gemm_swiglu(
     printf("  smem_size=%u\n", kernel_smem_size);
   }
 
-  const Kernel5Runtime::Args args = {
+  const Kernel5_1Runtime::Args args = {
       .M = M,
       .I = I,
       .H = H,
@@ -228,8 +236,8 @@ inline void fused_dispatch_grouped_gemm_swiglu(
       .launch_config = launch_config,
   };
 
-  const std::string &code = LaunchRuntime<Kernel5Runtime>::generate(args);
+  const std::string &code = LaunchRuntime<Kernel5_1Runtime>::generate(args);
   std::shared_ptr<KernelRuntime> runtime =
       compiler->build("fused_dispatch_grouped_gemm_swiglu", code);
-  LaunchRuntime<Kernel5Runtime>::launch(runtime, args);
+  LaunchRuntime<Kernel5_1Runtime>::launch(runtime, args);
 }

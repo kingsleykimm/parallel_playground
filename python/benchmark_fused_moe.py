@@ -2,9 +2,25 @@ import moe_cuda
 
 from dataclasses import dataclass
 import torch
+import torch.nn.functional as F
 from transformer_engine.pytorch.tensor.float8_blockwise_tensor import Float8BlockQuantizer, Float8BlockwiseQTensor
 from transformer_engine_torch import DType as TE_DType
-from common import init_distributed_environment, clean_print, setup
+from common import init_distributed_environment, clean_print, setup, calc_cosine_diff
+@dataclass
+class TestConfig:
+    B: int
+    S: int
+    I: int
+    H: int
+    num_experts: int
+    experts_per_token: int
+    
+    dp_size: int
+    num_comm_sms: int
+    num_comp_sms: int
+    local_rank: int
+    local_world_size: int = 4
+
 
 def fused_dispatch_grouped_gemm_swiglu(
     in_tokens: moe_cuda.TKParallelTensor,
@@ -147,22 +163,43 @@ def reference_compute_routing_info(
     
     return src_token_idx, src_dev_idx, padded_expert_counts, num_recv_tokens, expert_to_token_map, num_routed.cpu()
 
-@dataclass
-class TestConfig:
-    B: int
-    S: int
-    I: int
-    H: int
-    num_experts: int
-    experts_per_token: int
-    
-    dp_size: int
-    num_comm_sms: int
-    num_comp_sms: int
-    local_rank: int
-    local_world_size: int = 4
+# only use this for correctness testing
+def slow_reference_dispatch_group_gemm(
+    *,
+    cfg : TestConfig,
+    in_tokens : torch.Tensor,  # (B * S, H)
+    gate_bf16 : torch.Tensor,
+    up_bf16 : torch.Tensor,
+    num_experts_per_dev : int,
+    src_token_idx : torch.Tensor, # these should be sorted based off a lexicographical sort
+    src_dev_idx : torch.Tensor,
+    padded_expert_counts : torch.Tensor,
+    num_recv_tokens : int,
+    dp_group : torch.distributed.ProcessGroup
+):
 
 
+    all_tokens = torch.empty((cfg.local_world_size, in_tokens.shape[0], in_tokens.shape[1]), dtype = in_tokens.dtype, device = in_tokens.device)
+    inputs_gathered = torch.empty((num_recv_tokens, cfg.H), dtype = all_tokens.dtype, device = all_tokens.device)
+    output = torch.empty((num_recv_tokens, cfg.I), dtype = in_tokens.dtype, device = in_tokens.device)
+    torch.distributed.all_gather_into_tensor(output_tensor = all_tokens, input_tensor = in_tokens, group = dp_group)
+    for local_token_idx in range(src_token_idx.shape[0]):
+        src_token = src_token_idx[local_token_idx]
+        src_dev = src_dev_idx[local_token_idx]
+        if src_dev >= 0 and src_token >= 0:
+            inputs_gathered[local_token_idx] = all_tokens[src_dev, src_token]
+
+    num_cumsum_tokens = 0
+    for expert in range(num_experts_per_dev):
+        num_expert_tokens = padded_expert_counts[expert]
+        cur_tokens = inputs_gathered[num_cumsum_tokens : num_cumsum_tokens + num_expert_tokens]
+        gate_out = torch.mm(cur_tokens, gate_bf16[expert].T)
+        up_out = torch.mm(cur_tokens, up_bf16[expert].T)
+        output[num_cumsum_tokens : num_cumsum_tokens + num_expert_tokens] = F.silu(gate_out) * up_out
+        num_cumsum_tokens += num_expert_tokens
+
+    return inputs_gathered, output
+        
 def run(
         cfg: TestConfig,
         max_recv_tokens: int):
@@ -181,6 +218,14 @@ def run(
     dp_group = local_rank // cfg.dp_size
     num_dp_groups = local_world_size // cfg.dp_size
 
+
+    dp_groups = []
+    for i in range(cfg.dp_size):
+        ranks = [r for r in range(local_world_size) if r % cfg.dp_size == i]
+        group = torch.distributed.new_group(ranks)
+        dp_groups.append(group)
+    my_dp_group = dp_groups[local_rank % cfg.dp_size]
+
     quantizer_1d = Float8BlockQuantizer(
         fp8_dtype=TE_DType.kFloat8E4M3,
         rowwise=True,
@@ -193,12 +238,12 @@ def run(
         rowwise=True,
         columnwise=True,   # weights need both orientations (fprop + dgrad)
         block_scaling_dim=2,
+    )
+    in_tokens_bf16 = torch.randn((cfg.B * cfg.S, cfg.H),
+                    dtype=torch.bfloat16, device=device) / (cfg.H ** 0.5)
 
-    )
     in_tokens_quantized: Float8BlockwiseQTensor = quantizer_1d(
-        torch.empty((cfg.B * cfg.S, cfg.H),
-                    dtype=torch.bfloat16, device=device)
-    )
+        in_tokens_bf16)
 
     in_tokens_fp8 = in_tokens_quantized._rowwise_data.view(torch.float8_e4m3fn)
     in_tokens_scales_fp32 = in_tokens_quantized._rowwise_scale_inv.view(
@@ -230,9 +275,9 @@ def run(
         (cfg.H // 128, max_recv_tokens), dtype=torch.float32, device=device
     )
 
-    gate_bf16 = torch.empty((
+    gate_bf16 = torch.randn((
         num_experts_per_dev, cfg.I, cfg.H
-    ), dtype=torch.bfloat16, device=device)
+    ), dtype=torch.bfloat16, device=device) / (cfg.H ** 0.5)
 
     gate_tensor: Float8BlockwiseQTensor = quantizer_2d.quantize(gate_bf16)
     clean_print(gate_bf16.shape, print_once=True)
@@ -241,9 +286,9 @@ def run(
     gate = gate_tensor._rowwise_data.view(torch.float8_e4m3fn).view(num_experts_per_dev * cfg.I, cfg.H)
     scale_gate = gate_tensor._rowwise_scale_inv.view(torch.float32).view(num_experts_per_dev * (cfg.I // 128), cfg.H // 128)
 
-    up_bf16 = torch.empty((
+    up_bf16 = torch.randn((
         num_experts_per_dev, cfg.I, cfg.H
-    ), dtype=torch.bfloat16, device=device)
+    ), dtype=torch.bfloat16, device=device) / (cfg.H ** 0.5)
 
     up_tensor: Float8BlockwiseQTensor = quantizer_2d.quantize(up_bf16)
 
@@ -253,11 +298,11 @@ def run(
     scale_up = up_tensor._rowwise_scale_inv.view(torch.float32).view(num_experts_per_dev * (cfg.I // 128), cfg.H // 128)
 
     expert_y = torch.empty((
-        cfg.B * cfg.S, cfg.I
+        max_recv_tokens, cfg.I
     ), dtype=torch.float8_e4m3fn, device=device)
 
     expert_y_scales = torch.empty((
-        cfg.I // 128, cfg.B * cfg.S
+        cfg.I // 128, max_recv_tokens
     ), dtype=torch.float32, device=device)
 
     global_num_routed = moe_cuda.TKParallelTensor(
@@ -296,7 +341,7 @@ def run(
     num_recv_tokens = torch.zeros((1,), dtype=torch.int32, device=device)
 
     weights = torch.rand((cfg.B * cfg.S, cfg.num_experts),
-                         dtype=torch.bfloat16, device=device)
+                         dtype=torch.bfloat16, device=device) / (cfg.num_experts ** 0.5)
     indices = torch.multinomial(
         input=weights, num_samples=cfg.experts_per_token, replacement=False).to(torch.int32).to(device)
 
@@ -313,9 +358,9 @@ def run(
         dp_rank, local_rank, cfg.dp_size, dp_group, num_dp_groups,
         local_world_size,
         cfg.num_experts, cfg.experts_per_token, cfg.num_comm_sms, cfg.num_comp_sms)
-    
     clean_print("Initialized tensors", print_once=True)
     fused_run()
+    torch.distributed.barrier()
     torch.cuda.synchronize()
     clean_print("Fused run completed", print_once=True)
 
@@ -335,17 +380,99 @@ def run(
     src_dev_idx = src_dev_idx.cpu()[:reference_num_recv_tokens.item()]
     reference_src_token_idx = reference_src_token_idx.cpu()[:reference_num_recv_tokens.item()]
     reference_src_dev_idx = reference_src_dev_idx.cpu()[:reference_num_recv_tokens.item()]
-
-    clean_print(f"src_token_idx: {src_token_idx}, reference_src_token_idx: {reference_src_token_idx}", print_once=True)
-    clean_print(f"src_dev_idx: {src_dev_idx}, reference_src_dev_idx: {reference_src_dev_idx}", print_once=True)
-
     src_token_dev_idx = torch.stack((src_token_idx, src_dev_idx), dim = 1)
     reference_src_token_dev_idx = torch.stack((reference_src_token_idx, reference_src_dev_idx), dim = 1)
     k_key = src_token_dev_idx[:, 0] * 100000 + src_token_dev_idx[:, 1]
     r_key = reference_src_token_dev_idx[:, 0] * 100000 + reference_src_token_dev_idx[:, 1]                                                                                                                                                                                                                                     
     torch.testing.assert_close(src_token_dev_idx[k_key.argsort()], reference_src_token_dev_idx[r_key.argsort()])
 
+    reference_inputs_gathered, reference_swiglu = slow_reference_dispatch_group_gemm(
+            cfg = cfg,
+    in_tokens  = in_tokens_bf16,
+    gate_bf16 = gate_bf16,
+    up_bf16 = up_bf16,
+    num_experts_per_dev = num_experts_per_dev,
+    src_token_idx = reference_src_token_idx.to(device),
+    src_dev_idx = reference_src_dev_idx.to(device),
+    padded_expert_counts = padded_expert_counts.to(device),
+    num_recv_tokens = reference_num_recv_tokens.item(),
+    dp_group = my_dp_group
+    )
+
+
+    # dequantize the intermediate swiglu activation - scales are transposed
+
+    r_mask = r_key >= 0
+    k_mask = k_key >= 0
+
+    torch.testing.assert_close(
+        src_token_dev_idx[k_mask][k_key[k_mask].argsort()],
+        reference_src_token_dev_idx[r_mask][r_key[r_mask].argsort()]
+    )
+
+    # === Step 1: Check raw FP8 bytes (no dequantization) ===
+    # Build expected FP8 tokens by gathering from in_tokens_fp8 using kernel's routing
+    all_fp8_tokens = torch.empty((cfg.local_world_size, cfg.B * cfg.S, cfg.H), dtype=torch.float8_e4m3fn, device=device)
+    torch.distributed.all_gather_into_tensor(output_tensor=all_fp8_tokens, input_tensor=in_tokens_fp8, group=my_dp_group)
+    kernel_expert_x_raw = expert_x_tokens[:num_recv_tokens.item()]
+    # gather expected fp8 tokens in kernel order
+    k_sort = k_key[k_mask].argsort()
+    r_sort = r_key[r_mask].argsort()
+    # use the REFERENCE sorted routing to build expected FP8 (same canonical order)
+    # expected_fp8 = torch.empty((r_mask.sum().item(), cfg.H), dtype=torch.float8_e4m3fn, device=device)
+    # ref_sorted_dev = reference_src_token_dev_idx[r_mask][r_sort]
+    # ref_sorted_tok = ref_sorted_dev[:, 0]  # this is actually the token idx column... wait
+    # Actually reference_src_token_dev_idx columns are (token_idx, dev_idx)
+    # for i in range(r_mask.sum().item()):
+    #     si = r_sort[i]
+    #     sd = reference_src_dev_idx[r_mask][si].long()
+    #     st = reference_src_token_idx[r_mask][si].long()
+    #     expected_fp8[i] = all_fp8_tokens[sd, st]
+    # kernel_sorted_fp8 = kernel_expert_x_raw[k_mask].gather(dim=0, index=k_sort.unsqueeze(1).expand(-1, cfg.H).to(device))
+    # fp8_match = (kernel_sorted_fp8.view(torch.uint8) == expected_fp8.view(torch.uint8))
+    # clean_print(f"FP8 raw byte match: {fp8_match.float().mean().item():.6f} ({fp8_match.all().item()})")
+
+    # # === Step 2: Check scales separately ===
+    # all_scales = torch.empty((cfg.local_world_size, cfg.H // 128, cfg.B * cfg.S), dtype=torch.float32, device=device)
+    # torch.distributed.all_gather_into_tensor(output_tensor=all_scales, input_tensor=in_tokens_scales_fp32, group=my_dp_group)
+    # kernel_scales = expert_x_tokens_scale[:, :num_recv_tokens.item()]  # (H//128, num_recv)
+    # expected_scales = torch.empty((cfg.H // 128, r_mask.sum().item()), dtype=torch.float32, device=device)
+    # for i in range(r_mask.sum().item()):
+    #     si = r_sort[i]
+    #     sd = reference_src_dev_idx[r_mask][si].long()
+    #     st = reference_src_token_idx[r_mask][si].long()
+    #     expected_scales[:, i] = all_scales[sd, :, st]
+    # kernel_sorted_scales = kernel_scales[:, k_mask.to(device)][:, k_sort.to(device)]
+    # scale_match = torch.allclose(kernel_sorted_scales, expected_scales)
+    # clean_print(f"Scale match: {scale_match}, max diff: {(kernel_sorted_scales - expected_scales).abs().max().item():.6e}")
+
+    # # === Step 3: dequantized comparison ===
+    # clean_print(expert_x_tokens_scale.shape, print_once=True)
+    # expert_x_tokens_scale = expert_x_tokens_scale[:,:num_recv_tokens.item()]
+    # expert_x_tokens = expert_x_tokens[:num_recv_tokens.item()]
+    # expert_x = (expert_x_tokens.to(torch.float32) * expert_x_tokens_scale.transpose(-1, -2).contiguous().repeat_interleave(repeats = 128, dim = -1) ).to(torch.bfloat16)
+    # expert_x = expert_x[:num_recv_tokens.item()]
+
+    # expert_x = expert_x[k_mask].gather(dim = 0, index = k_key[k_mask].argsort().unsqueeze(1).expand(-1, cfg.H).to(device))
+    # reference_expert_x = reference_inputs_gathered[r_mask].gather(dim = 0, index = r_key[r_mask].argsort().unsqueeze(1).expand(-1, cfg.H).to(device))
+    # inputs_diff = calc_cosine_diff(reference_expert_x, expert_x)
+    # clean_print(f"inputs cosine diff: {inputs_diff}")
+    # assert inputs_diff < 0.01, "cosine diff between expert_x and reference_expert_x is too high"
+
+    expert_y_scales = expert_y_scales[:,:num_recv_tokens.item()]
+    expert_y = expert_y[:num_recv_tokens.item()]
+    clean_print(expert_y_scales.shape, print_once=True)
+    kernel_output = (expert_y.to(torch.float32) * expert_y_scales.transpose(-1, -2).contiguous().repeat_interleave(repeats = 128, dim = -1) ).to(torch.bfloat16)
+    reference_swiglu = reference_swiglu.to(torch.bfloat16)
+    kernel_output = kernel_output[k_mask].gather(dim = 0, index = k_key[k_mask].argsort().unsqueeze(1).expand(-1, cfg.I).to(device))
+    reference_swiglu = reference_swiglu[r_mask].gather(dim = 0, index = r_key[r_mask].argsort().unsqueeze(1).expand(-1, cfg.I).to(device))
+    clean_print(kernel_output[0], print_once=True)
+    clean_print(reference_swiglu[0], print_once=True)
+    diff = calc_cosine_diff(kernel_output, reference_swiglu)
+    clean_print(f"cosine diff: {diff}", print_once=True)
+    assert diff < 0.01, "cosine diff between kernel and reference is too high"
     
+    # torch.testing.assert_close(kernel_output, reference_swiglu)
 
 if __name__ == "__main__":
     setup()
@@ -354,7 +481,7 @@ if __name__ == "__main__":
         B=1,
         S=1024,
         I=2048,
-        H=4096,
+        H=512,
         num_experts=32,
         experts_per_token=4,
         dp_size = 1,

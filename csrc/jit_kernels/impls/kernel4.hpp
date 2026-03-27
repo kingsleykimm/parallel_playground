@@ -104,13 +104,13 @@ auto ptr = reinterpret_cast<void *>(&kernel4::global_kernel4<
 //   token row D:             (total_M, N)              — FP8 output (silu(gate)
 //   * up, requantized) scale_d:       (total_N/BN, total_M)     — per-(n-block,
 //   m-row) output scale
-inline void kernel4_contiguous(at::Tensor &A, at::Tensor &up_weight,
-                               at::Tensor &gate_weight, at::Tensor &scale_a,
-                               at::Tensor &scale_up, at::Tensor &scale_gate,
-                               at::Tensor &scale_d, at::Tensor &D,
+inline void kernel4_contiguous(torch::stable::Tensor &A, torch::stable::Tensor &up_weight,
+                               torch::stable::Tensor &gate_weight, torch::stable::Tensor &scale_a,
+                               torch::stable::Tensor &scale_up, torch::stable::Tensor &scale_gate,
+                               torch::stable::Tensor &scale_d, torch::stable::Tensor &D,
                                int *grouped_layout, cudaStream_t &stream) {
   HOST_ASSERT(
-      D.scalar_type() == at::ScalarType::Float8_e4m3fn,
+      D.scalar_type() == c10::ScalarType::Float8_e4m3fn,
       "unsupported output dtype: kernel4 outputs FP8-quantized activations");
 
   uint32_t total_M = A.size(0);
@@ -184,13 +184,13 @@ inline void kernel4_contiguous(at::Tensor &A, at::Tensor &up_weight,
 //   N/128, K/128) grouped_layout: (num_groups,) int32      — actual M count per
 //   group D:             (num_groups*max_M, N)     — FP8 output scale_d:
 //   (total_N/BN, num_groups*max_M) — per-(n-block, m-row) output scale
-inline void kernel4_masked(at::Tensor &A, at::Tensor &up_weight,
-                           at::Tensor &gate_weight, at::Tensor &scale_a,
-                           at::Tensor &scale_up, at::Tensor &scale_gate,
-                           at::Tensor &scale_d, at::Tensor &D,
+inline void kernel4_masked(torch::stable::Tensor &A, torch::stable::Tensor &up_weight,
+                           torch::stable::Tensor &gate_weight, torch::stable::Tensor &scale_a,
+                           torch::stable::Tensor &scale_up, torch::stable::Tensor &scale_gate,
+                           torch::stable::Tensor &scale_d, torch::stable::Tensor &D,
                            int *grouped_layout, cudaStream_t &stream) {
   HOST_ASSERT(
-      D.scalar_type() == at::ScalarType::Float8_e4m3fn,
+      D.scalar_type() == c10::ScalarType::Float8_e4m3fn,
       "unsupported output dtype: kernel4 outputs FP8-quantized activations");
 
   uint32_t num_groups = gate_weight.size(0);

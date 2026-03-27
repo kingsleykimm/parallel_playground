@@ -4,7 +4,6 @@
 // tile configuration.
 
 #include <algorithm>
-#include <c10/core/ScalarType.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -14,7 +13,17 @@
 #include <pyutils/parallel_tensor.cuh>
 #include <pyutils/torchutils.cuh>
 #include <runtime/utils.h>
+#include <torch/csrc/stable/tensor.h>
+#include <torch/headeronly/core/ScalarType.h>
 #include <type_traits>
+
+#include <torch/csrc/inductor/aoti_torch/utils.h>
+inline at::Tensor &stable_to_aten(torch::stable::Tensor &t) {
+  return *torch::aot_inductor::tensor_handle_to_tensor_pointer(t.get());
+}
+inline const at::Tensor &stable_to_aten(const torch::stable::Tensor &t) {
+  return *torch::aot_inductor::tensor_handle_to_tensor_pointer(t.get());
+}
 
 // Use matmul_layout directly from the .cuh to guarantee ABI match with NVRTC
 // kernel.
@@ -631,83 +640,89 @@ extern "C" void tk_build_kernel4_globals(
 #undef TK_KERNEL4_BUILD_CASE
 #undef TK_ALL_KERNEL4_CONFIGS
 
-// ============== kernel5 factory (kernel5::globals) ======= /
+// ============== kernel5_1 factory (kernel5_1::globals) ======= /
+//
+// H must be dispatched at runtime because it determines token_vec_tile =
+// sv_fp8e4m3<H>, which is a TMA type on in_tokens and expert_x_tokens GLs.
+// The TMA descriptor's smem box size is baked in at GL construction time,
+// so the factory must use the same H the JIT kernel is instantiated with.
+// All other template params either don't affect data member types (M, I,
+// num_warps, stages, smem_size) or are fixed (BM=64, BN=128).
 
-#include <moe_cuda/kernels/kernel5.cuh>
-// IMPORTANT: These constants determine TMA descriptor tile sizes baked into the
-// globals struct. They MUST match the values the JIT kernel is instantiated with,
-// otherwise TMA loads will transfer the wrong number of bytes and mbarrier waits
-// will hang. Constants that affect TMA descriptors:
-//   G_H  → token_vec_tile = sv_fp8e4m3<H>  (used in in_tokens, expert_x_tokens)
-//   G_BN → c_tile = st<fp8e4m3, 64, BN>    (used in c_layout)
-// Constants that only affect static constexprs (not struct layout or TMA): G_M, G_I
-static constexpr int G_M = 1024;
-static constexpr int G_I = 2048;
-static constexpr int G_H = 2048;
-static constexpr int G_BM = 64;
-static constexpr int G_BN = 128;
-static constexpr int G_NUM_CONSUMER_WARPS = 8;
-static constexpr int G_NUM_PRODUCER_WARPS = 4;
-static constexpr int G_NUM_STAGES = 4;
-static constexpr int G_KERNEL_SMEM_SIZE = 227 * 1024;
-static constexpr int G_NUM_EXPERTS = 32;
-static constexpr int G_EXPERTS_PER_TOKEN = 8;
-static constexpr int G_SUPER_M = 12;
-struct fp8_kernel5_factory {
-  // we fill with dummy variables for now, we're going to actually fill it out
-  // later when we write in the jit string
+#include <moe_cuda/kernels/kernel5_1.cuh>
 
+// Fixed constants — these don't affect TMA descriptor tile sizes
+static constexpr int K5_BM = 64;
+static constexpr int K5_BN = 128;
+static constexpr int K5_NUM_CONSUMER_WARPS = 8;
+static constexpr int K5_NUM_PRODUCER_WARPS = 4;
+static constexpr int K5_NUM_STAGES = 4;
+static constexpr int K5_KERNEL_SMEM_SIZE = 227 * 1024;
+static constexpr int K5_NUM_EXPERTS = 32;
+static constexpr int K5_EXPERTS_PER_TOKEN = 8;
+static constexpr int K5_SUPER_M = 12;
+// M and I only affect static constexprs, not types — use small dummies
+static constexpr int K5_M = 128;
+static constexpr int K5_I = 256;
+
+template <int _H> struct fp8_kernel5_1_factory {
   using globals_t =
-      kernel5::globals<G_M, G_I, G_H, G_BM, G_BN, G_NUM_CONSUMER_WARPS,
-                       G_NUM_PRODUCER_WARPS, G_NUM_STAGES, G_KERNEL_SMEM_SIZE,
-                       G_NUM_EXPERTS, G_EXPERTS_PER_TOKEN, G_SUPER_M>;
+      kernel5_1::globals<K5_M, K5_I, _H, K5_BM, K5_BN, K5_NUM_CONSUMER_WARPS,
+                         K5_NUM_PRODUCER_WARPS, K5_NUM_STAGES,
+                         K5_KERNEL_SMEM_SIZE, K5_NUM_EXPERTS,
+                         K5_EXPERTS_PER_TOKEN, K5_SUPER_M>;
 
   static size_t size() { return sizeof(globals_t); }
 
-  static void
-  build(void *out, kittens::py::TKParallelTensor &in_tokens,
-        kittens::py::TKParallelTensor &in_tokens_scales,
-        at::Tensor &expert_x_tokens, at::Tensor &expert_x_tokens_scale,
-        at::Tensor &comm_comp_barrier, at::Tensor &gate, at::Tensor &up,
-        at::Tensor &C, at::Tensor &scale_gate, at::Tensor &scale_up,
-        at::Tensor &out_scales, at::Tensor &indices,
-        kittens::py::TKParallelTensor &global_num_routed,
-        kittens::py::TKParallelTensor &expert_to_token_map,
-        at::Tensor &padded_expert_counts, at::Tensor &src_token_idx,
-        at::Tensor &src_dev_idx, kittens::py::TKParallelTensor &barrier,
-        int num_tokens, int *num_recv_tokens, int dp_rank, int rank,
-        int dp_size, int cur_dp_group, int num_dp_groups, int num_comm_sms,
-        int num_comp_sms) {
+  static void build(
+      void *out, kittens::py::TKParallelTensor &in_tokens,
+      kittens::py::TKParallelTensor &in_tokens_scales,
+      torch::stable::Tensor &expert_x_tokens,
+      torch::stable::Tensor &expert_x_tokens_scale,
+      torch::stable::Tensor &comm_comp_barrier, torch::stable::Tensor &gate,
+      torch::stable::Tensor &up, torch::stable::Tensor &C,
+      torch::stable::Tensor &scale_gate, torch::stable::Tensor &scale_up,
+      torch::stable::Tensor &out_scales, torch::stable::Tensor &indices,
+      kittens::py::TKParallelTensor &global_num_routed,
+      kittens::py::TKParallelTensor &expert_to_token_map,
+      torch::stable::Tensor &padded_expert_counts,
+      torch::stable::Tensor &src_token_idx, torch::stable::Tensor &src_dev_idx,
+      kittens::py::TKParallelTensor &barrier, int num_tokens,
+      int *num_recv_tokens, int dp_rank, int rank, int dp_size,
+      int cur_dp_group, int num_dp_groups, int num_comm_sms, int num_comp_sms) {
 
-    using in_tokens_layout = typename globals_t::in_tokens_layout;
     globals_t G{
         .in_tokens = kittens::py::parallel_tensor_to_pgl<
             typename globals_t::in_tokens_layout>(in_tokens),
         .in_tokens_scales = kittens::py::parallel_tensor_to_pgl<
             typename globals_t::in_tokens_scales_layout>(in_tokens_scales),
         .expert_x_tokens = kittens::py::tensor_to_gl<
-            typename globals_t::expert_x_tokens_layout>(expert_x_tokens),
+            typename globals_t::expert_x_tokens_layout>(
+            stable_to_aten(expert_x_tokens)),
         .expert_x_tokens_scale = kittens::py::tensor_to_gl<
             typename globals_t::expert_x_tokens_scale_layout>(
-            expert_x_tokens_scale),
+            stable_to_aten(expert_x_tokens_scale)),
         .comm_comp_barrier = kittens::py::tensor_to_gl<
-            typename globals_t::comm_comp_barrier_layout>(comm_comp_barrier),
-        .gate =
-            kittens::py::tensor_to_gl<typename globals_t::gate_layout>(gate),
-        .up = kittens::py::tensor_to_gl<typename globals_t::up_layout>(up),
-        .C = kittens::py::tensor_to_gl<typename globals_t::c_layout>(C),
+            typename globals_t::comm_comp_barrier_layout>(
+            stable_to_aten(comm_comp_barrier)),
+        .gate = kittens::py::tensor_to_gl<typename globals_t::gate_layout>(
+            stable_to_aten(gate)),
+        .up = kittens::py::tensor_to_gl<typename globals_t::up_layout>(
+            stable_to_aten(up)),
+        .C = kittens::py::tensor_to_gl<typename globals_t::c_layout>(
+            stable_to_aten(C)),
         .scale_gate =
             kittens::py::tensor_to_gl<typename globals_t::scale_gate_layout>(
-                scale_gate),
+                stable_to_aten(scale_gate)),
         .scale_up =
             kittens::py::tensor_to_gl<typename globals_t::scale_up_layout>(
-                scale_up),
+                stable_to_aten(scale_up)),
         .out_scales =
             kittens::py::tensor_to_gl<typename globals_t::out_scales_layout>(
-                out_scales),
+                stable_to_aten(out_scales)),
         .indices =
             kittens::py::tensor_to_gl<typename globals_t::indices_layout>(
-                indices),
+                stable_to_aten(indices)),
         .global_num_routed = kittens::py::parallel_tensor_to_pgl<
             typename globals_t::global_num_routed_layout>(global_num_routed),
         .expert_to_token_map = kittens::py::parallel_tensor_to_pgl<
@@ -715,13 +730,13 @@ struct fp8_kernel5_factory {
             expert_to_token_map),
         .padded_expert_counts = kittens::py::tensor_to_gl<
             typename globals_t::padded_expert_counts_layout>(
-            padded_expert_counts),
+            stable_to_aten(padded_expert_counts)),
         .src_token_idx =
             kittens::py::tensor_to_gl<typename globals_t::src_token_idx_layout>(
-                src_token_idx),
+                stable_to_aten(src_token_idx)),
         .src_dev_idx =
             kittens::py::tensor_to_gl<typename globals_t::src_dev_idx_layout>(
-                src_dev_idx),
+                stable_to_aten(src_dev_idx)),
         .barrier = kittens::py::parallel_tensor_to_pgl<
             typename globals_t::barrier_layout>(barrier),
         .num_tokens = num_tokens,
@@ -738,25 +753,65 @@ struct fp8_kernel5_factory {
   }
 };
 
-size_t tk_kernel5_globals_size() { return fp8_kernel5_factory::size(); }
+// Dispatch macros for kernel5_1 — keyed on H (hidden size)
+#define TK_KERNEL5_1_SIZE_CASE(h)                                              \
+  if (H_ == h)                                                                 \
+    return fp8_kernel5_1_factory<h>::size();
 
-void tk_build_kernel5_globals(
-    void *out, kittens::py::TKParallelTensor &in_tokens,
+#define TK_KERNEL5_1_BUILD_CASE(h)                                             \
+  if (H_ == h) {                                                               \
+    fp8_kernel5_1_factory<h>::build(                                           \
+        out, in_tokens, in_tokens_scales, expert_x_tokens,                     \
+        expert_x_tokens_scale, comm_comp_barrier, gate, up, C, scale_gate,     \
+        scale_up, out_scales, indices, global_num_routed, expert_to_token_map, \
+        padded_expert_counts, src_token_idx, src_dev_idx, barrier, num_tokens, \
+        num_recv_tokens, dp_rank, rank, dp_size, cur_dp_group, num_dp_groups,  \
+        num_comm_sms, num_comp_sms);                                           \
+    return;                                                                    \
+  }
+
+// Common hidden sizes in transformer models
+#define TK_ALL_KERNEL5_1_H_CONFIGS(MACRO)                                      \
+  MACRO(512)                                                                   \
+  MACRO(1024)                                                                  \
+  MACRO(2048)                                                                  \
+  MACRO(3072)                                                                  \
+  MACRO(4096)                                                                  \
+  MACRO(5120)                                                                  \
+  MACRO(6144)                                                                  \
+  MACRO(7168)                                                                  \
+  MACRO(8192)                                                                  \
+  HOST_ERROR("Unsupported Hidden Dimension Type");
+
+size_t tk_kernel5_1_globals_size(int H_) {
+  TK_ALL_KERNEL5_1_H_CONFIGS(TK_KERNEL5_1_SIZE_CASE)
+  fprintf(stderr,
+          "tk_kernel5_1_globals_size: unsupported H=%d (add to "
+          "TK_ALL_KERNEL5_1_H_CONFIGS)\n",
+          H_);
+  abort();
+}
+
+void tk_build_kernel5_1_globals(
+    int H_, void *out, kittens::py::TKParallelTensor &in_tokens,
     kittens::py::TKParallelTensor &in_tokens_scales,
-    at::Tensor &expert_x_tokens, at::Tensor &expert_x_tokens_scale,
-    at::Tensor &comm_comp_barrier, at::Tensor &gate, at::Tensor &up,
-    at::Tensor &C, at::Tensor &scale_gate, at::Tensor &scale_up,
-    at::Tensor &out_scales, at::Tensor &indices,
+    torch::stable::Tensor &expert_x_tokens,
+    torch::stable::Tensor &expert_x_tokens_scale,
+    torch::stable::Tensor &comm_comp_barrier, torch::stable::Tensor &gate,
+    torch::stable::Tensor &up, torch::stable::Tensor &C,
+    torch::stable::Tensor &scale_gate, torch::stable::Tensor &scale_up,
+    torch::stable::Tensor &out_scales, torch::stable::Tensor &indices,
     kittens::py::TKParallelTensor &global_num_routed,
     kittens::py::TKParallelTensor &expert_to_token_map,
-    at::Tensor &padded_expert_counts, at::Tensor &src_token_idx,
-    at::Tensor &src_dev_idx, kittens::py::TKParallelTensor &barrier,
-    int num_tokens, int *num_recv_tokens, int dp_rank, int rank, int dp_size,
-    int cur_dp_group, int num_dp_groups, int num_comm_sms, int num_comp_sms) {
-  fp8_kernel5_factory::build(
-      out, in_tokens, in_tokens_scales, expert_x_tokens, expert_x_tokens_scale,
-      comm_comp_barrier, gate, up, C, scale_gate, scale_up, out_scales, indices,
-      global_num_routed, expert_to_token_map, padded_expert_counts,
-      src_token_idx, src_dev_idx, barrier, num_tokens, num_recv_tokens, dp_rank,
-      rank, dp_size, cur_dp_group, num_dp_groups, num_comm_sms, num_comp_sms);
+    torch::stable::Tensor &padded_expert_counts,
+    torch::stable::Tensor &src_token_idx, torch::stable::Tensor &src_dev_idx,
+    kittens::py::TKParallelTensor &barrier, int num_tokens,
+    int *num_recv_tokens, int dp_rank, int rank, int dp_size, int cur_dp_group,
+    int num_dp_groups, int num_comm_sms, int num_comp_sms) {
+  TK_ALL_KERNEL5_1_H_CONFIGS(TK_KERNEL5_1_BUILD_CASE)
+  fprintf(stderr,
+          "tk_build_kernel5_1_globals: unsupported H=%d (add to "
+          "TK_ALL_KERNEL5_1_H_CONFIGS)\n",
+          H_);
+  abort();
 }

@@ -1,5 +1,5 @@
 #pragma once
-#include "c10/core/ScalarType.h"
+#include <torch/headeronly/core/ScalarType.h>
 #include "jit_kernels/heuristics/heuristics.hpp"
 #include "moe_cuda/types.h"
 #include <cassert>
@@ -10,30 +10,7 @@
 #include <jit_kernels/tk_globals_factory.h>
 #include <runtime/device.hpp>
 #include <runtime/format.hpp>
-
-namespace {
-
-inline std::string fp8_grouped_ref_trace_define_block() {
-  return fmt::format("#define KERNEL2_TRACE_REF {}\n"
-                     "#define KERNEL2_TRACE_REF_CTA_LIMIT {}\n"
-                     "#define KERNEL2_TRACE_REF_ITER_LIMIT {}\n",
-                     get_env<int>("KERNEL2_TRACE_REF", 0),
-                     get_env<int>("KERNEL2_TRACE_REF_CTA_LIMIT", 8),
-                     get_env<int>("KERNEL2_TRACE_REF_ITER_LIMIT", 2));
-}
-
-inline void fill_fp8_ref_swizzles(GemmConfig &gemm_config,
-                                  const at::Tensor &ab_tensor,
-                                  const at::Tensor &d_tensor) {
-  gemm_config.smem_config.swizzle_a_mode =
-      get_swizzle_mode(gemm_config.block_k, get_type_size(dtype_of(ab_tensor)));
-  gemm_config.smem_config.swizzle_b_mode =
-      get_swizzle_mode(gemm_config.block_k, get_type_size(dtype_of(ab_tensor)));
-  gemm_config.smem_config.swizzle_cd_mode =
-      get_swizzle_mode(gemm_config.block_n, get_type_size(dtype_of(d_tensor)));
-}
-
-} // namespace
+#include <torch/csrc/stable/tensor.h>
 
 class SM90_FP8_GEMM1D2D_TK_Runtime
     : LaunchRuntime<SM90_FP8_GEMM1D2D_TK_Runtime> {
@@ -45,7 +22,7 @@ public:
     int num_consumer_warps, num_producer_warps;
     int num_stages;
     int smem_size;
-    at::ScalarType c_dtype;
+    c10::ScalarType c_dtype;
     LaunchConfig launch_config;
   };
 
@@ -88,76 +65,17 @@ static void __instantiate_kernel() {{
   }
 };
 
-class SM90_FP8_GEMM1D2D_Ref_Runtime
-    : LaunchRuntime<SM90_FP8_GEMM1D2D_Ref_Runtime> {
-public:
-  struct Args {
-    uint32_t num_groups;
-    uint32_t M, N, K;
-    CUtensorMap a_tensor_map;
-    CUtensorMap sfa_tensor_map;
-    CUtensorMap b_tensor_map;
-    CUtensorMap d_tensor_map;
-    float *sfb;
-    int *grouped_layout;
-    GemmConfig gemm_config;
-    GemmType gemm_type;
-    LaunchConfig launch_config;
-  };
-
-  static std::string generate_impl(const Args &args) {
-    return fmt::format(
-        R"(
-{}
-#include <moe_cuda/kernels/sm90_fp8_gemm_1d2d_tk.cuh>
-
-using namespace moe_cuda::kernels::sm90_fp8_gemm_impl;
-
-static void __instantiate_kernel() {{
-    auto kernel_ptr = reinterpret_cast<void*>(&sm90_fp8_gemm_1d2d<
-        {},
-        {}, {}, {},
-        {}, {}, {},
-        static_cast<Major>({}),
-        {}, {},
-        {},
-        {},
-        static_cast<GemmType>({}),
-        {},
-        {}, {}, {},
-        {},
-        false>);
-}}
-)",
-        fp8_grouped_ref_trace_define_block(), args.num_groups, args.M, args.N,
-        args.K, args.gemm_config.block_m, args.gemm_config.block_n,
-        args.gemm_config.block_k, static_cast<int>(Major::K),
-        args.gemm_config.num_math_threads, args.gemm_config.num_tma_threads,
-        args.gemm_config.tma_multicast_a ? "true" : "false",
-        args.gemm_config.num_tma_multicast, static_cast<int>(args.gemm_type),
-        args.gemm_config.num_sms, args.gemm_config.smem_config.swizzle_a_mode,
-        args.gemm_config.smem_config.swizzle_b_mode,
-        args.gemm_config.smem_config.swizzle_cd_mode,
-        args.gemm_config.num_stages);
-  }
-
-  static void launch_impl(KernelHandle &kernel,
-                          const LaunchConfigHandle &launch_config,
-                          const Args &args) {
-    CUDA_CHECK(launch_kernel(kernel, launch_config, args.M, args.N, args.K,
-                             args.a_tensor_map, args.sfa_tensor_map,
-                             args.b_tensor_map, args.d_tensor_map, args.sfb,
-                             args.grouped_layout));
-  }
-};
+// [DEPRECATED] SM90_FP8_GEMM1D2D_Ref_Runtime and
+// sm90_fp8_grouped_gemm_1d2d_contiguous_ref removed — replaced by TK
+// globals factory path. See sm90_fp8_gemm_1d2d_nt below.
 
 // persistent kernel style
-inline void sm90_fp8_gemm_1d2d_nt(at::Tensor &A, at::Tensor &B,
-                                  at::Tensor &scale_a, at::Tensor &scale_b,
-                                  at::Tensor &D, cudaStream_t &stream) {
+inline void sm90_fp8_gemm_1d2d_nt(torch::stable::Tensor &A, torch::stable::Tensor &B,
+                                  torch::stable::Tensor &scale_a, torch::stable::Tensor &scale_b,
+                                  torch::stable::Tensor &D, cudaStream_t &stream) {
 
-  HOST_ASSERT(D.scalar_type() == at::ScalarType::BFloat16 ||
-                  D.scalar_type() == at::ScalarType::Float,
+  HOST_ASSERT(D.scalar_type() == c10::ScalarType::BFloat16 ||
+                  D.scalar_type() == c10::ScalarType::Float,
               "unsupported output dtype");
 
   uint32_t M = A.size(0);
@@ -227,85 +145,7 @@ inline void sm90_fp8_gemm_1d2d_nt(at::Tensor &A, at::Tensor &B,
   LaunchRuntime<SM90_FP8_GEMM1D2D_TK_Runtime>::launch(runtime, args);
 }
 
-inline void sm90_fp8_grouped_gemm_1d2d_contiguous_ref(
-    at::Tensor &A, at::Tensor &B, at::Tensor &scale_a, at::Tensor &scale_b,
-    at::Tensor &D, int *grouped_layout, cudaStream_t &stream) {
-  HOST_ASSERT(grouped_layout != nullptr,
-              "grouped_layout cannot be null for grouped FP8 GEMM");
-  HOST_ASSERT(D.scalar_type() == at::ScalarType::BFloat16 ||
-                  D.scalar_type() == at::ScalarType::Float,
-              "unsupported output dtype");
+// [DEPRECATED] sm90_fp8_grouped_gemm_1d2d_contiguous_ref removed —
+// used host-side TMA descriptor creation (make_tma_*_desc). Replaced by
+// TK globals factory path (kernel2 grouped GEMM).
 
-  uint32_t total_M = A.size(0);
-  uint32_t num_groups = B.size(0);
-  uint32_t N = B.size(-2);
-  uint32_t K = B.size(-1);
-
-  GemmConfig gemm_config = search_configs(
-      GemmType::MGroupedContiguous, total_M, N, K, 1, Major::K, Major::K,
-      Major::K, A.scalar_type(), D.scalar_type(), device_prop->get_num_sms());
-  fill_fp8_ref_swizzles(gemm_config, A, D);
-
-  size_t non_contig_A_stride = A.stride(-2);
-  size_t non_contig_B_stride = B.stride(-2);
-  size_t non_contig_D_stride = D.stride(-2);
-
-  CUtensorMap a_tensor_map = make_tma_a_desc(
-      A, Major::K, 1, gemm_config.block_m, gemm_config.block_k,
-      non_contig_A_stride, gemm_config.smem_config.swizzle_a_mode,
-      host_align(gemm_config.block_k, 64));
-  CUtensorMap sfa_tensor_map =
-      make_tma_sf_desc(scale_a, Major::MN, 1, total_M, K, gemm_config.block_m,
-                       gemm_config.block_k);
-  CUtensorMap b_tensor_map = make_tma_b_desc(
-      B, Major::K, num_groups, gemm_config.block_n, gemm_config.block_k,
-      non_contig_B_stride, gemm_config.smem_config.swizzle_b_mode,
-      host_align(gemm_config.block_k, 64));
-  CUtensorMap d_tensor_map = make_tma_d_desc(
-      D, Major::K, 1, gemm_config.block_m, gemm_config.block_n,
-      non_contig_D_stride, gemm_config.smem_config.swizzle_cd_mode,
-      host_align(gemm_config.block_n, 64));
-
-  LaunchConfig launch_config = {
-      dim3(gemm_config.num_math_threads + gemm_config.num_tma_threads, 1, 1),
-      dim3(gemm_config.num_sms),
-      stream,
-      gemm_config.smem_config.smem_size,
-      gemm_config.num_tma_multicast,
-  };
-
-  const SM90_FP8_GEMM1D2D_Ref_Runtime::Args args = {
-      num_groups,
-      total_M,
-      N,
-      K,
-      a_tensor_map,
-      sfa_tensor_map,
-      b_tensor_map,
-      d_tensor_map,
-      scale_b.data_ptr<float>(),
-      grouped_layout,
-      gemm_config,
-      GemmType::MGroupedContiguous,
-      launch_config,
-  };
-
-  const std::string &code =
-      LaunchRuntime<SM90_FP8_GEMM1D2D_Ref_Runtime>::generate(args);
-  std::shared_ptr<KernelRuntime> runtime =
-      compiler->build("sm90_fp8_grouped_gemm_1d2d_ref_contiguous", code);
-  LaunchRuntime<SM90_FP8_GEMM1D2D_Ref_Runtime>::launch(runtime, args);
-}
-
-inline void sm90_fp8_grouped_gemm_1d2d_masked_ref(
-    at::Tensor &A, at::Tensor &B, at::Tensor &scale_a, at::Tensor &scale_b,
-    at::Tensor &D, int *grouped_layout, cudaStream_t &stream) {
-  (void)A;
-  (void)B;
-  (void)scale_a;
-  (void)scale_b;
-  (void)D;
-  (void)grouped_layout;
-  (void)stream;
-  HOST_ASSERT(false, "masked FP8 grouped reference tracing is not implemented");
-}

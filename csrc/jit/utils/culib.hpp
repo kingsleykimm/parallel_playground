@@ -60,9 +60,13 @@ create_launch_config(KernelHandle &kernel, const int &smem_size,
   launch_handle.gridDimZ = gridDim.z;
   launch_handle.hStream = (CUstream)stream;
   launch_handle.sharedMemBytes = smem_size;
-  launch_handle.attrs = nullptr;
+  // Static so the attrs array outlives the returned handle (which stores a
+  // pointer into it).  Thread-safety note: callers serialise kernel launches
+  // on a single stream, so a thread_local static is sufficient.
+  static thread_local CUlaunchAttribute attrs[2];
+  launch_handle.attrs = attrs;
   launch_handle.numAttrs = 0;
-  CUlaunchAttribute attr;
+
   if (num_multicast > 1) {
     // Verify grid is divisible by cluster dimension
     if (gridDim.x % num_multicast != 0) {
@@ -74,12 +78,11 @@ create_launch_config(KernelHandle &kernel, const int &smem_size,
       CUDA_CHECK(cuFuncSetAttribute(
           kernel, CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED, 1));
     }
-    attr.id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
-    attr.value.clusterDim.x = num_multicast;
-    attr.value.clusterDim.y = 1;
-    attr.value.clusterDim.z = 1;
-    launch_handle.attrs = &attr;
-    launch_handle.numAttrs = 1;
+    attrs[launch_handle.numAttrs].id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
+    attrs[launch_handle.numAttrs].value.clusterDim.x = num_multicast;
+    attrs[launch_handle.numAttrs].value.clusterDim.y = 1;
+    attrs[launch_handle.numAttrs].value.clusterDim.z = 1;
+    launch_handle.numAttrs++;
 
     if (get_env<int>("JIT_DEBUG") > 0) {
       printf("  Cluster launch: grid=%u, cluster=%u\n", gridDim.x,
@@ -87,12 +90,10 @@ create_launch_config(KernelHandle &kernel, const int &smem_size,
     }
   }
 
-  CUlaunchAttribute coop_attr;
   if (cooperative) {
-    coop_attr.id = CU_LAUNCH_ATTRIBUTE_COOPERATIVE;
-    coop_attr.value.cooperative = 1;
-    launch_handle.attrs = &coop_attr;
-    launch_handle.numAttrs += 1;
+    attrs[launch_handle.numAttrs].id = CU_LAUNCH_ATTRIBUTE_COOPERATIVE;
+    attrs[launch_handle.numAttrs].value.cooperative = 1;
+    launch_handle.numAttrs++;
   }
 
   return launch_handle;

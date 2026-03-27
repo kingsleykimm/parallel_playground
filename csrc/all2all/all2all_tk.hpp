@@ -34,6 +34,7 @@ template <int EXPERTS_PER_TOKEN, int NUM_EXPERTS, int TOKEN_DIM>
 class All2All : public All2AllBase {
 
 public:
+#if 0
   struct RoutingDebugState {
     at::Tensor tokens_per_expert;
     at::Tensor source_rank;
@@ -42,7 +43,7 @@ public:
     at::Tensor padded_index;
     uint32_t num_recv_tokens = 0;
   };
-
+#endif
   All2All(uint32_t max_num_tokens, uint32_t num_experts,
           uint32_t expert_padding, uint32_t hidden_dim,
           std::optional<uint32_t> hidden_dim_scale, c10::ScalarType in_dtype,
@@ -125,6 +126,7 @@ public:
   }
 
   // for testing
+  #if 0
   RoutingDebugState debug_routing_state(cudaStream_t stream = nullptr) const {
     HOST_ASSERT(initialized_, "All2All handler is not initialized");
     HOST_ASSERT(this->context_.has_value(),
@@ -197,33 +199,34 @@ public:
                 hw.size() * sizeof(uint32_t));
     return t;
   }
+  #endif
 
   void dispatch(
-      at::Tensor &out_expert_num_tokens, // output counts per expert
-      at::Tensor &out_expert_x, // inputs into the grouped gemm kenrel, with
+      torch::stable::Tensor &out_expert_num_tokens, // output counts per expert
+      torch::stable::Tensor &out_expert_x, // inputs into the grouped gemm kenrel, with
                                 // optional scale factors (to be quantized)
-      std::optional<at::Tensor> &out_expert_x_scale,
-      at::Tensor &dp_x, // input tokens to be dispatched
-      std::optional<at::Tensor>
+      std::optional<torch::stable::Tensor> &out_expert_x_scale,
+      torch::stable::Tensor &dp_x, // input tokens to be dispatched
+      std::optional<torch::stable::Tensor>
           &dp_x_scale, // input scale factors to be dispatched, we allow
                        // optionality in where the quantize kernel is inserted
-      at::Tensor &indices, at::Tensor &weights,
-      std::optional<at::Tensor> &bound_m, bool do_send = true,
+      torch::stable::Tensor &indices, torch::stable::Tensor &weights,
+      std::optional<torch::stable::Tensor> &bound_m, bool do_send = true,
       bool do_recv = true, cudaStream_t stream = nullptr) override {
     HOST_ASSERT(initialized_, "All2All handler is not initialized");
     HOST_ASSERT(do_send || do_recv, "do_send and do_recv must be true");
 
     HOST_ASSERT(out_expert_num_tokens.size(0) == this->num_local_experts_,
                 "Shape check failed");
-    HOST_ASSERT(dtype_of(out_expert_num_tokens) == c10::ScalarType::UInt32,
+    HOST_ASSERT(out_expert_num_tokens.scalar_type() == at::ScalarType::UInt32,
                 "Dtype check failed");
     uint32_t *out_expert_num_tokens_ptr =
-        out_expert_num_tokens.data_ptr<uint32_t>();
+        (uint32_t *)out_expert_num_tokens.data_ptr();
 
     uint32_t num_expert_tokens = out_expert_x.size(0);
     HOST_ASSERT(out_expert_x.dim() == 2, "Expected 2D tensor");
     HOST_ASSERT(out_expert_x.stride(1) == 1, "Expected stride of 1");
-    HOST_ASSERT(dtype_of(out_expert_x) == this->in_dtype_,
+    HOST_ASSERT(out_expert_x.scalar_type() == this->in_dtype_,
                 "Dtype check failed");
     uint8_t *out_x_ptr = (uint8_t *)out_expert_x.data_ptr();
     uint32_t out_x_stride =
@@ -238,16 +241,16 @@ public:
       HOST_ASSERT(
           this->scale_dtype_.has_value(),
           "scale_dtype must be set when out_expert_x_scale is provided");
-      HOST_ASSERT(dtype_of(*out_expert_x_scale) == this->scale_dtype_.value(),
+      HOST_ASSERT(out_expert_x_scale->scalar_type() == this->scale_dtype_.value(),
                   "Scale dtypes do not match");
-      out_x_scale_ptr = out_expert_x_scale->data_ptr<float>();
+      out_x_scale_ptr = (float *)out_expert_x_scale->data_ptr();
       out_x_scale_stride_elem = out_expert_x_scale->stride(1);
       out_x_scale_stride_token = out_expert_x_scale->stride(0);
     }
 
     HOST_ASSERT(dp_x.dim() == 2, "input tokens ndim == 2");
     HOST_ASSERT(dp_x.stride(1) == 1, "contiguous check");
-    HOST_ASSERT(dtype_of(dp_x) == this->in_dtype_, "input dtype check");
+    HOST_ASSERT(dp_x.scalar_type() == this->in_dtype_, "input dtype check");
 
     uint8_t *x_ptr = (uint8_t *)dp_x.data_ptr();
     uint32_t x_stride = dp_x.stride(0);
@@ -260,9 +263,9 @@ public:
       HOST_ASSERT(dp_x_scale->dim() == 2, "token x scales check");
       HOST_ASSERT(this->scale_dtype_.has_value(),
                   "scale_dtype must be set when dp_x_scale is provided");
-      HOST_ASSERT(dtype_of(*dp_x_scale) == this->scale_dtype_.value(),
+      HOST_ASSERT(dp_x_scale->scalar_type() == this->scale_dtype_.value(),
                   "Dtype check");
-      x_scale_ptr = dp_x_scale->data_ptr<float>();
+      x_scale_ptr = (float *)dp_x_scale->data_ptr();
       x_scale_stride_token = dp_x_scale->stride(0);
       x_scale_stride_elem = dp_x_scale->stride(1);
     }
@@ -271,22 +274,22 @@ public:
     HOST_ASSERT(indices.dim() == 2 && indices.size(0) == dp_x.size(0) &&
                     indices.size(1) == this->num_experts_per_token_,
                 "indices shape check");
-    HOST_ASSERT(dtype_of(indices) == c10::ScalarType::Int, "dtype check");
+    HOST_ASSERT(indices.scalar_type() == at::ScalarType::Int, "dtype check");
 
     HOST_ASSERT(weights.dim() == 2 && weights.size(0) == dp_x.size(0) &&
                     weights.size(1) == this->num_experts_per_token_,
                 "Weight ndimension check");
-    HOST_ASSERT(dtype_of(weights) == c10::ScalarType::Float, "dtype check");
+    HOST_ASSERT(weights.scalar_type() == at::ScalarType::Float, "dtype check");
 
-    float *weights_ptr = weights.data_ptr<float>();
+    float *weights_ptr = (float *)weights.data_ptr();
     uint32_t weights_stride = weights.stride(0);
 
     uint32_t *bound_m_ptr = nullptr;
     if (bound_m.has_value()) {
       HOST_ASSERT(bound_m->numel() == 1, "only one m bound");
-      HOST_ASSERT(dtype_of(*bound_m) == c10::ScalarType::UInt32,
+      HOST_ASSERT(bound_m->scalar_type() == at::ScalarType::UInt32,
                   "bound_m dtype check");
-      bound_m_ptr = bound_m->data_ptr<uint32_t>();
+      bound_m_ptr = (uint32_t *)bound_m->data_ptr();
     }
 
     if (do_send) {
@@ -295,7 +298,7 @@ public:
         printf("launching dispatch send from all2all_tk.hpp\n");
       }
 
-      at::Tensor dp_x_scale_val = dp_x_scale.value();
+      torch::stable::Tensor dp_x_scale_val = dp_x_scale.value();
       this->context_->dispatch_send(dp_x, dp_x_scale_val, indices, weights,
                                     this->context_->workspace.sync_counter,
                                     dp_x.size(0), stream);
@@ -324,7 +327,7 @@ public:
         CUDA_CHECK(cudaStreamSynchronize(stream));
         printf("launching dispatch recv from all2all_tk.hpp\n");
       }
-      at::Tensor out_expert_x_scale_val = out_expert_x_scale.value();
+      torch::stable::Tensor out_expert_x_scale_val = out_expert_x_scale.value();
       this->context_->dispatch_recv(out_expert_x, out_expert_x_scale_val,
                                     out_expert_num_tokens_ptr, stream);
       if (get_env<int>("A2A_DEBUG") > 0) {
@@ -333,9 +336,9 @@ public:
     }
   }
 
-  void combine(at::Tensor &out_tokens, // (activations for this device)
-               at::Tensor &indices, at::Tensor &weights, at::Tensor &expert_y,
-               std::optional<at::Tensor> &bound_m, bool do_send = true,
+  void combine(torch::stable::Tensor &out_tokens, // (activations for this device)
+               torch::stable::Tensor &indices, torch::stable::Tensor &weights, torch::stable::Tensor &expert_y,
+               std::optional<torch::stable::Tensor> &bound_m, bool do_send = true,
                bool do_recv = true, bool accumulate = false,
                cudaStream_t stream = nullptr) override {
     HOST_ASSERT(initialized_, "All2All handler is not initialized");
@@ -345,21 +348,21 @@ public:
     uint32_t num_recv_tokens = expert_y.size(0);
     HOST_ASSERT(out_tokens.dim() == 2, "input tokens ndim == 2");
     HOST_ASSERT(out_tokens.stride(1) == 1, "contiguous check");
-    HOST_ASSERT(dtype_of(out_tokens) == this->out_dtype_, "input dtype check");
+    HOST_ASSERT(out_tokens.scalar_type() == this->out_dtype_, "input dtype check");
 
     uint8_t *out_tokens_ptr = (uint8_t *)out_tokens.data_ptr();
 
     HOST_ASSERT(indices.dim() == 2 && indices.size(0) == num_tokens &&
                     indices.size(1) == this->num_experts_per_token_,
                 "indices shape check");
-    HOST_ASSERT(dtype_of(indices) == c10::ScalarType::Int, "dtype check");
+      HOST_ASSERT(indices.scalar_type() == at::ScalarType::Int, "dtype check");
 
     HOST_ASSERT(weights.dim() == 2 && weights.size(0) == num_tokens &&
                     weights.size(1) == this->num_experts_per_token_,
                 "Weight ndimension check");
-    HOST_ASSERT(dtype_of(weights) == c10::ScalarType::Float, "dtype check");
+    HOST_ASSERT(weights.scalar_type() == at::ScalarType::Float, "dtype check");
 
-    float *weights_ptr = weights.data_ptr<float>();
+    float *weights_ptr = (float *)weights.data_ptr();
     uint32_t weights_stride = weights.stride(0);
 
     HOST_ASSERT(expert_y.dim() == 2,
@@ -368,9 +371,9 @@ public:
     uint32_t *bound_m_ptr = nullptr;
     if (bound_m.has_value()) {
       HOST_ASSERT(bound_m->numel() == 1, "only one m bound");
-      HOST_ASSERT(dtype_of(*bound_m) == c10::ScalarType::UInt32,
+      HOST_ASSERT(bound_m->scalar_type() == at::ScalarType::UInt32,
                   "bound_m dtype check");
-      bound_m_ptr = bound_m->data_ptr<uint32_t>();
+      bound_m_ptr = (uint32_t *)bound_m->data_ptr();
     }
 
     if (do_send) {

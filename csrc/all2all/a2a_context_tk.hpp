@@ -16,7 +16,15 @@
 #include <runtime/device.hpp>
 
 #include "a2a_worker_tk.hpp"
-#include <ATen/ATen.h>
+#include <torch/csrc/stable/tensor.h>
+
+#include <torch/csrc/inductor/aoti_torch/utils.h>
+inline at::Tensor &stable_to_aten(torch::stable::Tensor &t) {
+  return *torch::aot_inductor::tensor_handle_to_tensor_pointer(t.get());
+}
+inline const at::Tensor &stable_to_aten(const torch::stable::Tensor &t) {
+  return *torch::aot_inductor::tensor_handle_to_tensor_pointer(t.get());
+}
 
 class P2PDeviceWorkspace {
 public:
@@ -143,8 +151,8 @@ public:
         .sync(this->world_size);
   }
 
-  void dispatch_send(at::Tensor &in_tokens, at::Tensor &in_scales,
-                     at::Tensor &indices, at::Tensor &weights,
+  void dispatch_send(torch::stable::Tensor &in_tokens, torch::stable::Tensor &in_scales,
+                     torch::stable::Tensor &indices, torch::stable::Tensor &weights,
                      uint32_t *sync_counter, uint32_t num_tokens,
                      cudaStream_t stream) {
     if (num_tokens > this->max_num_tokens) {
@@ -153,7 +161,7 @@ public:
     cudaError_t status =
         a2a_kernels::fp8e4m3_a2a_dispatch_send<EXPERTS_PER_TOKEN, NUM_EXPERTS,
                                                TOKEN_DIM>(
-            in_tokens, in_scales, indices, weights,
+            stable_to_aten(in_tokens), stable_to_aten(in_scales), stable_to_aten(indices), stable_to_aten(weights),
             this->workspace.token_offset, this->workspace.expert_offsets,
             this->recv_buffer, this->recv_scale_buffer,
             this->num_routed_tensor.data_, this->send_buffer,
@@ -163,7 +171,7 @@ public:
     CUDA_CHECK(status);
   }
 
-  void dispatch_recv(at::Tensor &out_tokens, at::Tensor &out_scales,
+  void dispatch_recv(torch::stable::Tensor &out_tokens, torch::stable::Tensor &out_scales,
                      uint32_t *out_num_tokens_ptr, cudaStream_t stream) {
     (void)out_num_tokens_ptr;
     cudaError_t status =
@@ -177,26 +185,26 @@ public:
     CUDA_CHECK(status);
   }
 
-  void combine_send(at::Tensor &experts_out, cudaStream_t stream) {
+  void combine_send(torch::stable::Tensor &experts_out, cudaStream_t stream) {
     HOST_ASSERT(experts_out.scalar_type() == at::ScalarType::BFloat16,
                 "Only Bf16 combine kernels supported for now");
     int num_recv_tokens = static_cast<int>(this->worker.num_recv_tokens);
     cudaError_t status = a2a_kernels::a2a_combine_send_tk<TOKEN_DIM>(
-        experts_out, this->recv_buffer, this->barrier,
+        stable_to_aten(experts_out), this->recv_buffer, this->barrier,
         this->worker.combine_send_offset, this->worker.source_rank,
         this->worker.padded_index, this->workspace.sync_counter,
         num_recv_tokens, this->rank, this->dp_group, this->dp_size, stream);
     CUDA_CHECK(status);
   }
 
-  void combine_recv(at::Tensor &out_tokens, at::Tensor &indices,
-                    at::Tensor &weights, bool accumulate, cudaStream_t stream) {
+  void combine_recv(torch::stable::Tensor &out_tokens, torch::stable::Tensor &indices,
+                    torch::stable::Tensor &weights, bool accumulate, cudaStream_t stream) {
     HOST_ASSERT(out_tokens.scalar_type() == at::ScalarType::BFloat16,
                 "Only Bf16 combine kernels supported for now");
     cudaError_t status =
         a2a_kernels::a2a_combine_recv_tk<EXPERTS_PER_TOKEN, NUM_EXPERTS,
                                          TOKEN_DIM>(
-            this->barrier, this->recv_buffer, out_tokens, indices, weights,
+            this->barrier, this->recv_buffer, stable_to_aten(out_tokens), stable_to_aten(indices), stable_to_aten(weights),
             this->workspace.token_offset, this->workspace.expert_offsets,
             this->workspace.sync_counter, out_tokens.size(-2), accumulate,
             this->rank, this->dp_group, stream);

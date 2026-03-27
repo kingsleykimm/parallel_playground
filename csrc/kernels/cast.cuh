@@ -10,8 +10,9 @@
 #include <cuda_runtime.h>
 #include <optional>
 #include <runtime/device.hpp>
-#include <runtime/tensor_compat.h>
 #include <runtime/utils.h>
+#include <torch/csrc/stable/ops.h>
+#include <torch/csrc/stable/tensor.h>
 #include <utility>
 
 namespace moe_cuda {
@@ -280,10 +281,11 @@ inline void fused_silu_mul_quant(__nv_bfloat16 *gemm_out,
   CUDA_SYNC_DEBUG();
 }
 
-inline void cast_(at::Tensor &inp, at::Tensor &out,
-                  std::optional<at::Tensor> &scale, cudaStream_t stream) {
+inline void cast_(torch::stable::Tensor &inp, torch::stable::Tensor &out,
+                  std::optional<torch::stable::Tensor> &scale,
+                  cudaStream_t stream) {
   NvtxRange range("cast");
-  if (dtype_of(inp) == dtype_of(out)) {
+  if (inp.scalar_type() == out.scalar_type()) {
     printf("inp and out are the same dtype\n");
     out = std::move(inp);
     return;
@@ -310,37 +312,42 @@ inline void cast_(at::Tensor &inp, at::Tensor &out,
   dim3 grid(grid_size);
   dim3 block(block_size);
 
-  if (dtype_of(inp) == c10::ScalarType::BFloat16 &&
-      dtype_of(out) == c10::ScalarType::Float) {
+  auto inp_dtype = inp.scalar_type();
+  auto out_dtype = out.scalar_type();
+
+  if (inp_dtype == c10::ScalarType::BFloat16 &&
+      out_dtype == c10::ScalarType::Float) {
     cast_bf16_to_f32(
-        reinterpret_cast<const __nv_bfloat16 *>(inp.data_ptr<c10::BFloat16>()),
-        out.data_ptr<float>(), nelem, grid, block, stream);
+        reinterpret_cast<const __nv_bfloat16 *>(inp.const_data_ptr()),
+        static_cast<float *>(out.mutable_data_ptr()), nelem, grid, block,
+        stream);
     CUDA_SYNC_DEBUG();
-  } else if (dtype_of(inp) == c10::ScalarType::Float &&
-             dtype_of(out) == c10::ScalarType::BFloat16) {
+  } else if (inp_dtype == c10::ScalarType::Float &&
+             out_dtype == c10::ScalarType::BFloat16) {
     cast_f32_to_bf16(
-        inp.data_ptr<float>(),
-        reinterpret_cast<__nv_bfloat16 *>(out.data_ptr<c10::BFloat16>()), nelem,
-        grid, block, stream);
+        static_cast<const float *>(inp.const_data_ptr()),
+        reinterpret_cast<__nv_bfloat16 *>(out.mutable_data_ptr()), nelem, grid,
+        block, stream);
     CUDA_SYNC_DEBUG();
-  } else if (dtype_of(inp) == c10::ScalarType::BFloat16 &&
-             dtype_of(out) == c10::ScalarType::Float8_e4m3fn) {
+  } else if (inp_dtype == c10::ScalarType::BFloat16 &&
+             out_dtype == c10::ScalarType::Float8_e4m3fn) {
     HOST_ASSERT(scale.has_value(), "cast.cu, bf16 to fp8 requires an "
                                    "additional scale tensor to be passed in");
-    HOST_ASSERT(dtype_of(*scale) == c10::ScalarType::Float,
+    HOST_ASSERT(scale->scalar_type() == c10::ScalarType::Float,
                 "cast.cu: scale tensor for fp8 must be fp32");
     size_t num_rows = 1;
     for (int i = 0; i < inp.dim() - 1; i++) {
       num_rows *= inp.size(i);
     }
     cast_bf16_to_fp8_blkscaled(
-        reinterpret_cast<const __nv_bfloat16 *>(inp.data_ptr<c10::BFloat16>()),
-        reinterpret_cast<__nv_fp8_e4m3 *>(out.data_ptr<c10::Float8_e4m3fn>()),
-        scale->data_ptr<float>(), num_rows, inp.size(-1), stream);
+        reinterpret_cast<const __nv_bfloat16 *>(inp.const_data_ptr()),
+        reinterpret_cast<__nv_fp8_e4m3 *>(out.mutable_data_ptr()),
+        static_cast<float *>(scale->mutable_data_ptr()), num_rows,
+        inp.size(-1), stream);
     CUDA_SYNC_DEBUG();
   } else {
-    printf("inp dtype: %d, out dtype: %d\n", static_cast<int>(dtype_of(inp)),
-           static_cast<int>(dtype_of(out)));
+    printf("inp dtype: %d, out dtype: %d\n", static_cast<int>(inp_dtype),
+           static_cast<int>(out_dtype));
     HOST_ERROR("cast.cu: Unsupported cast operation");
   }
   CUDA_CHECK(cudaGetLastError());

@@ -6,7 +6,8 @@
 #include <runtime/device.hpp>
 #include <runtime/format.hpp>
 #include <runtime/tensor.h>
-
+#include <torch/csrc/stable/ops.h>
+#include <torch/csrc/stable/tensor.h>
 class SM90_Transpose_SF_Runtime : LaunchRuntime<SM90_Transpose_SF_Runtime> {
 public:
   struct Args {
@@ -91,29 +92,30 @@ public:
 };
 
 // when calling any of these methods, it is assumed sfa and sfb are row-major
-inline void sm90_transpose_sf(at::Tensor &sf, at::Tensor &transposed_sf,
+inline void sm90_transpose_sf(torch::stable::Tensor &sf, torch::stable::Tensor &transposed_sf,
                               cudaStream_t &stream) {
   // determine num_threads ,block_mn, sf_k
   // HOST_ASSERT(sf.dim() < 3, "scale factor ndim should be less than 2 for
   // GEMMs");
   HOST_ASSERT(sf.dim() == 2 || sf.dim() == 3,
               "scale factor ndim should be 2 or 3 for GEMMs");
-  (sf.dim() == 2) ? custom::unsqueeze(sf, 0) : void();
-
+  if (sf.dim() == 2) {
+    sf = unsqueeze(sf, 0);
+  }
   size_t num_groups = sf.size(0);
   size_t mn = sf.size(1);
   size_t k = sf.size(2);
   // determine BLOCK_MN with a small heuristic search based off of mn size
   const auto [block_mn, num_threads, smem_size] = get_transpose_config(mn, k);
-  const size_t aligned_mn = host_align(mn, 16 / get_type_size(dtype_of(sf)));
+  const size_t aligned_mn = host_align(mn, 16 / get_type_size(sf.scalar_type()));
   LaunchConfig launch_config = {dim3(num_threads),
                                 dim3(host_ceil_div(mn, block_mn), num_groups),
                                 stream, smem_size, 1};
   SM90_Transpose_SF_Runtime::Args args = {static_cast<uint32_t>(num_threads),
                                           (uint32_t)block_mn,
                                           static_cast<uint32_t>(k),
-                                          sf.data_ptr<float>(),
-                                          transposed_sf.data_ptr<float>(),
+                                          (float *)sf.data_ptr(),
+                                          (float *)transposed_sf.data_ptr(),
                                           mn,
                                           aligned_mn,
                                           stream,
