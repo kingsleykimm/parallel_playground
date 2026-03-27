@@ -125,8 +125,8 @@ public:
         parallel_config.node_size, parallel_config.world_size, stream);
   }
 
-  // for testing
-  #if 0
+// for testing
+#if 0
   RoutingDebugState debug_routing_state(cudaStream_t stream = nullptr) const {
     HOST_ASSERT(initialized_, "All2All handler is not initialized");
     HOST_ASSERT(this->context_.has_value(),
@@ -199,12 +199,13 @@ public:
                 hw.size() * sizeof(uint32_t));
     return t;
   }
-  #endif
+#endif
 
   void dispatch(
       torch::stable::Tensor &out_expert_num_tokens, // output counts per expert
-      torch::stable::Tensor &out_expert_x, // inputs into the grouped gemm kenrel, with
-                                // optional scale factors (to be quantized)
+      torch::stable::Tensor
+          &out_expert_x, // inputs into the grouped gemm kenrel, with
+                         // optional scale factors (to be quantized)
       std::optional<torch::stable::Tensor> &out_expert_x_scale,
       torch::stable::Tensor &dp_x, // input tokens to be dispatched
       std::optional<torch::stable::Tensor>
@@ -241,7 +242,8 @@ public:
       HOST_ASSERT(
           this->scale_dtype_.has_value(),
           "scale_dtype must be set when out_expert_x_scale is provided");
-      HOST_ASSERT(out_expert_x_scale->scalar_type() == this->scale_dtype_.value(),
+      HOST_ASSERT(out_expert_x_scale->scalar_type() ==
+                      this->scale_dtype_.value(),
                   "Scale dtypes do not match");
       out_x_scale_ptr = (float *)out_expert_x_scale->data_ptr();
       out_x_scale_stride_elem = out_expert_x_scale->stride(1);
@@ -336,11 +338,13 @@ public:
     }
   }
 
-  void combine(torch::stable::Tensor &out_tokens, // (activations for this device)
-               torch::stable::Tensor &indices, torch::stable::Tensor &weights, torch::stable::Tensor &expert_y,
-               std::optional<torch::stable::Tensor> &bound_m, bool do_send = true,
-               bool do_recv = true, bool accumulate = false,
-               cudaStream_t stream = nullptr) override {
+  void
+  combine(torch::stable::Tensor &out_tokens, // (activations for this device)
+          torch::stable::Tensor &indices, torch::stable::Tensor &weights,
+          torch::stable::Tensor &expert_y,
+          std::optional<torch::stable::Tensor> &bound_m, bool do_send = true,
+          bool do_recv = true, bool accumulate = false,
+          cudaStream_t stream = nullptr) override {
     HOST_ASSERT(initialized_, "All2All handler is not initialized");
     HOST_ASSERT(do_send || do_recv, "needed");
 
@@ -348,14 +352,15 @@ public:
     uint32_t num_recv_tokens = expert_y.size(0);
     HOST_ASSERT(out_tokens.dim() == 2, "input tokens ndim == 2");
     HOST_ASSERT(out_tokens.stride(1) == 1, "contiguous check");
-    HOST_ASSERT(out_tokens.scalar_type() == this->out_dtype_, "input dtype check");
+    HOST_ASSERT(out_tokens.scalar_type() == this->out_dtype_,
+                "input dtype check");
 
     uint8_t *out_tokens_ptr = (uint8_t *)out_tokens.data_ptr();
 
     HOST_ASSERT(indices.dim() == 2 && indices.size(0) == num_tokens &&
                     indices.size(1) == this->num_experts_per_token_,
                 "indices shape check");
-      HOST_ASSERT(indices.scalar_type() == at::ScalarType::Int, "dtype check");
+    HOST_ASSERT(indices.scalar_type() == at::ScalarType::Int, "dtype check");
 
     HOST_ASSERT(weights.dim() == 2 && weights.size(0) == num_tokens &&
                     weights.size(1) == this->num_experts_per_token_,

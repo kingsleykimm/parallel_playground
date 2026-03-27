@@ -1,8 +1,8 @@
 #pragma once
-#include <torch/csrc/stable/tensor.h>
-#include <torch/headeronly/core/ScalarType.h>
 #include <cstddef>
 #include <pyutils/parallel_tensor.cuh>
+#include <torch/csrc/stable/tensor.h>
+#include <torch/headeronly/core/ScalarType.h>
 
 extern "C" size_t tk_globals_size(int bm, int bn, int bk,
                                   c10::ScalarType c_dtype);
@@ -55,13 +55,16 @@ size_t tk_kernel5_1_globals_size(int H);
 void tk_build_kernel5_1_globals(
     int H, void *out, kittens::py::TKParallelTensor &in_tokens,
     kittens::py::TKParallelTensor &in_tokens_scales,
-    torch::stable::Tensor &expert_x_tokens, torch::stable::Tensor &expert_x_tokens_scale,
-    torch::stable::Tensor &comm_comp_barrier, torch::stable::Tensor &gate, torch::stable::Tensor &up,
-    torch::stable::Tensor &C, torch::stable::Tensor &scale_gate, torch::stable::Tensor &scale_up,
+    torch::stable::Tensor &expert_x_tokens,
+    torch::stable::Tensor &expert_x_tokens_scale,
+    torch::stable::Tensor &comm_comp_barrier, torch::stable::Tensor &gate,
+    torch::stable::Tensor &up, torch::stable::Tensor &C,
+    torch::stable::Tensor &scale_gate, torch::stable::Tensor &scale_up,
     torch::stable::Tensor &out_scales, torch::stable::Tensor &indices,
     kittens::py::TKParallelTensor &global_num_routed,
     kittens::py::TKParallelTensor &expert_to_token_map,
-    torch::stable::Tensor &padded_expert_counts, torch::stable::Tensor &src_token_idx,
-    torch::stable::Tensor &src_dev_idx, kittens::py::TKParallelTensor &barrier,
-    int num_tokens, int *num_recv_tokens, int dp_rank, int rank, int dp_size,
-    int cur_dp_group, int num_dp_groups, int num_comm_sms, int num_comp_sms);
+    torch::stable::Tensor &padded_expert_counts,
+    torch::stable::Tensor &src_token_idx, torch::stable::Tensor &src_dev_idx,
+    kittens::py::TKParallelTensor &barrier, int num_tokens,
+    int *num_recv_tokens, int dp_rank, int rank, int dp_size, int cur_dp_group,
+    int num_dp_groups, int num_comm_sms, int num_comp_sms);

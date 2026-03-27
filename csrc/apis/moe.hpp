@@ -9,25 +9,30 @@
 // #include <jit_kernels/impls/sm90_bf16_gemm.hpp>
 #include <jit_kernels/impls/sm90_fp8_gemm_1d2d.hpp>
 #include <runtime/device.hpp>
-#include <torch/csrc/stable/tensor.h>
 #include <torch/csrc/stable/ops.h>
+#include <torch/csrc/stable/tensor.h>
 namespace moe_cuda {
 namespace api {
 
 // we always assume SFA is K-major; normal (non-grouped) FP8 GEMM NT only
-inline void fp8_gemm_nt(torch::stable::Tensor &act, torch::stable::Tensor &act_scale,
-                        torch::stable::Tensor &weight, torch::stable::Tensor &weight_scale,
+inline void fp8_gemm_nt(torch::stable::Tensor &act,
+                        torch::stable::Tensor &act_scale,
+                        torch::stable::Tensor &weight,
+                        torch::stable::Tensor &weight_scale,
                         torch::stable::Tensor &output,
                         [[maybe_unused]] const std::string &compiled_dims,
                         cudaStream_t &stream) {
   HOST_ASSERT(act.dim() < 3,
               "A tensor for FP8 GEMM must have less than three dims");
   auto sfa_mn_major = contiguous(transpose(act_scale, -1, -2));
-  sm90_fp8_gemm_1d2d_nt(act, weight, sfa_mn_major, weight_scale, output, stream);
+  sm90_fp8_gemm_1d2d_nt(act, weight, sfa_mn_major, weight_scale, output,
+                        stream);
 }
 
-inline void fp8_grouped_gemm(torch::stable::Tensor &act, torch::stable::Tensor &act_scale,
-                             torch::stable::Tensor &weight, torch::stable::Tensor &weight_scale,
+inline void fp8_grouped_gemm(torch::stable::Tensor &act,
+                             torch::stable::Tensor &act_scale,
+                             torch::stable::Tensor &weight,
+                             torch::stable::Tensor &weight_scale,
                              torch::stable::Tensor &output, GemmType gemm_type,
                              int *grouped_layout, cudaStream_t &stream) {
   if (gemm_type == GemmType::MGroupedContiguous) {
@@ -48,9 +53,10 @@ inline void fp8_grouped_gemm(torch::stable::Tensor &act, torch::stable::Tensor &
 }
 
 // inline void bf16_gemm(torch::stable::Tensor &A, torch::stable::Tensor &B,
-//                       std::optional<torch::stable::Tensor> &C, torch::stable::Tensor &D,
-//                       GemmType gemm_type, const std::string &compiled_dims,
-//                       int *grouped_layout, cudaStream_t &stream) {
+//                       std::optional<torch::stable::Tensor> &C,
+//                       torch::stable::Tensor &D, GemmType gemm_type, const
+//                       std::string &compiled_dims, int *grouped_layout,
+//                       cudaStream_t &stream) {
 //   if (gemm_type != GemmType::MGroupedMasked) {
 //     HOST_ASSERT(A.dim() < 3,
 //                 "A tensor for BF16 GEMM must have less than three dims");
@@ -70,17 +76,18 @@ inline void fp8_grouped_gemm(torch::stable::Tensor &act, torch::stable::Tensor &
 //                                   stream);
 //   } else if (gemm_type == GemmType::Batched) {
 //     HOST_ASSERT(A.dim() == 3,
-//                 "A tensor for BF16 GEMM must have three dims for batched mode");
+//                 "A tensor for BF16 GEMM must have three dims for batched
+//                 mode");
 //     sm90_bf16_batched_gemm(A, B, D, compiled_dims, stream);
 //   }
 // }
 
-inline void fp8_grouped_gemm_swiglu(torch::stable::Tensor &A, torch::stable::Tensor &gate_weight,
-                                    torch::stable::Tensor &up_weight, torch::stable::Tensor &scale_a,
-                                    torch::stable::Tensor &scale_gate,
-                                    torch::stable::Tensor &scale_up, torch::stable::Tensor &scale_d,
-                                    torch::stable::Tensor &D, GemmType gemm_type,
-                                    int *grouped_layout, cudaStream_t &stream) {
+inline void fp8_grouped_gemm_swiglu(
+    torch::stable::Tensor &A, torch::stable::Tensor &gate_weight,
+    torch::stable::Tensor &up_weight, torch::stable::Tensor &scale_a,
+    torch::stable::Tensor &scale_gate, torch::stable::Tensor &scale_up,
+    torch::stable::Tensor &scale_d, torch::stable::Tensor &D,
+    GemmType gemm_type, int *grouped_layout, cudaStream_t &stream) {
   if (get_env<int>("MOE_CUDA_DEBUG") != 0) {
     printf("FP8 Grouped GEMM Swiglu launching in moe.hpp \n");
   }
@@ -96,10 +103,11 @@ inline void fp8_grouped_gemm_swiglu(torch::stable::Tensor &A, torch::stable::Ten
 }
 
 void fp8_grouped_gemm_swiglu_consumer_pp(
-    torch::stable::Tensor &A, torch::stable::Tensor &gate_weight, torch::stable::Tensor &up_weight,
-    torch::stable::Tensor &scale_a, torch::stable::Tensor &scale_gate, torch::stable::Tensor &scale_up,
-    torch::stable::Tensor &scale_d, torch::stable::Tensor &D, GemmType gemm_type, int *grouped_layout,
-    cudaStream_t &stream) {
+    torch::stable::Tensor &A, torch::stable::Tensor &gate_weight,
+    torch::stable::Tensor &up_weight, torch::stable::Tensor &scale_a,
+    torch::stable::Tensor &scale_gate, torch::stable::Tensor &scale_up,
+    torch::stable::Tensor &scale_d, torch::stable::Tensor &D,
+    GemmType gemm_type, int *grouped_layout, cudaStream_t &stream) {
 
   HOST_ASSERT(grouped_layout != nullptr,
               "grouped_layout cannot be null for masked grouped FP8 swiglu "

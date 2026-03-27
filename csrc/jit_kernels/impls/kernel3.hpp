@@ -3,8 +3,6 @@
   @brief JIT launcher for kernel3 - grouped gemm with fused silumulquant
  */
 #pragma once
-#include <torch/headeronly/core/ScalarType.h>
-#include <torch/csrc/stable/tensor.h>
 #include "jit_kernels/heuristics/heuristics.hpp"
 #include "moe_cuda/types.h"
 #include <algorithm>
@@ -19,6 +17,8 @@
 #include <jit_kernels/tk_globals_factory.h>
 #include <runtime/device.hpp>
 #include <runtime/format.hpp>
+#include <torch/csrc/stable/tensor.h>
+#include <torch/headeronly/core/ScalarType.h>
 
 // Runtime for kernel2::matmul_template (grouped FP8 GEMM)
 // GEMM_TYPE: 0 = MGroupedMasked, 1 = MGroupedContiguous
@@ -104,11 +104,12 @@ static void __instantiate_kernel() {{
 //   D:             (total_M, N/2)         — FP8 output (silu(gate) * up,
 //   requantized) scale_d:       (N/(2*BN), total_M)    — per-(row, col-block)
 //   output scale
-inline void kernel3_contiguous(torch::stable::Tensor &A, torch::stable::Tensor &up_weight,
-                               torch::stable::Tensor &gate_weight, torch::stable::Tensor &scale_a,
-                               torch::stable::Tensor &scale_up, torch::stable::Tensor &scale_gate,
-                               torch::stable::Tensor &scale_d, torch::stable::Tensor &D,
-                               int *grouped_layout, cudaStream_t &stream) {
+inline void kernel3_contiguous(
+    torch::stable::Tensor &A, torch::stable::Tensor &up_weight,
+    torch::stable::Tensor &gate_weight, torch::stable::Tensor &scale_a,
+    torch::stable::Tensor &scale_up, torch::stable::Tensor &scale_gate,
+    torch::stable::Tensor &scale_d, torch::stable::Tensor &D,
+    int *grouped_layout, cudaStream_t &stream) {
   HOST_ASSERT(
       D.scalar_type() == c10::ScalarType::Float8_e4m3fn,
       "unsupported output dtype: kernel3 outputs FP8-quantized activations");
@@ -180,11 +181,13 @@ inline void kernel3_contiguous(torch::stable::Tensor &A, torch::stable::Tensor &
 //   N/128, K/128) grouped_layout: (num_groups,) int32   — actual M count per
 //   group D:             (num_groups * max_M, N/2) — FP8 output scale_d:
 //   (N/(2*BN), num_groups * max_M) — per-(row, col-block) output scale
-inline void kernel3_masked(torch::stable::Tensor &A, torch::stable::Tensor &up_weight,
-                           torch::stable::Tensor &gate_weight, torch::stable::Tensor &scale_a,
-                           torch::stable::Tensor &scale_up, torch::stable::Tensor &scale_gate,
-                           torch::stable::Tensor &scale_d, torch::stable::Tensor &D,
-                           int *grouped_layout, cudaStream_t &stream) {
+inline void
+kernel3_masked(torch::stable::Tensor &A, torch::stable::Tensor &up_weight,
+               torch::stable::Tensor &gate_weight,
+               torch::stable::Tensor &scale_a, torch::stable::Tensor &scale_up,
+               torch::stable::Tensor &scale_gate,
+               torch::stable::Tensor &scale_d, torch::stable::Tensor &D,
+               int *grouped_layout, cudaStream_t &stream) {
   HOST_ASSERT(
       D.scalar_type() == c10::ScalarType::Float8_e4m3fn,
       "unsupported output dtype: kernel3 outputs FP8-quantized activations");

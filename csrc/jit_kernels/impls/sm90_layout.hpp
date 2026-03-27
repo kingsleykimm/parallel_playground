@@ -92,7 +92,8 @@ public:
 };
 
 // when calling any of these methods, it is assumed sfa and sfb are row-major
-inline void sm90_transpose_sf(torch::stable::Tensor &sf, torch::stable::Tensor &transposed_sf,
+inline void sm90_transpose_sf(torch::stable::Tensor &sf,
+                              torch::stable::Tensor &transposed_sf,
                               cudaStream_t &stream) {
   // determine num_threads ,block_mn, sf_k
   // HOST_ASSERT(sf.dim() < 3, "scale factor ndim should be less than 2 for
@@ -107,7 +108,8 @@ inline void sm90_transpose_sf(torch::stable::Tensor &sf, torch::stable::Tensor &
   size_t k = sf.size(2);
   // determine BLOCK_MN with a small heuristic search based off of mn size
   const auto [block_mn, num_threads, smem_size] = get_transpose_config(mn, k);
-  const size_t aligned_mn = host_align(mn, 16 / get_type_size(sf.scalar_type()));
+  const size_t aligned_mn =
+      host_align(mn, 16 / get_type_size(sf.scalar_type()));
   LaunchConfig launch_config = {dim3(num_threads),
                                 dim3(host_ceil_div(mn, block_mn), num_groups),
                                 stream, smem_size, 1};

@@ -44,7 +44,8 @@ CUresult launch_kernel(KernelHandle &kernel,
 inline LaunchConfigHandle
 create_launch_config(KernelHandle &kernel, const int &smem_size,
                      const dim3 &blockDim, const dim3 &gridDim,
-                     const uint32_t &num_multicast, cudaStream_t stream, bool cooperative = false) {
+                     const uint32_t &num_multicast, cudaStream_t stream,
+                     bool cooperative = false) {
   if (smem_size > 0) {
     CUDA_CHECK(cuFuncSetAttribute(
         kernel, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem_size));

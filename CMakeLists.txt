@@ -3,6 +3,7 @@ project(parallel_playground LANGUAGES CXX CUDA)
 
 option(BUILD_TESTS "Build C++ tests" ON)
 option(BUILD_PYBIND "Build Python extension" OFF)
+option(BUILD_TORCH_API "Build Torch API" OFF)
 option(FETCH_LIBTORCH "Auto-fetch LibTorch when Torch is not found" OFF)
 set(LIBTORCH_VERSION "2.10.0" CACHE STRING "LibTorch version to fetch")
 set(LIBTORCH_CUDA_TAG "" CACHE STRING "Override CUDA tag (e.g. cu128)")
@@ -254,6 +255,11 @@ target_compile_options(moe_cuda_lib PRIVATE
         -O3
         -fPIC
     >
+)
+
+# Static archive: use ARCHIVE_OUTPUT_DIRECTORY (LIBRARY_OUTPUT_DIRECTORY is for SHARED).
+set_target_properties(moe_cuda_lib PROPERTIES
+    ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/build"
 )
 
 if(BUILD_PYBIND)

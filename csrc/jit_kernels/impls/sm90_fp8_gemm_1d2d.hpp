@@ -1,5 +1,4 @@
 #pragma once
-#include <torch/headeronly/core/ScalarType.h>
 #include "jit_kernels/heuristics/heuristics.hpp"
 #include "moe_cuda/types.h"
 #include <cassert>
@@ -11,6 +10,7 @@
 #include <runtime/device.hpp>
 #include <runtime/format.hpp>
 #include <torch/csrc/stable/tensor.h>
+#include <torch/headeronly/core/ScalarType.h>
 
 class SM90_FP8_GEMM1D2D_TK_Runtime
     : LaunchRuntime<SM90_FP8_GEMM1D2D_TK_Runtime> {
@@ -70,9 +70,12 @@ static void __instantiate_kernel() {{
 // globals factory path. See sm90_fp8_gemm_1d2d_nt below.
 
 // persistent kernel style
-inline void sm90_fp8_gemm_1d2d_nt(torch::stable::Tensor &A, torch::stable::Tensor &B,
-                                  torch::stable::Tensor &scale_a, torch::stable::Tensor &scale_b,
-                                  torch::stable::Tensor &D, cudaStream_t &stream) {
+inline void sm90_fp8_gemm_1d2d_nt(torch::stable::Tensor &A,
+                                  torch::stable::Tensor &B,
+                                  torch::stable::Tensor &scale_a,
+                                  torch::stable::Tensor &scale_b,
+                                  torch::stable::Tensor &D,
+                                  cudaStream_t &stream) {
 
   HOST_ASSERT(D.scalar_type() == c10::ScalarType::BFloat16 ||
                   D.scalar_type() == c10::ScalarType::Float,
@@ -148,4 +151,3 @@ inline void sm90_fp8_gemm_1d2d_nt(torch::stable::Tensor &A, torch::stable::Tenso
 // [DEPRECATED] sm90_fp8_grouped_gemm_1d2d_contiguous_ref removed —
 // used host-side TMA descriptor creation (make_tma_*_desc). Replaced by
 // TK globals factory path (kernel2 grouped GEMM).
-

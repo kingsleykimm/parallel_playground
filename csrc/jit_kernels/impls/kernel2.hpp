@@ -1,5 +1,4 @@
 #pragma once
-#include <torch/headeronly/core/ScalarType.h>
 #include "jit_kernels/heuristics/heuristics.hpp"
 #include "moe_cuda/types.h"
 #include <algorithm>
@@ -15,7 +14,7 @@
 #include <runtime/device.hpp>
 #include <runtime/format.hpp>
 #include <torch/csrc/stable/tensor.h>
-
+#include <torch/headeronly/core/ScalarType.h>
 
 namespace {
 
@@ -180,11 +179,10 @@ static void __instantiate_kernel() {{
 //   scale_b:    (num_groups * N/128, K/128)
 //   grouped_layout: (total_M,) int32 device array — group index per token row
 //   D:          (total_M, N)
-inline void sm90_fp8_grouped_gemm_contiguous(torch::stable::Tensor &A, torch::stable::Tensor &B,
-                                             torch::stable::Tensor &scale_a,
-                                             torch::stable::Tensor &scale_b, torch::stable::Tensor &D,
-                                             int *grouped_layout,
-                                             cudaStream_t &stream) {
+inline void sm90_fp8_grouped_gemm_contiguous(
+    torch::stable::Tensor &A, torch::stable::Tensor &B,
+    torch::stable::Tensor &scale_a, torch::stable::Tensor &scale_b,
+    torch::stable::Tensor &D, int *grouped_layout, cudaStream_t &stream) {
   HOST_ASSERT(D.scalar_type() == c10::ScalarType::BFloat16 ||
                   D.scalar_type() == c10::ScalarType::Float,
               "unsupported output dtype");
@@ -260,11 +258,10 @@ inline void sm90_fp8_grouped_gemm_contiguous(torch::stable::Tensor &A, torch::st
 //   scale_b:    (num_groups * N/128, K/128)
 //   grouped_layout: (num_groups,) int32 device array — actual M per group
 //   D:          (num_groups, max_M,  N)
-inline void sm90_fp8_grouped_gemm_masked(torch::stable::Tensor &A, torch::stable::Tensor &B,
-                                         torch::stable::Tensor &scale_a,
-                                         torch::stable::Tensor &scale_b, torch::stable::Tensor &D,
-                                         int *grouped_layout,
-                                         cudaStream_t &stream) {
+inline void sm90_fp8_grouped_gemm_masked(
+    torch::stable::Tensor &A, torch::stable::Tensor &B,
+    torch::stable::Tensor &scale_a, torch::stable::Tensor &scale_b,
+    torch::stable::Tensor &D, int *grouped_layout, cudaStream_t &stream) {
   HOST_ASSERT(D.scalar_type() == c10::ScalarType::BFloat16 ||
                   D.scalar_type() == c10::ScalarType::Float,
               "unsupported output dtype");

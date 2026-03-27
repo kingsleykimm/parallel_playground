@@ -324,10 +324,9 @@ inline void cast_(torch::stable::Tensor &inp, torch::stable::Tensor &out,
     CUDA_SYNC_DEBUG();
   } else if (inp_dtype == c10::ScalarType::Float &&
              out_dtype == c10::ScalarType::BFloat16) {
-    cast_f32_to_bf16(
-        static_cast<const float *>(inp.const_data_ptr()),
-        reinterpret_cast<__nv_bfloat16 *>(out.mutable_data_ptr()), nelem, grid,
-        block, stream);
+    cast_f32_to_bf16(static_cast<const float *>(inp.const_data_ptr()),
+                     reinterpret_cast<__nv_bfloat16 *>(out.mutable_data_ptr()),
+                     nelem, grid, block, stream);
     CUDA_SYNC_DEBUG();
   } else if (inp_dtype == c10::ScalarType::BFloat16 &&
              out_dtype == c10::ScalarType::Float8_e4m3fn) {
@@ -342,8 +341,8 @@ inline void cast_(torch::stable::Tensor &inp, torch::stable::Tensor &out,
     cast_bf16_to_fp8_blkscaled(
         reinterpret_cast<const __nv_bfloat16 *>(inp.const_data_ptr()),
         reinterpret_cast<__nv_fp8_e4m3 *>(out.mutable_data_ptr()),
-        static_cast<float *>(scale->mutable_data_ptr()), num_rows,
-        inp.size(-1), stream);
+        static_cast<float *>(scale->mutable_data_ptr()), num_rows, inp.size(-1),
+        stream);
     CUDA_SYNC_DEBUG();
   } else {
     printf("inp dtype: %d, out dtype: %d\n", static_cast<int>(inp_dtype),

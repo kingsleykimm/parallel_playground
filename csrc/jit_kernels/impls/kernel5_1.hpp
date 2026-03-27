@@ -1,15 +1,10 @@
 /**
   @file kernel5_1.hpp
-  @brief JIT launcher for kernel5_1 - Fused Dispatch + FC1 of SwiGLU MLP, (Grouped
-  GEMM) Uses cooperative grid launch for grid-wide sync between routing and
-  compute/comm phases.
+  @brief JIT launcher for kernel5_1 - Fused Dispatch + FC1 of SwiGLU MLP,
+  (Grouped GEMM) Uses cooperative grid launch for grid-wide sync between routing
+  and compute/comm phases.
  */
 #pragma once
-#include <optional>
-#include <torch/headeronly/core/ScalarType.h>
-#include <torch/csrc/stable/tensor.h>
-#include <torch/csrc/stable/device.h>
-#include <torch/csrc/stable/ops.h>
 #include "jit_kernels/heuristics/heuristics.hpp"
 #include "moe_cuda/types.h"
 #include <algorithm>
@@ -21,9 +16,14 @@
 #include <jit/runtime.hpp>
 #include <jit/utils/culib.hpp>
 #include <jit_kernels/tk_globals_factory.h>
+#include <optional>
 #include <pyutils/parallel_tensor.cuh>
 #include <runtime/device.hpp>
 #include <runtime/format.hpp>
+#include <torch/csrc/stable/device.h>
+#include <torch/csrc/stable/ops.h>
+#include <torch/csrc/stable/tensor.h>
+#include <torch/headeronly/core/ScalarType.h>
 
 class Kernel5_1Runtime : LaunchRuntime<Kernel5_1Runtime> {
 public:
@@ -138,16 +138,18 @@ auto ptr = reinterpret_cast<void *>(&kernel5_1::global_kernel5_1<
 inline void fused_dispatch_grouped_gemm_swiglu(
     kittens::py::TKParallelTensor &in_tokens,
     kittens::py::TKParallelTensor &in_tokens_scales,
-    torch::stable::Tensor &expert_x_tokens, torch::stable::Tensor &expert_x_tokens_scale,
-    torch::stable::Tensor &gate, torch::stable::Tensor &up,
-    torch::stable::Tensor &C, torch::stable::Tensor &scale_gate, torch::stable::Tensor &scale_up,
+    torch::stable::Tensor &expert_x_tokens,
+    torch::stable::Tensor &expert_x_tokens_scale, torch::stable::Tensor &gate,
+    torch::stable::Tensor &up, torch::stable::Tensor &C,
+    torch::stable::Tensor &scale_gate, torch::stable::Tensor &scale_up,
     torch::stable::Tensor &out_scales, torch::stable::Tensor &indices,
     kittens::py::TKParallelTensor &global_num_routed,
     kittens::py::TKParallelTensor &expert_to_token_map,
-    torch::stable::Tensor &padded_expert_counts, torch::stable::Tensor &src_token_idx,
-    torch::stable::Tensor &src_dev_idx, kittens::py::TKParallelTensor &barrier,
-    int num_tokens, int *num_recv_tokens, int dp_rank, int rank, int dp_size,
-    int cur_dp_group, int num_dp_groups, int world_size, int num_experts, int experts_per_token,
+    torch::stable::Tensor &padded_expert_counts,
+    torch::stable::Tensor &src_token_idx, torch::stable::Tensor &src_dev_idx,
+    kittens::py::TKParallelTensor &barrier, int num_tokens,
+    int *num_recv_tokens, int dp_rank, int rank, int dp_size, int cur_dp_group,
+    int num_dp_groups, int world_size, int num_experts, int experts_per_token,
     int num_comm_sms, int num_comp_sms, cudaStream_t &stream) {
   // for persistent case
   HOST_ASSERT(
@@ -169,15 +171,16 @@ inline void fused_dispatch_grouped_gemm_swiglu(
   uint32_t kernel_smem_size = gemm_config.smem_config.smem_size;
   uint32_t super_m = 8;
 
-
   torch::stable::Tensor comm_comp_barrier = new_zeros(
-    src_token_idx, {host_ceil_div(src_token_idx.size(0), BM), (int64_t) BM}, std::make_optional(torch::headeronly::ScalarType::Int), std::nullopt);
-
+      src_token_idx, {host_ceil_div(src_token_idx.size(0), BM), (int64_t)BM},
+      std::make_optional(torch::headeronly::ScalarType::Int), std::nullopt);
 
   LaunchConfig launch_config = {
       dim3(gemm_config.num_math_threads + gemm_config.num_tma_threads, 1, 1),
-      dim3(total_sms), stream, (int)kernel_smem_size,
-      1, // num_multicast (not used, cooperative handles grid sync),
+      dim3(total_sms),
+      stream,
+      (int)kernel_smem_size,
+      1,   // num_multicast (not used, cooperative handles grid sync),
       true // cooperative launch
   };
 

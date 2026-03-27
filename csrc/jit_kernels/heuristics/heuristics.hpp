@@ -393,19 +393,19 @@ inline GemmConfig get_kernel5_config(uint32_t M, uint32_t I,
   HOST_ASSERT(best_block_m != 0,
               "Error: kernel5 config search yielded no results");
 
-  return GemmConfig{GemmType::MGroupedContiguous,
-                    best_block_m,
-                    block_n,
-                    block_k,
-                    SharedMemoryConfig{get_tk_lcf_kernel5_smem_size(
-                                          best_block_m, best_num_stages),
-                                      0, 0, 0},
-                    1,                        // num_tma_multicast (disabled)
-                    false,                    // tma_multicast_a
-                    best_producer_warps * 32, // num_tma_threads
-                    best_consumer_warps * 32, // num_math_threads
-                    num_sms,
-                    best_num_stages};
+  return GemmConfig{
+      GemmType::MGroupedContiguous,
+      best_block_m,
+      block_n,
+      block_k,
+      SharedMemoryConfig{
+          get_tk_lcf_kernel5_smem_size(best_block_m, best_num_stages), 0, 0, 0},
+      1,                        // num_tma_multicast (disabled)
+      false,                    // tma_multicast_a
+      best_producer_warps * 32, // num_tma_threads
+      best_consumer_warps * 32, // num_math_threads
+      num_sms,
+      best_num_stages};
 }
 
 inline GemmConfig search_configs(GemmType gemm_type, uint32_t M, uint32_t N,

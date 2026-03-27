@@ -18,14 +18,10 @@
 #include <kernels/internal_api.hpp>
 #include <runtime/parallel.h>
 #include <runtime/utils.h>
-#include <torch/headeronly/macros/Macros.h>
 #include <torch/csrc/stable/library.h>
-
+#include <torch/headeronly/macros/Macros.h>
 
 #include <all2all/all2all_base.hpp>
-
-
-
 
 namespace {
 
@@ -140,19 +136,24 @@ public:
         max_private_tokens, rank_, parallel_config, input_stream);
   }
 
-  void dispatch(torch::stable::Tensor &out_expert_num_tokens, torch::stable::Tensor &out_expert_x,
-                std::optional<torch::stable::Tensor> &out_expert_x_scale, torch::stable::Tensor &dp_x,
-                std::optional<torch::stable::Tensor> &dp_x_scale, torch::stable::Tensor &indices,
-                torch::stable::Tensor &weights, std::optional<torch::stable::Tensor> bound_m,
-                bool do_send, bool do_recv) {
+  void dispatch(torch::stable::Tensor &out_expert_num_tokens,
+                torch::stable::Tensor &out_expert_x,
+                std::optional<torch::stable::Tensor> &out_expert_x_scale,
+                torch::stable::Tensor &dp_x,
+                std::optional<torch::stable::Tensor> &dp_x_scale,
+                torch::stable::Tensor &indices, torch::stable::Tensor &weights,
+                std::optional<torch::stable::Tensor> bound_m, bool do_send,
+                bool do_recv) {
     handle_->dispatch(out_expert_num_tokens, out_expert_x, out_expert_x_scale,
                       dp_x, dp_x_scale, indices, weights, bound_m, do_send,
                       do_recv, current_stream());
   }
 
-  void combine(torch::stable::Tensor &out_tokens, torch::stable::Tensor &indices, torch::stable::Tensor &weights,
-               torch::stable::Tensor &expert_y, std::optional<torch::stable::Tensor> bound_m,
-               bool do_send, bool do_recv, bool accumulate) {
+  void combine(torch::stable::Tensor &out_tokens,
+               torch::stable::Tensor &indices, torch::stable::Tensor &weights,
+               torch::stable::Tensor &expert_y,
+               std::optional<torch::stable::Tensor> bound_m, bool do_send,
+               bool do_recv, bool accumulate) {
     handle_->combine(out_tokens, indices, weights, expert_y, bound_m, do_send,
                      do_recv, accumulate, current_stream());
   }
@@ -237,13 +238,17 @@ PYBIND11_MODULE(moe_cuda, m) {
 
   m.def("naive_moe_forward_dispatch",
         [](PyAll2All &all2all, uint32_t num_experts, uint32_t experts_per_token,
-           uint32_t hidden_dim, GemmType gemm_type, torch::stable::Tensor &input,
-           torch::stable::Tensor &input_scales, torch::stable::Tensor &gate, torch::stable::Tensor &gate_scales,
-           torch::stable::Tensor &up, torch::stable::Tensor &up_scales, torch::stable::Tensor &down,
-           torch::stable::Tensor &down_scales, torch::stable::Tensor &indices, torch::stable::Tensor &weights,
+           uint32_t hidden_dim, GemmType gemm_type,
+           torch::stable::Tensor &input, torch::stable::Tensor &input_scales,
+           torch::stable::Tensor &gate, torch::stable::Tensor &gate_scales,
+           torch::stable::Tensor &up, torch::stable::Tensor &up_scales,
+           torch::stable::Tensor &down, torch::stable::Tensor &down_scales,
+           torch::stable::Tensor &indices, torch::stable::Tensor &weights,
            torch::stable::Tensor &out_tokens, torch::stable::Tensor &expert_x,
-           torch::stable::Tensor &expert_x_scales, torch::stable::Tensor &inter_y,
-           torch::stable::Tensor &inter_y_scales, torch::stable::Tensor &expert_y) {
+           torch::stable::Tensor &expert_x_scales,
+           torch::stable::Tensor &inter_y,
+           torch::stable::Tensor &inter_y_scales,
+           torch::stable::Tensor &expert_y) {
           auto stream = current_stream();
           moe_cuda::All2AllBase &a2a = *all2all.handle().get();
           naive_moe_forward_dispatch(

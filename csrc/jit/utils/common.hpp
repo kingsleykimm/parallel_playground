@@ -114,4 +114,3 @@ inline int get_compiled_dim(const std::string &compiled_dims, char dim,
 //   make_tma_a_desc, make_tma_b_desc, make_tma_d_desc,
 //   make_tma_a_desc_3d, make_tma_b_desc_3d, make_tma_d_desc_3d,
 //   make_tma_sf_desc
-

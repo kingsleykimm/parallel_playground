@@ -151,17 +151,19 @@ public:
         .sync(this->world_size);
   }
 
-  void dispatch_send(torch::stable::Tensor &in_tokens, torch::stable::Tensor &in_scales,
-                     torch::stable::Tensor &indices, torch::stable::Tensor &weights,
-                     uint32_t *sync_counter, uint32_t num_tokens,
-                     cudaStream_t stream) {
+  void dispatch_send(torch::stable::Tensor &in_tokens,
+                     torch::stable::Tensor &in_scales,
+                     torch::stable::Tensor &indices,
+                     torch::stable::Tensor &weights, uint32_t *sync_counter,
+                     uint32_t num_tokens, cudaStream_t stream) {
     if (num_tokens > this->max_num_tokens) {
       throw std::runtime_error("Number of tokens exceeds maximum allowed");
     }
     cudaError_t status =
         a2a_kernels::fp8e4m3_a2a_dispatch_send<EXPERTS_PER_TOKEN, NUM_EXPERTS,
                                                TOKEN_DIM>(
-            stable_to_aten(in_tokens), stable_to_aten(in_scales), stable_to_aten(indices), stable_to_aten(weights),
+            stable_to_aten(in_tokens), stable_to_aten(in_scales),
+            stable_to_aten(indices), stable_to_aten(weights),
             this->workspace.token_offset, this->workspace.expert_offsets,
             this->recv_buffer, this->recv_scale_buffer,
             this->num_routed_tensor.data_, this->send_buffer,
@@ -171,7 +173,8 @@ public:
     CUDA_CHECK(status);
   }
 
-  void dispatch_recv(torch::stable::Tensor &out_tokens, torch::stable::Tensor &out_scales,
+  void dispatch_recv(torch::stable::Tensor &out_tokens,
+                     torch::stable::Tensor &out_scales,
                      uint32_t *out_num_tokens_ptr, cudaStream_t stream) {
     (void)out_num_tokens_ptr;
     cudaError_t status =
@@ -197,14 +200,17 @@ public:
     CUDA_CHECK(status);
   }
 
-  void combine_recv(torch::stable::Tensor &out_tokens, torch::stable::Tensor &indices,
-                    torch::stable::Tensor &weights, bool accumulate, cudaStream_t stream) {
+  void combine_recv(torch::stable::Tensor &out_tokens,
+                    torch::stable::Tensor &indices,
+                    torch::stable::Tensor &weights, bool accumulate,
+                    cudaStream_t stream) {
     HOST_ASSERT(out_tokens.scalar_type() == at::ScalarType::BFloat16,
                 "Only Bf16 combine kernels supported for now");
     cudaError_t status =
         a2a_kernels::a2a_combine_recv_tk<EXPERTS_PER_TOKEN, NUM_EXPERTS,
                                          TOKEN_DIM>(
-            this->barrier, this->recv_buffer, stable_to_aten(out_tokens), stable_to_aten(indices), stable_to_aten(weights),
+            this->barrier, this->recv_buffer, stable_to_aten(out_tokens),
+            stable_to_aten(indices), stable_to_aten(weights),
             this->workspace.token_offset, this->workspace.expert_offsets,
             this->workspace.sync_counter, out_tokens.size(-2), accumulate,
             this->rank, this->dp_group, stream);
