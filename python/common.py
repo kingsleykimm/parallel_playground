@@ -13,12 +13,36 @@ class Major(Enum):
     MN = 1
 
 
-def calc_cosine_diff(ref: torch.Tensor, out: torch.Tensor) -> float:
-    ref_d = ref.to(torch.double)
-    out_d = out.to(torch.double)
-    denominator = (ref_d * ref_d + out_d * out_d).sum().item()
-    similarity = (2 * (ref_d * out_d).sum().item()) / denominator
-    return 1 - similarity
+def calc_cosine_diff(x: torch.Tensor, y: torch.Tensor):
+    x, y = x.double(), y.double()
+    denominator = (x * x + y * y).sum()
+    if denominator == 0:    # Which means that all elements in x and y are 0
+        return 0.0
+    sim = 2 * (x * y).sum() / denominator
+    return 1 - sim
+
+
+def quantize_2d_128(input: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    assert input.dtype == torch.float or input.dtype == torch.bfloat16
+    assert input.size(-1) % 128 == 0 and input.size(-2) % 128 == 0
+    num_groups = input.size(0)
+    num_k_blocks = input.size(-1) / 128
+    num_n_blocks = input.size(-2) / 128
+
+    quantized = torch.empty_like(
+        input, dtype=torch.float8_e4m3fn, device=input.device)
+    scales = torch.empty(num_groups, num_n_blocks, num_k_blocks,
+                         dtype=torch.float32, device=input.device)
+
+    for n_block in range(num_n_blocks):
+        for k_block in range(num_k_blocks):
+            slice2d = input[n_block * 128: (n_block + 1)
+                            * 128, k_block * 128: (k_block + 1) * 128]
+            cur_scale = slice2d.abs().amax() / 448.0
+            scales[n_block, k_block] = cur_scale
+            quantized[n_block * 128: (n_block + 1) * 128, k_block * 128: (
+                k_block + 1) * 128] = (slice2d / cur_scale).to(torch.float8_e4m3fn)
+    return quantized, scales
 
 
 def clean_print(*args, **kwargs):
@@ -126,18 +150,18 @@ def profile(
 def quantize_1d_128(input: torch.Tensor):
     assert input.dtype == torch.float or input.dtype == torch.bfloat16
     flattened = input.reshape(-1, input.size(-1))
-    num_blocks = input.size(-1) / 128
+    num_blocks = input.size(-1) // 128
 
     quantized = torch.empty_like(
         flattened, dtype=torch.float8_e4m3fn, device=flattened.device)
-    scales = torch.empty(flattened.size(0), num_blocks,
+    scales = torch.empty((num_blocks, flattened.size(0)),
                          dtype=torch.float32, device=flattened.device)
     for i in range(flattened.size(0)):
 
         for block in range(num_blocks):
             slice = flattened[i, block * 128: (block + 1) * 128]
-            cur_scale = slice.amax() / 448.0
-            scales[i, block] = cur_scale
+            cur_scale = slice.abs().amax() / 448.0
+            scales[block, i] = cur_scale
             quantized[i, block * 128: (block + 1) * 128] = (slice /
                                                             cur_scale).to(torch.float8_e4m3fn)
     return quantized, scales
@@ -147,12 +171,12 @@ def quantize_2d_128(input: torch.Tensor):
     assert input.dtype == torch.float or input.dtype == torch.bfloat16
     assert input.size(-1) % 128 == 0 and input.size(-2) % 128 == 0
     num_groups = input.size(0)
-    num_k_blocks = input.size(-1) / 128
-    num_n_blocks = input.size(-2) / 128
+    num_k_blocks = input.size(-1) // 128
+    num_n_blocks = input.size(-2) // 128
 
     quantized = torch.empty_like(
         input, dtype=torch.float8_e4m3fn, device=input.device)
-    scales = torch.empty(num_groups, num_n_blocks, num_k_blocks,
+    scales = torch.empty((num_groups, num_n_blocks, num_k_blocks),
                          dtype=torch.float32, device=input.device)
 
     for g in range(num_groups):
@@ -160,7 +184,7 @@ def quantize_2d_128(input: torch.Tensor):
             for k_block in range(num_k_blocks):
                 slice2d = input[g, n_block *
                                 128: (n_block + 1) * 128, k_block * 128: (k_block + 1) * 128]
-                cur_scale = slice2d.amax() / 448.0
+                cur_scale = slice2d.abs().amax() / 448.0
                 scales[g, n_block, k_block] = cur_scale
                 quantized[g, n_block * 128: (n_block + 1) * 128, k_block * 128: (
                     k_block + 1) * 128] = (slice2d / cur_scale).to(torch.float8_e4m3fn)
@@ -192,6 +216,7 @@ def init_distributed_environment():
 
     device = torch.device(f"cuda:{local_rank}")
     torch.cuda.set_device(device)
+    torch.cuda.manual_seed(local_rank)
     torch.random.manual_seed(local_rank)
 
     return local_rank, local_world_size

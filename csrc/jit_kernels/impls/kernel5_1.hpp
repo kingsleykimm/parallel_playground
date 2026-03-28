@@ -1,6 +1,6 @@
 /**
-  @file kernel5.hpp
-  @brief JIT launcher for kernel5 - Fused Dispatch + FC1 of SwiGLU MLP, (Grouped
+  @file kernel5_1.hpp
+  @brief JIT launcher for kernel5_1 - Fused Dispatch + FC1 of SwiGLU MLP, (Grouped
   GEMM) Uses cooperative grid launch for grid-wide sync between routing and
   compute/comm phases.
  */
@@ -21,9 +21,9 @@
 #include <runtime/device.hpp>
 #include <runtime/format.hpp>
 
-class Kernel5Runtime : LaunchRuntime<Kernel5Runtime> {
+class Kernel5_1Runtime : LaunchRuntime<Kernel5_1Runtime> {
 public:
-  // kernel5 constants (mirrored from kernel5.cuh)
+  // kernel5_1 constants (mirrored from kernel5_1.cuh)
   static constexpr int SM_COUNT = 132;
   static constexpr int DYNAMIC_SHARED_MEMORY = 227 * 1024 - 1024;
 
@@ -53,9 +53,11 @@ public:
     at::Tensor *indices;
     kittens::py::TKParallelTensor *global_num_routed;
     kittens::py::TKParallelTensor *expert_to_token_map;
+    kittens::py::TKParallelTensor *expert_to_slot_map;
     at::Tensor *padded_expert_counts;
     at::Tensor *src_token_idx;
     at::Tensor *src_dev_idx;
+    at::Tensor *src_slot_idx;
     kittens::py::TKParallelTensor *barrier;
 
     int num_tokens;
@@ -74,10 +76,10 @@ public:
   static std::string generate_impl(const Args &args) {
     return fmt::format(R"(
 
-#include <moe_cuda/kernels/kernel5.cuh>
+#include <moe_cuda/kernels/kernel5_1.cuh>
 
 static void __instantiate_kernel() {{
-auto ptr = reinterpret_cast<void *>(&kernel5::global_kernel5<
+auto ptr = reinterpret_cast<void *>(&kernel5_1::global_kernel5_1<
         {}, {}, {},
         {},
         {},
@@ -99,27 +101,28 @@ auto ptr = reinterpret_cast<void *>(&kernel5::global_kernel5<
                           const LaunchConfigHandle &launch_config,
                           const Args &args) {
     // Build globals via the pre-compiled factory
-    size_t gsize = tk_kernel5_globals_size();
+    size_t gsize = tk_kernel5_1_globals_size(args.H);
     alignas(128) char globals_buf[4096];
     assert(gsize <= sizeof(globals_buf));
 
-    tk_build_kernel5_globals(
-        globals_buf, *args.in_tokens, *args.in_tokens_scales,
+    tk_build_kernel5_1_globals(
+      args.H, globals_buf, *args.in_tokens, *args.in_tokens_scales,
         *args.expert_x_tokens, *args.expert_x_tokens_scale,
         *args.comm_comp_barrier, *args.gate, *args.up, *args.C,
         *args.scale_gate, *args.scale_up, *args.out_scales, *args.indices,
         *args.global_num_routed, *args.expert_to_token_map,
-        *args.padded_expert_counts, *args.src_token_idx, *args.src_dev_idx,
+        *args.expert_to_slot_map, *args.padded_expert_counts,
+        *args.src_token_idx, *args.src_dev_idx, *args.src_slot_idx,
         *args.barrier, args.num_tokens, args.num_recv_tokens, args.dp_rank,
         args.rank, args.dp_size, args.cur_dp_group, args.num_dp_groups,
         args.num_comm_sms, args.num_comp_sms);
 
-    // kernel5 uses cooperative_groups::this_grid().sync(), so we need
+    // kernel5_1 uses cooperative_groups::this_grid().sync(), so we need
     // cooperative launch via CU_LAUNCH_ATTRIBUTE_COOPERATIVE
 
     void *kernelParams[] = {globals_buf};
     if (get_env<int>("JIT_DEBUG") != 0) {
-      printf("Launching kernel5: grid=%u, block=%u, smem=%d, cooperative=1\n",
+      printf("Launching kernel5_1: grid=%u, block=%u, smem=%d, cooperative=1\n",
              launch_config.gridDimX, launch_config.blockDimX,
              launch_config.sharedMemBytes);
     }
@@ -139,8 +142,10 @@ inline void fused_dispatch_grouped_gemm_swiglu(
     at::Tensor &out_scales, at::Tensor &indices,
     kittens::py::TKParallelTensor &global_num_routed,
     kittens::py::TKParallelTensor &expert_to_token_map,
+    kittens::py::TKParallelTensor &expert_to_slot_map,
     at::Tensor &padded_expert_counts, at::Tensor &src_token_idx,
-    at::Tensor &src_dev_idx, kittens::py::TKParallelTensor &barrier,
+    at::Tensor &src_dev_idx, at::Tensor &src_slot_idx,
+    kittens::py::TKParallelTensor &barrier,
     int num_tokens, int *num_recv_tokens, int dp_rank, int rank, int dp_size,
     int cur_dp_group, int num_dp_groups, int world_size, int num_experts, int experts_per_token,
     int num_comm_sms, int num_comp_sms, cudaStream_t &stream) {
@@ -154,7 +159,7 @@ inline void fused_dispatch_grouped_gemm_swiglu(
 
   int total_sms = num_comm_sms + num_comp_sms;
 
-  auto gemm_config = get_kernel5_config(M, I, num_experts, num_comp_sms);
+  auto gemm_config = get_kernel5_1_config(M, I, num_experts, num_comp_sms);
 
   uint32_t BM = gemm_config.block_m;
   uint32_t BN = gemm_config.block_n;
@@ -162,7 +167,7 @@ inline void fused_dispatch_grouped_gemm_swiglu(
   uint32_t num_producer_warps = gemm_config.num_tma_threads / 32;
   uint32_t num_stages = gemm_config.num_stages;
   uint32_t kernel_smem_size = gemm_config.smem_config.smem_size;
-  uint32_t super_m = 8;
+  uint32_t super_m = 1;
 
   auto comm_comp_barrier = at::zeros(std::vector<int64_t>{host_ceil_div(src_token_idx.size(0), BM)}, at::TensorOptions().device(torch::kCUDA).dtype(torch::kInt32));
 
@@ -185,7 +190,7 @@ inline void fused_dispatch_grouped_gemm_swiglu(
     printf("  smem_size=%u\n", kernel_smem_size);
   }
 
-  const Kernel5Runtime::Args args = {
+  const Kernel5_1Runtime::Args args = {
       .M = M,
       .I = I,
       .H = H,
@@ -212,9 +217,11 @@ inline void fused_dispatch_grouped_gemm_swiglu(
       .indices = &indices,
       .global_num_routed = &global_num_routed,
       .expert_to_token_map = &expert_to_token_map,
+      .expert_to_slot_map = &expert_to_slot_map,
       .padded_expert_counts = &padded_expert_counts,
       .src_token_idx = &src_token_idx,
       .src_dev_idx = &src_dev_idx,
+      .src_slot_idx = &src_slot_idx,
       .barrier = &barrier,
       .num_tokens = num_tokens,
       .num_recv_tokens = num_recv_tokens,
@@ -228,8 +235,8 @@ inline void fused_dispatch_grouped_gemm_swiglu(
       .launch_config = launch_config,
   };
 
-  const std::string &code = LaunchRuntime<Kernel5Runtime>::generate(args);
+  const std::string &code = LaunchRuntime<Kernel5_1Runtime>::generate(args);
   std::shared_ptr<KernelRuntime> runtime =
       compiler->build("fused_dispatch_grouped_gemm_swiglu", code);
-  LaunchRuntime<Kernel5Runtime>::launch(runtime, args);
+  LaunchRuntime<Kernel5_1Runtime>::launch(runtime, args);
 }

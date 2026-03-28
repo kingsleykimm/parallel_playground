@@ -93,7 +93,8 @@ public:
     LaunchConfigHandle launch_handle = create_launch_config(
         kernel_runtime->kernel_handle, args.launch_config.smem_size,
         args.launch_config.blockDim, args.launch_config.gridDim,
-        args.launch_config.num_multicast, args.launch_config.stream, args.launch_config.cooperative);
+        args.launch_config.num_multicast, args.launch_config.stream,
+        args.launch_config.cooperative);
     Derived::launch_impl(kernel_runtime->kernel_handle, launch_handle, args);
   }
 };

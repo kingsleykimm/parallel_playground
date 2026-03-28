@@ -326,9 +326,9 @@ inline int get_kernel5_max_stages(const int block_m) {
   return 0;
 }
 
-inline GemmConfig get_kernel5_config(uint32_t M, uint32_t I,
-                                     uint32_t num_experts,
-                                     const uint32_t &num_sms) {
+inline GemmConfig get_kernel5_1_config(uint32_t M, uint32_t I,
+                                       uint32_t num_experts,
+                                       const uint32_t &num_sms) {
   constexpr uint32_t block_n = 128;
   constexpr uint32_t block_k = 128;
 
@@ -343,7 +343,7 @@ inline GemmConfig get_kernel5_config(uint32_t M, uint32_t I,
   };
   const Candidate candidates[] = {
       {128, 8, 4},
-      {64, 4, 8},
+      {64, 4, 4},
   };
 
   const uint32_t num_c_blocks = I / block_n;
@@ -393,20 +393,24 @@ inline GemmConfig get_kernel5_config(uint32_t M, uint32_t I,
   HOST_ASSERT(best_block_m != 0,
               "Error: kernel5 config search yielded no results");
 
-  return GemmConfig{GemmType::MGroupedContiguous,
-                    best_block_m,
-                    block_n,
-                    block_k,
-                    SharedMemoryConfig{get_tk_lcf_kernel5_smem_size(
-                                          best_block_m, best_num_stages),
-                                      0, 0, 0},
-                    1,                        // num_tma_multicast (disabled)
-                    false,                    // tma_multicast_a
-                    best_producer_warps * 32, // num_tma_threads
-                    best_consumer_warps * 32, // num_math_threads
-                    num_sms,
-                    best_num_stages};
+  return GemmConfig{
+      GemmType::MGroupedContiguous,
+      best_block_m,
+      block_n,
+      block_k,
+      SharedMemoryConfig{
+          get_tk_lcf_kernel5_smem_size(best_block_m, best_num_stages), 0, 0, 0},
+      1,                        // num_tma_multicast (disabled)
+      false,                    // tma_multicast_a
+      best_producer_warps * 32, // num_tma_threads
+      best_consumer_warps * 32, // num_math_threads
+      num_sms,
+      best_num_stages};
 }
+
+// compared to kernel5_1, which requires a much more rigid block structure, we
+// can have more flexibility with BN, since we aren't requiring ourselves to
+// quantize
 
 inline GemmConfig search_configs(GemmType gemm_type, uint32_t M, uint32_t N,
                                  uint32_t K, uint32_t num_groups, Major AMajor,

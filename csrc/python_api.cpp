@@ -406,6 +406,7 @@ PYBIND11_MODULE(moe_cuda, m) {
       pybind11::arg("scale"));
 
   bind_fused_dispatch_grouped_gemm_swiglu(m);
+  bind_fused_grouped_gemm_combine(m);
 
   pybind11::class_<PyAll2All>(m, "All2All")
       .def(pybind11::init<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,

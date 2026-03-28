@@ -5,7 +5,8 @@
 #include <jit_kernels/impls/kernel2.hpp>
 #include <jit_kernels/impls/kernel3.hpp>
 #include <jit_kernels/impls/kernel4.hpp>
-#include <jit_kernels/impls/kernel5.hpp>
+#include <jit_kernels/impls/kernel5_1.hpp>
+#include <jit_kernels/impls/kernel5_2.hpp>
 #include <jit_kernels/impls/sm90_bf16_gemm.hpp>
 #include <jit_kernels/impls/sm90_fp8_gemm_1d2d.hpp>
 #include <runtime/device.hpp>
