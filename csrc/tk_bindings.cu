@@ -64,6 +64,7 @@ void bind_fused_grouped_gemm_combine(pybind11::module_ &m) {
       [](kittens::py::TKParallelTensor &out_tokens, at::Tensor &expert_y_tokens,
          at::Tensor &expert_y_tokens_scale, at::Tensor &down,
          at::Tensor &scale_down, at::Tensor &C, at::Tensor &weights,
+         at::Tensor &padded_expert_counts,
          at::Tensor &src_token_idx, at::Tensor &src_dev_idx,
          at::Tensor &src_slot_idx, int num_experts, int experts_per_token,
          at::Tensor &num_recv_tokens, int dp_rank, int rank, int dp_size,
@@ -72,14 +73,15 @@ void bind_fused_grouped_gemm_combine(pybind11::module_ &m) {
         auto stream = current_stream();
         moe_cuda::kernels::fused_grouped_gemm_combine(
             out_tokens, expert_y_tokens, expert_y_tokens_scale, down,
-            scale_down, C, weights, src_token_idx, src_dev_idx, src_slot_idx,
-            num_experts, experts_per_token, num_recv_tokens.data_ptr<int>(),
-            dp_rank, rank, dp_size, cur_dp_group, num_dp_groups, num_comm_sms,
-            num_comp_sms, stream);
+            scale_down, C, weights, padded_expert_counts, src_token_idx,
+            src_dev_idx, src_slot_idx, num_experts, experts_per_token,
+            num_recv_tokens.data_ptr<int>(), dp_rank, rank, dp_size,
+            cur_dp_group, num_dp_groups, num_comm_sms, num_comp_sms, stream);
       },
       pybind11::arg("out_tokens"), pybind11::arg("expert_y_tokens"),
       pybind11::arg("expert_y_tokens_scale"), pybind11::arg("down"),
       pybind11::arg("scale_down"), pybind11::arg("C"), pybind11::arg("weights"),
+      pybind11::arg("padded_expert_counts"),
       pybind11::arg("src_token_idx"), pybind11::arg("src_dev_idx"),
       pybind11::arg("src_slot_idx"), pybind11::arg("num_experts"),
       pybind11::arg("experts_per_token"), pybind11::arg("num_recv_tokens"),

@@ -60,17 +60,69 @@ static void __instantiate_kernel() {{
                        args.gemm_type, to_string(args.c_dtype), args.super_n);
   }
 
+
+  static void launch_impl(KernelHandle &kernel,
+    const LaunchConfigHandle &launch_config,
+    const Args &args) {
+// args.M = max_M (masked) or total_M (contiguous); args.N = N_per_group
+// always
+size_t total_M = (args.gemm_type == 0)
+   ? (size_t)args.num_groups *
+         args.M      // masked: total_M = groups * max_M
+   : (size_t)args.M; // contiguous: total_M already full
+size_t total_N =
+(size_t)args.num_groups * args.N; // always N_per_group * num_groups
+
+size_t gsize = tk_kernel3_globals_size(args.bm, args.bn, args.bk,
+                     args.gemm_type, args.c_dtype);
+alignas(128) char globals_buf[2048];
+assert(gsize <= sizeof(globals_buf));
+tk_build_kernel3_globals(args.bm, args.bn, args.bk, args.gemm_type,
+       static_cast<int>(args.num_groups), args.c_dtype,
+       globals_buf, args.A, args.gate_weight,
+       args.up_weight, args.D, args.scale_a,
+       args.scale_gate, args.scale_up, args.scale_d,
+       args.grouped_layout, total_M, total_N, args.K);
+
+void *kernelParams[] = {globals_buf};
+CUDA_CHECK(cuLaunchKernelEx(&launch_config, kernel, kernelParams, nullptr));
+
+if (get_env<int>("JIT_DEBUG") != 0) {
+CUDA_CHECK(cudaStreamSynchronize(launch_config.hStream));
+}
+}
+};
+
+// Runtime for kernel3_sub::matmul_template (unoptimized baseline — no MMA/scale overlap)
+class Kernel3SubRuntime : LaunchRuntime<Kernel3SubRuntime> {
+public:
+  using Args = Kernel3Runtime::Args;
+
+  static std::string generate_impl(const Args &args) {
+    return fmt::format(R"(
+
+#include <moe_cuda/kernels/kernel3_sub.cuh>
+
+using mmt_jit = kernel3_sub::matmul_template<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>;
+
+static void __instantiate_kernel() {{
+    auto ptr = reinterpret_cast<void*>(
+        &kittens::prototype::lcf::kernel<mmt_jit>);
+	}}
+	)",
+                       args.M, args.N, args.K, args.bm, args.bn, args.bk,
+                       args.num_groups, args.num_consumer_warps,
+                       args.num_producer_warps, args.num_stages, args.smem_size,
+                       args.gemm_type, to_string(args.c_dtype), args.super_n);
+  }
+
   static void launch_impl(KernelHandle &kernel,
                           const LaunchConfigHandle &launch_config,
                           const Args &args) {
-    // args.M = max_M (masked) or total_M (contiguous); args.N = N_per_group
-    // always
     size_t total_M = (args.gemm_type == 0)
-                         ? (size_t)args.num_groups *
-                               args.M      // masked: total_M = groups * max_M
-                         : (size_t)args.M; // contiguous: total_M already full
-    size_t total_N =
-        (size_t)args.num_groups * args.N; // always N_per_group * num_groups
+                         ? (size_t)args.num_groups * args.M
+                         : (size_t)args.M;
+    size_t total_N = (size_t)args.num_groups * args.N;
 
     size_t gsize = tk_kernel3_globals_size(args.bm, args.bn, args.bk,
                                            args.gemm_type, args.c_dtype);
@@ -90,6 +142,7 @@ static void __instantiate_kernel() {{
       CUDA_CHECK(cudaStreamSynchronize(launch_config.hStream));
     }
   }
+
 };
 
 // Contiguous grouped FP8 GEMM with fused SwiGLU + FP8 requantization:
@@ -245,4 +298,141 @@ inline void kernel3_masked(at::Tensor &A, at::Tensor &up_weight,
   std::shared_ptr<KernelRuntime> runtime =
       compiler->build("kernel3_masked", code);
   LaunchRuntime<Kernel3Runtime>::launch(runtime, args);
+}
+
+// =========== kernel3_sub (unoptimized baseline) launchers ===========
+
+inline void kernel3_sub_contiguous(at::Tensor &A, at::Tensor &up_weight,
+                                   at::Tensor &gate_weight, at::Tensor &scale_a,
+                                   at::Tensor &scale_up, at::Tensor &scale_gate,
+                                   at::Tensor &scale_d, at::Tensor &D,
+                                   int *grouped_layout, cudaStream_t &stream) {
+  HOST_ASSERT(
+      D.scalar_type() == at::ScalarType::Float8_e4m3fn,
+      "unsupported output dtype: kernel3_sub outputs FP8-quantized activations");
+
+  uint32_t total_M = A.size(0);
+  uint32_t num_groups = up_weight.size(0);
+  uint32_t N = up_weight.size(-2);
+  uint32_t K = up_weight.size(-1);
+
+  auto gemm_config = get_kernel3_config(
+      GemmType::MGroupedContiguous, total_M, N, K, 1, Major::K, Major::K,
+      Major::K, A.scalar_type(), D.scalar_type(), device_prop->get_num_sms());
+
+  int num_consumer_warps = gemm_config.num_math_threads / 32;
+  int num_producer_warps = gemm_config.num_tma_threads / 32;
+  int super_n = 8;
+
+  LaunchConfig launch_config = {
+      dim3(gemm_config.num_math_threads + gemm_config.num_tma_threads, 1, 1),
+      dim3(132), stream, gemm_config.smem_config.smem_size, 1};
+
+  const Kernel3SubRuntime::Args args = {
+      .M = total_M,
+      .N = N,
+      .K = K,
+      .num_groups = num_groups,
+      .A = A.data_ptr(),
+      .up_weight = up_weight.data_ptr(),
+      .gate_weight = gate_weight.data_ptr(),
+      .D = D.data_ptr(),
+      .scale_a = scale_a.data_ptr(),
+      .scale_up = scale_up.data_ptr(),
+      .scale_gate = scale_gate.data_ptr(),
+      .scale_d = scale_d.data_ptr(),
+      .grouped_layout = (void *)grouped_layout,
+      .bm = (int)gemm_config.block_m,
+      .bn = (int)gemm_config.block_n,
+      .bk = (int)gemm_config.block_k,
+      .super_n = super_n,
+      .num_consumer_warps = num_consumer_warps,
+      .num_producer_warps = num_producer_warps,
+      .num_stages = gemm_config.num_stages,
+      .smem_size = gemm_config.smem_config.smem_size,
+      .gemm_type = /*gemm_type=*/1,
+      .c_dtype = D.scalar_type(),
+      .launch_config = launch_config,
+  };
+
+  if (get_env<int>("JIT_DEBUG") > 0) {
+    printf("kernel3_sub_contiguous:\n");
+    printf("  total_M=%u total_N=%u K=%u num_groups=%u\n", total_M, N, K,
+           num_groups);
+    printf("  bm=%d bn=%d bk=%d super_n=%d stages=%d\n", args.bm, args.bn,
+           args.bk, args.super_n, args.num_stages);
+  }
+
+  const std::string &code = LaunchRuntime<Kernel3SubRuntime>::generate(args);
+  std::shared_ptr<KernelRuntime> runtime =
+      compiler->build("kernel3_sub_contiguous", code);
+  LaunchRuntime<Kernel3SubRuntime>::launch(runtime, args);
+}
+
+inline void kernel3_sub_masked(at::Tensor &A, at::Tensor &up_weight,
+                               at::Tensor &gate_weight, at::Tensor &scale_a,
+                               at::Tensor &scale_up, at::Tensor &scale_gate,
+                               at::Tensor &scale_d, at::Tensor &D,
+                               int *grouped_layout, cudaStream_t &stream) {
+  HOST_ASSERT(
+      D.scalar_type() == at::ScalarType::Float8_e4m3fn,
+      "unsupported output dtype: kernel3_sub outputs FP8-quantized activations");
+
+  uint32_t num_groups = gate_weight.size(0);
+  uint32_t max_M = A.size(1);
+  uint32_t N = gate_weight.size(-2);
+  uint32_t K = gate_weight.size(-1);
+  uint32_t total_M = num_groups * max_M;
+
+  auto gemm_config = get_kernel3_config(
+      GemmType::MGroupedMasked, max_M, N, K, num_groups, Major::K, Major::K,
+      Major::K, A.scalar_type(), D.scalar_type(), device_prop->get_num_sms());
+
+  int num_consumer_warps = gemm_config.num_math_threads / 32;
+  int num_producer_warps = gemm_config.num_tma_threads / 32;
+  int super_n = 8;
+
+  LaunchConfig launch_config = {
+      dim3(gemm_config.num_math_threads + gemm_config.num_tma_threads, 1, 1),
+      dim3(132), stream, gemm_config.smem_config.smem_size, 1};
+
+  const Kernel3SubRuntime::Args args = {
+      .M = max_M,
+      .N = N,
+      .K = K,
+      .num_groups = num_groups,
+      .A = A.data_ptr(),
+      .up_weight = up_weight.data_ptr(),
+      .gate_weight = gate_weight.data_ptr(),
+      .D = D.data_ptr(),
+      .scale_a = scale_a.data_ptr(),
+      .scale_up = scale_up.data_ptr(),
+      .scale_gate = scale_gate.data_ptr(),
+      .scale_d = scale_d.data_ptr(),
+      .grouped_layout = (void *)grouped_layout,
+      .bm = (int)gemm_config.block_m,
+      .bn = (int)gemm_config.block_n,
+      .bk = (int)gemm_config.block_k,
+      .super_n = super_n,
+      .num_consumer_warps = num_consumer_warps,
+      .num_producer_warps = num_producer_warps,
+      .num_stages = gemm_config.num_stages,
+      .smem_size = gemm_config.smem_config.smem_size,
+      .gemm_type = /*gemm_type=*/0,
+      .c_dtype = D.scalar_type(),
+      .launch_config = launch_config,
+  };
+
+  if (get_env<int>("JIT_DEBUG") > 0) {
+    printf("kernel3_sub_masked:\n");
+    printf("  total_M=%u N=%u K=%u num_groups=%u max_M=%u\n", total_M, N, K,
+           num_groups, max_M);
+    printf("  bm=%d bn=%d bk=%d super_n=%d stages=%d\n", args.bm, args.bn,
+           args.bk, args.super_n, args.num_stages);
+  }
+
+  const std::string &code = LaunchRuntime<Kernel3SubRuntime>::generate(args);
+  std::shared_ptr<KernelRuntime> runtime =
+      compiler->build("kernel3_sub_masked", code);
+  LaunchRuntime<Kernel3SubRuntime>::launch(runtime, args);
 }

@@ -66,6 +66,47 @@ class TESwiglu(nn.Module):
             return tex.swiglu(x, quantizer=self.quantizer_1d)
 
 
+def unfused_swiglu_mlp(
+    *,
+    cfg : torch.Tensor,
+    input : torch.Tensor,
+    input_scales : torch.Tensor,
+    weight : torch.Tensor,
+    weight_scales : torch.Tensor,
+    gemm_type : moe_cuda.GemmType,
+    D : torch.Tensor,
+    scale_d : torch.Tensor,
+    grouped_layout : torch.Tensor,
+) -> torch.Tensor:
+    moe_cuda.fp8_grouped_gemm_nt(
+        input, input_scales,
+        weight, weight_scales,
+        D, gemm_type, grouped_layout)
+    swiglu_out = torch.empty(shape = (cfg.B * cfg.S, cfg.I), dtype = torch.float8_e4m3fn, device = input.device)
+    swiglu_out_scales = torch.empty(shape = (cfg.B * cfg.S, cfg.I // 128), dtype = torch.float, device = input.device)
+    moe_cuda.fused_silu_mul_quant(
+        gemm_out = D, swiglu_out = swiglu_out, scale = swiglu_out_scales
+    )
+    dequantized = (swiglu_out.float() * swiglu_out_scales.repeat_interleave(repeats = 128, dim = -1)).to(torch.bfloat16)
+    return dequantized
+
+def non_interleaved_moe_cuda_swiglu(
+    *,
+    input : torch.Tensor,
+    scale_a : torch.Tensor,
+    gate : torch.Tensor,
+    scale_gate : torch.Tensor,
+    up : torch.Tensor,
+    scale_up : torch.Tensor,
+    D : torch.Tensor,
+    scale_d : torch.Tensor,
+    gemm_type : moe_cuda.GemmType,
+    grouped_layout : torch.Tensor,
+) -> torch.Tensor:
+    return moe_cuda.fp8_grouped_gemm_swiglu_sub(
+        input, scale_a, gate, scale_gate, up, scale_up, scale_d, D, gemm_type, grouped_layout
+    )
+
 def moe_cuda_swiglu_pp(
     *,
     input: torch.Tensor,
@@ -109,6 +150,67 @@ def moe_cuda_swiglu_coop(
 
 
 @torch.no_grad()
+def _prepare_inputs(
+    *,
+    num_groups: int,
+    expected_m_per_group: int,
+    max_m: int,
+    H: int,
+    I: int,
+    rank: int,
+    gemm_type: moe_cuda.GemmType,
+):
+    device = f"cuda:{rank}"
+    if gemm_type == moe_cuda.GemmType.MGroupedContiguous:
+        A, up_weight, gate_weight, grouped_layout, D, scale_D, aligned_ms = generate_m_grouped_contiguous(
+            num_groups, expected_m_per_group, I, H)
+        m_splits = aligned_ms
+    elif gemm_type == moe_cuda.GemmType.MGroupedMasked:
+        A, up_weight, gate_weight, grouped_layout, D, scale_D = generate_m_grouped_masked(
+            num_groups, max_m, expected_m_per_group, I, H)
+        m_splits = [max_m] * num_groups
+    else:
+        assert False, "not supported gem type for now"
+
+    quantizer_1d = Float8BlockQuantizer(
+        fp8_dtype=TE_DType.kFloat8E4M3,
+        rowwise=True,
+        columnwise=False,
+        block_scaling_dim=1,
+    )
+    quantizer_2d = Float8BlockQuantizer(
+        fp8_dtype=TE_DType.kFloat8E4M3,
+        rowwise=True,
+        columnwise=True,
+        block_scaling_dim=2,
+    )
+
+    te_model = TESwiglu(hidden_size=H, intermediate_size=I,
+                        num_groups=num_groups).to(device)
+    te_model.load_weights(gate_weight, up_weight)
+
+    inputs_q_tensor: Float8BlockwiseQTensor = quantizer_1d(A)
+    gate_q_tensor: Float8BlockwiseQTensor = quantizer_2d(gate_weight)
+    up_q_tensor: Float8BlockwiseQTensor = quantizer_2d(up_weight)
+
+    inputs_q, inputs_scales = inputs_q_tensor._rowwise_data.view(
+        torch.float8_e4m3fn), inputs_q_tensor._rowwise_scale_inv
+    gate_q, gate_q_scales = gate_q_tensor._rowwise_data.view(
+        torch.float8_e4m3fn), gate_q_tensor._rowwise_scale_inv
+    up_q, up_q_scales = up_q_tensor._rowwise_data.view(
+        torch.float8_e4m3fn), up_q_tensor._rowwise_scale_inv
+
+    return dict(
+        A=A, up_weight=up_weight, gate_weight=gate_weight,
+        grouped_layout=grouped_layout, D=D, scale_D=scale_D,
+        m_splits=m_splits, te_model=te_model,
+        inputs_q=inputs_q, inputs_scales=inputs_scales,
+        gate_q=gate_q, gate_q_scales=gate_q_scales,
+        up_q=up_q, up_q_scales=up_q_scales,
+    )
+
+
+@torch.no_grad()
 def run(
     *,
     num_groups: int,
@@ -122,86 +224,20 @@ def run(
 ):
     print(
         f"Starting run for config num_groups: {num_groups}, gemm_type: {gemm_type}, expected_m_per_group: {expected_m_per_group}, H: {H}, I: {I}")
-    device = f"cuda:{rank}"
-    if gemm_type == moe_cuda.GemmType.MGroupedContiguous:
-        A, up_weight, gate_weight, grouped_layout, D, scale_D, aligned_ms = generate_m_grouped_contiguous(
-            num_groups, expected_m_per_group, I, H)
-        # m_splits must be the ALIGNED sizes (including zero-padded rows already in A),
-        # not bincount of actual tokens — TE requires M_per_expert % 8 == 0.
-        m_splits = aligned_ms
-    elif gemm_type == moe_cuda.GemmType.MGroupedMasked:
-        A, up_weight, gate_weight, grouped_layout, D, scale_D = generate_m_grouped_masked(
-            num_groups, max_m, expected_m_per_group, I, H)
-        # For masked layout grouped_layout is [G, max_M] mask; m_splits is max_m per group
-        m_splits = [max_m] * num_groups
-    else:
-        assert False, "not supported gem type for now"
 
-    # DEBUG
-    # Quantizers for manually inspecting / comparing scales with our custom path.
-    # Call quantizer_2d(weight_tensor) → Float8BlockwiseQTensor, then access:
-    #   ._rowwise_data          [N, K] uint8
-    #   ._rowwise_scale_inv     [N//128, K//128] float32
-    #   ._columnwise_data       [K, N] uint8  (transposed copy for dgrad)
-    #   ._columnwise_scale_inv  [K//128, N//128] float32
+    inputs = _prepare_inputs(
+        num_groups=num_groups, expected_m_per_group=expected_m_per_group,
+        max_m=max_m, H=H, I=I, rank=rank, gemm_type=gemm_type)
 
-    quantizer_1d = Float8BlockQuantizer(
-        fp8_dtype=TE_DType.kFloat8E4M3,
-        rowwise=True,
-        columnwise=False,  # activations are never transposed in fprop
-        block_scaling_dim=1,
-    )
-    quantizer_2d = Float8BlockQuantizer(
-        fp8_dtype=TE_DType.kFloat8E4M3,
-        rowwise=True,
-        columnwise=True,   # weights need both orientations (fprop + dgrad)
-        block_scaling_dim=2,
-    )
-
-    # --- TE FP8 blockwise path ---
-    te_model = TESwiglu(hidden_size=H, intermediate_size=I,
-                        num_groups=num_groups).to(device)
-    te_model.load_weights(gate_weight, up_weight)
-    # te_out = te_model(A, m_splits)
-    # print("Finished TE Model")
-
-    # get scaled tensors from TE
-    inputs_q_tensor: Float8BlockwiseQTensor = quantizer_1d(A)
-    gate_q_tensor: Float8BlockwiseQTensor = quantizer_2d(gate_weight)
-    up_q_tensor: Float8BlockwiseQTensor = quantizer_2d(up_weight)
-    # down_q_tensor : Float8BlockwiseQTensor = quantizer_2d(down_weight)
-    # import code; code.interact(local=dict(globals(), **locals()))
-    inputs_q, inputs_scales = inputs_q_tensor._rowwise_data.view(
-        torch.float8_e4m3fn), inputs_q_tensor._rowwise_scale_inv
-    gate_q, gate_q_scales = gate_q_tensor._rowwise_data.view(
-        torch.float8_e4m3fn), gate_q_tensor._rowwise_scale_inv
-    up_q, up_q_scales = up_q_tensor._rowwise_data.view(
-        torch.float8_e4m3fn), up_q_tensor._rowwise_scale_inv
-    # down_q, down_q_scales = down_q_tensor._rowwise_data, down_q_tensor._rowwise_scale_inv
-    # print("Beginning custom kernel")
-    # moe_cuda_swiglu_coop(
-    #     input=inputs_q,
-    #     input_scales=inputs_scales,
-    #     gate=gate_q,
-    #     gate_scales=gate_q_scales, up=up_q, up_scales=up_q_scales, gemm_type=gemm_type, D=D, scale_d=scale_D,
-    #     grouped_layout=grouped_layout,
-    # )
-
-    # Dequantize D (FP8) using columnwise scale_D.
-    # scale_D is columnwise: [I / 128, total_M ]
-    # Transpose → rowwise: [total_M, I//128], then tile-multiply.
-    # [total_M, I_dim//128]
-    scale_rw = scale_D.T.contiguous()
-    custom_out = D.float() * scale_rw.repeat_interleave(128, dim=-1)
-    # te_out = te_out.dequantize(dtype = torch.bfloat16)
-
-    # indexing = torch.where(grouped_layout >= 0)[0]
-    # custom_out = custom_out[indexing]
-    # te_out = te_out[indexing]
-    # # --- Correctness ---
-    # cosine_diff = calc_cosine_diff(custom_out, te_out)
-    # print(f"Cosine difference: {cosine_diff}")
-    # check_diff("fp8 grouped gemm swiglu", custom_out, te_out, single=True)
+    inputs_q = inputs["inputs_q"]
+    inputs_scales = inputs["inputs_scales"]
+    gate_q = inputs["gate_q"]
+    gate_q_scales = inputs["gate_q_scales"]
+    up_q = inputs["up_q"]
+    up_q_scales = inputs["up_q_scales"]
+    D = inputs["D"]
+    scale_D = inputs["scale_D"]
+    grouped_layout = inputs["grouped_layout"]
 
     def coop_run(): return moe_cuda_swiglu_coop(
         input=inputs_q,
@@ -224,13 +260,8 @@ def run(
         gemm_type=gemm_type,
         D=D_copy, scale_d=scale_D_copy, grouped_layout=grouped_layout
     )
-    # te_run = lambda : te_model(A, m_splits)
 
     if do_profile:
-
-        # combined = lambda : (custom_run(), te_run())
-        # profile(combined, num_iters=10, suffix = "swiglu_coop_comp")
-
         custom_avg_ms = benchmark_no_l2_clear(
             coop_run, num_warmup_iters=1, num_iters=20)
         pingpong_avg_ms = benchmark_no_l2_clear(

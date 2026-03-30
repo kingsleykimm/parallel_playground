@@ -846,6 +846,7 @@ template <int _H> struct fp8_kernel5_2_factory {
                     at::Tensor &expert_y_tokens_scale,
                     at::Tensor &comm_comp_barrier, at::Tensor &down,
                     at::Tensor &scale_down, at::Tensor &C, at::Tensor &weights,
+                    at::Tensor &padded_expert_counts,
                     at::Tensor &src_token_idx, at::Tensor &src_dev_idx,
                     at::Tensor &src_slot_idx, int *num_recv_tokens, int dp_rank,
                     int rank, int dp_size, int cur_dp_group, int num_dp_groups,
@@ -870,6 +871,9 @@ template <int _H> struct fp8_kernel5_2_factory {
         .weights =
             kittens::py::tensor_to_gl<typename globals_t::weights_layout>(
                 weights),
+        .padded_expert_counts = kittens::py::tensor_to_gl<
+            typename globals_t::padded_expert_counts_layout>(
+            padded_expert_counts),
         .src_token_idx =
             kittens::py::tensor_to_gl<typename globals_t::src_token_idx_layout>(
                 src_token_idx),
@@ -900,7 +904,8 @@ template <int _H> struct fp8_kernel5_2_factory {
   if (H_ == h) {                                                               \
     fp8_kernel5_2_factory<h>::build(                                           \
         out, out_tokens, expert_y_tokens, expert_y_tokens_scale,               \
-        comm_comp_barrier, down, scale_down, C, weights, src_token_idx,        \
+        comm_comp_barrier, down, scale_down, C, weights,                       \
+        padded_expert_counts, src_token_idx,                                   \
         src_dev_idx, src_slot_idx, num_recv_tokens, dp_rank, rank, dp_size,    \
         cur_dp_group, num_dp_groups, num_comm_sms, num_comp_sms);              \
     return;                                                                    \
@@ -931,10 +936,11 @@ void tk_build_kernel5_2_globals(
     int H_, void *out, kittens::py::TKParallelTensor &out_tokens,
     at::Tensor &expert_y_tokens, at::Tensor &expert_y_tokens_scale,
     at::Tensor &comm_comp_barrier, at::Tensor &down, at::Tensor &scale_down,
-    at::Tensor &C, at::Tensor &weights, at::Tensor &src_token_idx,
-    at::Tensor &src_dev_idx, at::Tensor &src_slot_idx, int *num_recv_tokens,
-    int dp_rank, int rank, int dp_size, int cur_dp_group, int num_dp_groups,
-    int num_comm_sms, int num_comp_sms) {
+    at::Tensor &C, at::Tensor &weights, at::Tensor &padded_expert_counts,
+    at::Tensor &src_token_idx, at::Tensor &src_dev_idx,
+    at::Tensor &src_slot_idx, int *num_recv_tokens, int dp_rank, int rank,
+    int dp_size, int cur_dp_group, int num_dp_groups, int num_comm_sms,
+    int num_comp_sms) {
   TK_ALL_KERNEL5_2_H_CONFIGS(TK_KERNEL5_2_BUILD_CASE);
   fprintf(stderr,
           "tk_build_kernel5_2_globals: unsupported H=%d (add to "

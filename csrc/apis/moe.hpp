@@ -117,6 +117,23 @@ inline void fp8_grouped_gemm_swiglu(at::Tensor &A, at::Tensor &gate_weight,
   }
 }
 
+inline void fp8_grouped_gemm_swiglu_sub(at::Tensor &A, at::Tensor &gate_weight,
+                                    at::Tensor &up_weight, at::Tensor &scale_a,
+                                    at::Tensor &scale_gate,
+                                    at::Tensor &scale_up, at::Tensor &scale_d,
+                                    at::Tensor &D, GemmType gemm_type,
+                                    int *grouped_layout, cudaStream_t &stream) {
+  HOST_ASSERT(grouped_layout != nullptr,
+              "grouped_layout cannot be null for grouped FP8 swiglu GEMM (sub)");
+  if (gemm_type == GemmType::MGroupedMasked) {
+    kernel3_sub_masked(A, up_weight, gate_weight, scale_a, scale_up, scale_gate,
+                       scale_d, D, grouped_layout, stream);
+  } else {
+    kernel3_sub_contiguous(A, up_weight, gate_weight, scale_a, scale_up,
+                           scale_gate, scale_d, D, grouped_layout, stream);
+  }
+}
+
 void fp8_grouped_gemm_swiglu_consumer_pp(
     at::Tensor &A, at::Tensor &gate_weight, at::Tensor &up_weight,
     at::Tensor &scale_a, at::Tensor &scale_gate, at::Tensor &scale_up,

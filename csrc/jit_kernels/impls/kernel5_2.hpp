@@ -47,6 +47,7 @@
      at::Tensor *scale_down;
      at::Tensor *C;
      at::Tensor *weights;
+     at::Tensor *padded_expert_counts;
      at::Tensor *src_token_idx;
      at::Tensor *src_dev_idx;
      at::Tensor *src_slot_idx;
@@ -99,9 +100,10 @@
      tk_build_kernel5_2_globals(
         args.H, globals_buf, *args.out_tokens, *args.expert_y_tokens,
          *args.expert_y_tokens_scale, *args.comm_comp_barrier, *args.down,
-          *args.scale_down, *args.C, *args.weights, *args.src_token_idx,
-           *args.src_dev_idx, *args.src_slot_idx, args.num_recv_tokens, args.dp_rank,
-            args.rank, args.dp_size, args.cur_dp_group, args.num_dp_groups, args.num_comm_sms, args.num_comp_sms);
+          *args.scale_down, *args.C, *args.weights, *args.padded_expert_counts,
+           *args.src_token_idx, *args.src_dev_idx, *args.src_slot_idx,
+            args.num_recv_tokens, args.dp_rank, args.rank, args.dp_size,
+             args.cur_dp_group, args.num_dp_groups, args.num_comm_sms, args.num_comp_sms);
       
      // kernel5_1 uses cooperative_groups::this_grid().sync(), so we need
      // cooperative launch via CU_LAUNCH_ATTRIBUTE_COOPERATIVE
@@ -123,7 +125,8 @@
     kittens::py::TKParallelTensor &out_tokens,
     at::Tensor &expert_y_tokens, at::Tensor &expert_y_tokens_scale,
     at::Tensor &down, at::Tensor &scale_down,
-    at::Tensor &C, at::Tensor &weights, at::Tensor &src_token_idx,
+    at::Tensor &C, at::Tensor &weights, at::Tensor &padded_expert_counts,
+    at::Tensor &src_token_idx,
     at::Tensor &src_dev_idx, at::Tensor &src_slot_idx, int num_experts, int experts_per_token,
     int *num_recv_tokens,
     int dp_rank, int rank, int dp_size, int cur_dp_group, int num_dp_groups,
@@ -193,6 +196,7 @@
        .scale_down = &scale_down,
        .C = &C,
        .weights = &weights,
+       .padded_expert_counts = &padded_expert_counts,
        .src_token_idx = &src_token_idx,
        .src_dev_idx = &src_dev_idx,
        .src_slot_idx = &src_slot_idx,

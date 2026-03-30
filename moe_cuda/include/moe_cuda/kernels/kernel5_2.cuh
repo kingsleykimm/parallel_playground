@@ -71,6 +71,9 @@ struct globals {
   // these are the outputs from the swiglu (kernel 5_1)
   using expert_y_tokens_layout = gl<fp8e4m3, 1, 1, -1, -1, a_tile>;
   using expert_y_tokens_scale_layout = gl<float, 1, 1, -1, -1, sfa_tile>;
+  using tokens_per_expert_layout =
+      sv<int, constexpr_ti_align(NUM_EXPERTS / WORLD_SIZE, 16)>;
+  using padded_expert_counts_layout = gl<int, 1, 1, -1, -1>;
   using src_token_idx_layout = gl<int, 1, 1, -1, -1>;
   using src_dev_idx_layout = gl<int, 1, 1, -1, -1>;
   using src_slot_idx_layout = gl<int, 1, 1, -1, -1>;
@@ -97,6 +100,7 @@ struct globals {
   scale_down_layout scale_down;
   c_layout C;
   weights_layout weights;
+  padded_expert_counts_layout padded_expert_counts;
   // important: this maps from the destination expert + ith token (out of
   // NUM_EXPERTS_PER_TOKEN) to the source token idx
   src_token_idx_layout src_token_idx;

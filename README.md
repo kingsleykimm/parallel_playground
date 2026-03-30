@@ -49,7 +49,8 @@ export JIT_USE_NVRTC=1
 # Roadmap:
 - [ ] implement a fused dispatch + swiglu grouped gemm
     - [ ] inside here, enforce transposed sfa majors
-    - [ ] keep linking this together, and also remember to zero out the comm_comp_barriers after each dispatch
+    - [ ] keep linking this together, and also remember to zero out the comm_comp_barriers after each dispatch (these are actually initialized inside so it's ok)
+    - [ ] also remember to zero out the tk parallel tensor barrier after each call in an epilogue kernel, as well as any other metadata
 - [ ] check all a2a kernels work with dp_size > 1
 - [] fuse gate matmul + grouped topk kernels into one kernel
 - [ ] look at fusing SP + TP kernels to match megatron forward pass

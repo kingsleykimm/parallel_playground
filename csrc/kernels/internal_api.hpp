@@ -37,6 +37,13 @@ void fp8_grouped_gemm_swiglu(at::Tensor &A, at::Tensor &gate_weight,
                              GemmType gemm_type, int *grouped_layout,
                              cudaStream_t &stream);
 
+void fp8_grouped_gemm_swiglu_sub(at::Tensor &A, at::Tensor &gate_weight,
+                                at::Tensor &up_weight, at::Tensor &scale_a,
+                                at::Tensor &scale_gate, at::Tensor &scale_up,
+                                at::Tensor &scale_d, at::Tensor &D,
+                                GemmType gemm_type, int *grouped_layout,
+                                cudaStream_t &stream);
+
 void fp8_grouped_gemm_swiglu_consumer_pp(
     at::Tensor &A, at::Tensor &gate_weight, at::Tensor &up_weight,
     at::Tensor &scale_a, at::Tensor &scale_gate, at::Tensor &scale_up,
@@ -72,11 +79,12 @@ void fused_dispatch_grouped_gemm_swiglu(
 void fused_grouped_gemm_combine(
     kittens::py::TKParallelTensor &out_tokens, at::Tensor &expert_y_tokens,
     at::Tensor &expert_y_tokens_scale, at::Tensor &down, at::Tensor &scale_down,
-    at::Tensor &C, at::Tensor &weights, at::Tensor &src_token_idx,
-    at::Tensor &src_dev_idx, at::Tensor &src_slot_idx, int num_experts,
-    int experts_per_token, int *num_recv_tokens, int dp_rank, int rank,
-    int dp_size, int cur_dp_group, int num_dp_groups, int num_comm_sms,
-    int num_comp_sms, cudaStream_t &stream);
+    at::Tensor &C, at::Tensor &weights, at::Tensor &padded_expert_counts,
+    at::Tensor &src_token_idx, at::Tensor &src_dev_idx,
+    at::Tensor &src_slot_idx, int num_experts, int experts_per_token,
+    int *num_recv_tokens, int dp_rank, int rank, int dp_size, int cur_dp_group,
+    int num_dp_groups, int num_comm_sms, int num_comp_sms,
+    cudaStream_t &stream);
 
 } // namespace kernels
 } // namespace moe_cuda

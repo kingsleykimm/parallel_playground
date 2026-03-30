@@ -72,7 +72,8 @@ void tk_build_kernel5_2_globals(
     int H_, void *out, kittens::py::TKParallelTensor &out_tokens,
     at::Tensor &expert_y_tokens, at::Tensor &expert_y_tokens_scale,
     at::Tensor &comm_comp_barrier, at::Tensor &down, at::Tensor &scale_down,
-    at::Tensor &C, at::Tensor &weights, at::Tensor &src_token_idx,
-    at::Tensor &src_dev_idx, at::Tensor &src_slot_idx, int *num_recv_tokens,
-    int dp_rank, int rank, int dp_size, int cur_dp_group, int num_dp_groups,
-    int num_comm_sms, int num_comp_sms);
+    at::Tensor &C, at::Tensor &weights, at::Tensor &padded_expert_counts,
+    at::Tensor &src_token_idx, at::Tensor &src_dev_idx,
+    at::Tensor &src_slot_idx, int *num_recv_tokens, int dp_rank, int rank,
+    int dp_size, int cur_dp_group, int num_dp_groups, int num_comm_sms,
+    int num_comp_sms);

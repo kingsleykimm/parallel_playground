@@ -265,7 +265,7 @@ PYBIND11_MODULE(moe_cuda, m) {
         }
         moe_cuda::kernels::fp8_grouped_gemm_swiglu(
             A, gate_weight, up_weight, scale_a, gate_scale, up_scale, scale_d,
-            D, GemmType::MGroupedContiguous, grouped_layout.data_ptr<int>(),
+            D, gemm_type, grouped_layout.data_ptr<int>(),
             stream);
       },
       pybind11::arg("A"), pybind11::arg("scale_a"),
@@ -316,6 +316,75 @@ PYBIND11_MODULE(moe_cuda, m) {
       pybind11::arg("up_weight"), pybind11::arg("up_scale"), pybind11::arg("D"),
       pybind11::arg("scale_d"), pybind11::arg("grouped_layout"),
       "Launch the grouped gemm swiglu entrypoint on the current CUDA stream");
+  // kernel3_sub: unoptimized baseline (no MMA/scale interleaving)
+  m.def(
+      "fp8_grouped_gemm_swiglu_sub",
+      [](at::Tensor &A, at::Tensor &scale_a, at::Tensor &gate_weight,
+         at::Tensor &gate_scale, at::Tensor &up_weight, at::Tensor &up_scale,
+         at::Tensor &D, at::Tensor &scale_d, GemmType &gemm_type,
+         at::Tensor &grouped_layout) {
+        auto stream = current_stream();
+        HOST_ASSERT(grouped_layout.scalar_type() == at::ScalarType::Int,
+                    "invalid grouped layout type");
+        HOST_ASSERT(D.size(-1) / 128 == scale_d.size(-2),
+                    "incorrect output scale d layout");
+        moe_cuda::kernels::fp8_grouped_gemm_swiglu_sub(
+            A, gate_weight, up_weight, scale_a, gate_scale, up_scale, scale_d,
+            D, gemm_type, grouped_layout.data_ptr<int>(),
+            stream);
+      },
+      pybind11::arg("A"), pybind11::arg("scale_a"),
+      pybind11::arg("gate_weight"), pybind11::arg("gate_scale"),
+      pybind11::arg("up_weight"), pybind11::arg("up_scale"), pybind11::arg("D"),
+      pybind11::arg("scale_d"), pybind11::arg("gemm_type"),
+      pybind11::arg("grouped_layout"),
+      "Launch the unoptimized grouped gemm swiglu (kernel3_sub) baseline on "
+      "the current CUDA stream");
+
+  m.def(
+      "fp8_grouped_gemm_swiglu_sub_contiguous",
+      [](at::Tensor &A, at::Tensor &scale_a, at::Tensor &gate_weight,
+         at::Tensor &gate_scale, at::Tensor &up_weight, at::Tensor &up_scale,
+         at::Tensor &D, at::Tensor &scale_d, at::Tensor &grouped_layout) {
+        auto stream = current_stream();
+        HOST_ASSERT(grouped_layout.scalar_type() == at::ScalarType::Int,
+                    "invalid grouped layout type");
+        HOST_ASSERT(D.size(-1) / 128 == scale_d.size(-2),
+                    "incorrect output scale d layout");
+        moe_cuda::kernels::fp8_grouped_gemm_swiglu_sub(
+            A, gate_weight, up_weight, scale_a, gate_scale, up_scale, scale_d,
+            D, GemmType::MGroupedContiguous, grouped_layout.data_ptr<int>(),
+            stream);
+      },
+      pybind11::arg("A"), pybind11::arg("scale_a"),
+      pybind11::arg("gate_weight"), pybind11::arg("gate_scale"),
+      pybind11::arg("up_weight"), pybind11::arg("up_scale"), pybind11::arg("D"),
+      pybind11::arg("scale_d"), pybind11::arg("grouped_layout"),
+      "Launch the unoptimized grouped gemm swiglu (kernel3_sub) contiguous "
+      "baseline on the current CUDA stream");
+
+  m.def(
+      "fp8_grouped_gemm_swiglu_sub_masked",
+      [](at::Tensor &A, at::Tensor &scale_a, at::Tensor &gate_weight,
+         at::Tensor &gate_scale, at::Tensor &up_weight, at::Tensor &up_scale,
+         at::Tensor &D, at::Tensor &scale_d, at::Tensor &grouped_layout) {
+        auto stream = current_stream();
+        HOST_ASSERT(grouped_layout.scalar_type() == at::ScalarType::Int,
+                    "invalid grouped layout type");
+        HOST_ASSERT(D.size(-1) / 128 == scale_d.size(-2),
+                    "incorrect output scale d layout");
+        moe_cuda::kernels::fp8_grouped_gemm_swiglu_sub(
+            A, gate_weight, up_weight, scale_a, gate_scale, up_scale, scale_d,
+            D, GemmType::MGroupedMasked, grouped_layout.data_ptr<int>(),
+            stream);
+      },
+      pybind11::arg("A"), pybind11::arg("scale_a"),
+      pybind11::arg("gate_weight"), pybind11::arg("gate_scale"),
+      pybind11::arg("up_weight"), pybind11::arg("up_scale"), pybind11::arg("D"),
+      pybind11::arg("scale_d"), pybind11::arg("grouped_layout"),
+      "Launch the unoptimized grouped gemm swiglu (kernel3_sub) masked "
+      "baseline on the current CUDA stream");
+
   m.def(
       "fp8_grouped_gemm_swiglu_pp",
       [](at::Tensor &A, at::Tensor &scale_a, at::Tensor &gate_weight,

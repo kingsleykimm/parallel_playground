@@ -302,6 +302,19 @@ def enumerate_grouped_gemms() -> Generator:
             for n, k in n_k_list:
                 yield num_groups, expected_m_per_group, n, k, gemm_type
 
+def enumerate_moe_configs() -> Generator:
+    b_s_list = [(1, 1024), (2, 4096), (8, 1024)]
+    # b_s_list = [(1, 1024)]
+    h_i_list = [(512, 2048), (2048, 7168)]
+    num_experts_list = [32, 128, 512]
+    experts_per_token_list = [2, 8, 10]
+    num_comm_sms_list = [28, 54]
+    for b, s in b_s_list:
+        for h, i in h_i_list:
+            for num_experts in num_experts_list:
+                for experts_per_token in experts_per_token_list:
+                    for num_comm_sms in num_comm_sms_list:
+                        yield b, s, h, i, num_experts, experts_per_token, num_comm_sms
 
 # use these later
 

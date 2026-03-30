@@ -1,8 +1,9 @@
 /**
  * @file
- * @brief: Extension of Basic FP8 1d2d grouped gemm with fused silu-mul-quant
- * activation in epilogue, with 2 cooperative consumer warpgroups, similar to
- * the TK implementation.
+ * @brief: Unoptimized version of kernel3.cuh — both WGMMAs are issued
+ * back-to-back before any scale loading or promotion, so there is no
+ * overlap of MMA with scalar work.  Kept as a baseline to show the
+ * improvement from the interleaved schedule in kernel3.cuh.
  **/
 #pragma once
 
@@ -14,7 +15,7 @@ using namespace kittens;
 using namespace kittens::prototype;
 using namespace kittens::prototype::lcf;
 
-namespace kernel3 {
+namespace kernel3_sub {
 
 // Here, GEMM_TYPE corresponds to MGroupedMasked or MGroupedContiguous
 
@@ -295,7 +296,19 @@ struct matmul_template {
       args.common.computation_valid = computation_valid;
       if (computation_valid) {
 
-        // Compute scale pointer offsets once (independent of WGMMA results)
+        // === Phase 1: issue both WGMMAs back-to-back (no interleaving) ===
+        warp::zero(args.state.per_k_gate_accum);
+        warpgroup::mma_ABt(args.state.per_k_gate_accum,
+                           args.input.a[warpgroup::groupid()], args.input.gate);
+
+        warp::zero(args.state.per_k_up_accum);
+        warpgroup::mma_ABt(args.state.per_k_up_accum,
+                           args.input.a[warpgroup::groupid()], args.input.up);
+
+        // === Phase 2: wait for both WGMMAs to complete ===
+        warpgroup::mma_async_wait();
+
+        // === Phase 3: load all scale metadata ===
         const auto previous_group_offset = get_global_idx<true>(
             shape_k_scales * shape_n_sfb, 0, args, args.common.m_block_idx);
         const uint32_t scale_b_offset =
@@ -306,18 +319,14 @@ struct matmul_template {
             args.globals.scale_gate.raw_ptr + scale_b_offset;
         float *local_up_sfb = args.globals.scale_up.raw_ptr + scale_b_offset;
 
-        // === Phase 1: issue gate WGMMA ===
-        warp::zero(args.state.per_k_gate_accum);
-        warpgroup::mma_ABt(args.state.per_k_gate_accum,
-                           args.input.a[warpgroup::groupid()], args.input.gate);
-
-        // === Phase 2: while gate WGMMA runs, load gate scales + scale_a,
-        //              and build the per-column gate scale vector ===
         float gate_scale_0, gate_scale_1, up_scale_0, up_scale_1;
         move<float>::ldg(gate_scale_0, local_gate_sfb);
+        move<float>::ldg(up_scale_0, local_up_sfb);
         if constexpr (!layout::kIsUniformScales) {
-          if (args.state.num_full_iters > args.state.num_former_iters)
+          if (args.state.num_full_iters > args.state.num_former_iters) {
             move<float>::ldg(gate_scale_1, local_gate_sfb + stride_n_sfb);
+            move<float>::ldg(up_scale_1, local_up_sfb + stride_n_sfb);
+          }
         }
 
         typename decltype(args.state.per_k_gate_accum)::col_vec scale_a_rv;
@@ -328,28 +337,27 @@ struct matmul_template {
 #pragma unroll
           for (uint32_t i = 0; i < layout::BN / 16; i++) {
             const uint32_t column_chunk = i * 2;
-            float first = column_chunk < args.state.num_former_iters
+            float gate_first = column_chunk < args.state.num_former_iters
                               ? gate_scale_0
                               : gate_scale_1;
-            float second = column_chunk + 1 < args.state.num_former_iters
+            float gate_second = column_chunk + 1 < args.state.num_former_iters
                                ? gate_scale_0
                                : gate_scale_1;
-            gate_col_scale_b[i][0] = make_float2(first, first);
-            gate_col_scale_b[i][1] = make_float2(second, second);
+            gate_col_scale_b[i][0] = make_float2(gate_first, gate_first);
+            gate_col_scale_b[i][1] = make_float2(gate_second, gate_second);
+
+            float up_first = column_chunk < args.state.num_former_iters
+                              ? up_scale_0
+                              : up_scale_1;
+            float up_second = column_chunk + 1 < args.state.num_former_iters
+                               ? up_scale_0
+                               : up_scale_1;
+            up_col_scale_b[i][0] = make_float2(up_first, up_first);
+            up_col_scale_b[i][1] = make_float2(up_second, up_second);
           }
         }
 
-        // === Phase 3: wait for gate WGMMA ===
-        warpgroup::mma_async_wait();
-
-        // === Phase 4: issue up WGMMA ===
-        warp::zero(args.state.per_k_up_accum);
-        warpgroup::mma_ABt(args.state.per_k_up_accum,
-                           args.input.a[warpgroup::groupid()], args.input.up);
-
-        // === Phase 5: while up WGMMA runs:
-        //   a) apply scale promotion to gate result and accumulate
-        //   b) load up scales and build per-column up scale vector ===
+        // === Phase 4: apply scale promotion to gate result and accumulate ===
         warp::mul_row(args.state.per_k_gate_accum, args.state.per_k_gate_accum,
                       scale_a_rv);
         if constexpr (layout::kIsUniformScales) {
@@ -360,28 +368,7 @@ struct matmul_template {
         }
         args.state.gate_accum += args.state.per_k_gate_accum;
 
-        move<float>::ldg(up_scale_0, local_up_sfb);
-        if constexpr (!layout::kIsUniformScales) {
-          if (args.state.num_full_iters > args.state.num_former_iters)
-            move<float>::ldg(up_scale_1, local_up_sfb + stride_n_sfb);
-#pragma unroll
-          for (uint32_t i = 0; i < layout::BN / 16; i++) {
-            const uint32_t column_chunk = i * 2;
-            float first = column_chunk < args.state.num_former_iters
-                              ? up_scale_0
-                              : up_scale_1;
-            float second = column_chunk + 1 < args.state.num_former_iters
-                               ? up_scale_0
-                               : up_scale_1;
-            up_col_scale_b[i][0] = make_float2(first, first);
-            up_col_scale_b[i][1] = make_float2(second, second);
-          }
-        }
-
-        // === Phase 6: wait for up WGMMA ===
-        warpgroup::mma_async_wait();
-
-        // === Phase 7: apply scale promotion to up result and accumulate ===
+        // === Phase 5: apply scale promotion to up result and accumulate ===
         warp::mul_row(args.state.per_k_up_accum, args.state.per_k_up_accum,
                       scale_a_rv);
         if constexpr (layout::kIsUniformScales) {
@@ -450,4 +437,4 @@ struct matmul_template {
 // using mmt =
 //     matmul_template<-1, -1, -1, 64, 128, 128, 1, 8, 1, 4, 0, 0, float, 12>;
 // using tk_globals_t = typename mmt::layout::globals;
-} // namespace kernel3
+} // namespace kernel3_sub
