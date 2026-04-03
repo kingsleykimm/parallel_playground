@@ -48,7 +48,7 @@ inline int get_tk_lcf_smem_size(const int block_m, const int block_n,
   // SAFE_STAGES_BETWEEN_BLOCKS == num_stages (producer never stalls on
   // finish_finished).
   return scratch_alloc_size + num_stages * input_alloc_size +
-         finish_block_size + 2 * 1024;
+         finish_block_size + 1024;
 }
 
 // Computes the shared memory size required by the TK LCF kernel3 (fused
@@ -417,7 +417,7 @@ inline GemmConfig search_configs(GemmType gemm_type, uint32_t M, uint32_t N,
                                  Major BMajor, Major CMajor,
                                  c10::ScalarType AB_type,
                                  c10::ScalarType CD_type,
-                                 const uint32_t &num_sms) {
+                                 const uint32_t &num_sms, bool fused_combine = false) {
   // we need to determine smem and multicast config
   const uint32_t block_k = 128 / get_type_size(AB_type);
 
@@ -532,12 +532,17 @@ inline GemmConfig search_configs(GemmType gemm_type, uint32_t M, uint32_t N,
   for (int num_stages = 16; num_stages > 0; num_stages--) {
     int smem_size = get_tk_lcf_smem_size(best_block_m, best_block_n, block_k,
                                          num_stages, cd_size);
+    if (fused_combine) {
+      smem_size += host_align(num_groups, 16) * sizeof(int);
+    }
     if (smem_size <= smem_capacity) {
       best_num_stages = num_stages;
       smem_config.smem_size = smem_size;
       break;
     }
   }
+  HOST_ASSERT(best_num_stages != 0,
+              "Error: kernel5 config search yielded no results");
 
   int min_sms = num_sms;
   if (SM90Arch::should_minimize_sms()) {

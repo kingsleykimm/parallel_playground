@@ -234,19 +234,16 @@ PYBIND11_MODULE(moe_cuda, m) {
       "fp8_grouped_gemm_nt",
       [](at::Tensor &act, at::Tensor &act_scale, at::Tensor &weight,
          at::Tensor &weight_scale, at::Tensor &output, GemmType gemm_type,
-         std::optional<at::Tensor> grouped_layout) {
+         at::Tensor grouped_layout) {
         auto stream = current_stream();
-        int *grouped_layout_ptr = grouped_layout.has_value()
-                                      ? grouped_layout->data_ptr<int>()
-                                      : nullptr;
         moe_cuda::kernels::fp8_grouped_gemm_nt(act, act_scale, weight,
                                                weight_scale, output, gemm_type,
-                                               grouped_layout_ptr, stream);
+                                               grouped_layout.data_ptr<int>(), stream);
       },
       pybind11::arg("act"), pybind11::arg("act_scale"), pybind11::arg("weight"),
       pybind11::arg("weight_scale"), pybind11::arg("output"),
-      pybind11::arg("gemm_type") = GemmType::MGroupedContiguous,
-      pybind11::arg("grouped_layout") = pybind11::none(),
+      pybind11::arg("gemm_type"),
+      pybind11::arg("grouped_layout"),
       "Launch the grouped FP8 GEMM entrypoint on the current CUDA stream.");
 
   m.def(

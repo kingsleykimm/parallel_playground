@@ -90,6 +90,48 @@ def check_diff(name: str, A: torch.Tensor, A_ref: torch.Tensor, single: bool = F
         clean_print(f"Ref max:   {A_ref.abs().max().item():.10f}")
 
 
+def benchmark_l2_clear(
+    func: Callable,
+    num_warmup_iters: int = 1,
+    num_iters: int = 5,
+    single: bool = False,
+    use_events: bool = True
+) -> float:
+    for _ in range(num_warmup_iters):
+        func()
+    torch.cuda.synchronize()
+
+    l2_cache = torch.empty(1024 * 1024 * 128 // 2, dtype=torch.bfloat16, device=f"cuda:{_env['local_rank']}" if not single else "cuda")
+
+    if use_events:
+        start_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
+        end_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
+
+        for i in range(num_iters):
+            l2_cache.random_(0, 100)
+            start_events[i].record()
+            func()
+            end_events[i].record()
+        torch.cuda.synchronize()
+
+        times = [start_events[i].elapsed_time(end_events[i]) for i in range(num_iters)]
+        total_ms = sum(times)
+        avg_ms = total_ms / num_iters
+
+    else:
+        times = []
+        for i in range(num_iters):
+            l2_cache.random_(0, 100)
+            torch.cuda.synchronize()
+            start_time = perf_counter()
+            func()
+            torch.cuda.synchronize()
+            end_time = perf_counter()
+            times.append(end_time - start_time)
+        avg_ms = (sum(times) / num_iters) * 1000
+
+    return avg_ms
+
 def benchmark_no_l2_clear(
     func: Callable,
     num_warmup_iters: int = 1,
@@ -262,7 +304,7 @@ def generate_m_grouped_contiguous(num_groups: int, expected_m_per_group: int, n:
     # assert major_a.is_k_major()
     # a = cast_fp8_fp4_with_major(a, major_a, quant_config.gran_k_a, quant_config.is_fp4_a, use_ue8m0)
     # b = grouped_cast_fp8_fp4_with_major(b, major_b, quant_config.gran_k_b, quant_config.is_fp4_b, use_ue8m0, use_block_cast_for_fp8=True)
-    return a, up, gate, grouped_layout, d, scale_d, aligned_ms
+    return a, up, gate, grouped_layout, d, scale_d, aligned_ms, actual_ms
 
 
 def generate_m_grouped_masked(num_groups: int, max_m: int, expected_m_per_group: int, n: int, k: int, use_bf16: bool = False,) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -294,7 +336,7 @@ def generate_m_grouped_masked(num_groups: int, max_m: int, expected_m_per_group:
 
 
 def enumerate_grouped_gemms() -> Generator:
-    m_group_list = [(4, 8192), (8, 4096), [32, 1024]]
+    m_group_list = [(4, 2048), (8, 4096), [4, 1024]]
     n_k_list = [(6144, 7168), (7168, 3072), (4096, 4096), (4096, 2048)]
 
     for gemm_type in [moe_cuda.GemmType.MGroupedContiguous, moe_cuda.GemmType.MGroupedMasked]:
@@ -305,7 +347,7 @@ def enumerate_grouped_gemms() -> Generator:
 def enumerate_moe_configs() -> Generator:
     b_s_list = [(1, 1024), (2, 4096), (8, 1024)]
     # b_s_list = [(1, 1024)]
-    h_i_list = [(512, 2048), (2048, 7168)]
+    h_i_list = [(512, 2048), (2048, 4096)]
     num_experts_list = [32, 128, 512]
     experts_per_token_list = [2, 8, 10]
     num_comm_sms_list = [28, 54]

@@ -147,27 +147,10 @@ static void __instantiate_kernel() {{
                              args.scale_b, args.grouped_layout, total_M,
                              total_N, args.K);
 
-    if (grouped_kernel_trace_host_enabled()) {
-      printf("[kernel2] launch_impl\n");
-      printf("  gemm_type=%d c_dtype=%s num_groups=%u\n", args.gemm_type,
-             to_string(args.c_dtype).c_str(), args.num_groups);
-      printf("  M=%u N=%u K=%u total_M=%zu total_N=%zu\n", args.M, args.N,
-             args.K, total_M, total_N);
-      printf("  bm=%d bn=%d bk=%d super_n=%d stages=%d\n", args.bm, args.bn,
-             args.bk, args.super_n, args.num_stages);
-      printf("  consumer_warps=%d producer_warps=%d smem=%d\n",
-             args.num_consumer_warps, args.num_producer_warps, args.smem_size);
-      printf("  ptrs A=%p B=%p C=%p scale_a=%p scale_b=%p grouped_layout=%p\n",
-             args.A, args.B, args.C, args.scale_a, args.scale_b,
-             args.grouped_layout);
-      printf("  globals_size=%zu\n", gsize);
-      tk_dump_grouped_globals(args.bm, args.bn, args.bk, args.gemm_type,
-                              args.c_dtype, globals_buf);
-      dump_hex_prefix("  globals_prefix=", globals_buf, gsize);
-    }
-
     void *kernelParams[] = {globals_buf};
+    nvtxRangePush("sm90_fp8_grouped_gemm");
     CUDA_CHECK(cuLaunchKernelEx(&launch_config, kernel, kernelParams, nullptr));
+    nvtxRangePop();
   }
 };
 

@@ -1,5 +1,5 @@
 import moe_cuda
-
+import argparse
 from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
@@ -23,6 +23,8 @@ class TestConfig:
     num_comp_sms: int
     local_rank: int
     local_world_size: int = 4
+    save_cache: str = None
+    load_cache: str = None
 
 
 def fused_dispatch_grouped_gemm_swiglu(
@@ -620,12 +622,12 @@ def fused_dispatch_run(
     num_recv_tokens = torch.zeros((1,), dtype=torch.int32, device=device)
 
     weights = torch.rand((cfg.B * cfg.S, cfg.num_experts),
-                         dtype=torch.bfloat16, device=device)
+                         dtype=torch.float32, device=device)
     indices = torch.multinomial(
         input=weights, num_samples=cfg.experts_per_token, replacement=False).to(torch.int32).to(device)
     weights = torch.gather(input = weights, dim = 1, index = indices).softmax(dim = -1)
 
-    fused_dispatch_run  = lambda : fused_dispatch_grouped_gemm_swiglu(
+    _dispatch_run_fn = lambda : fused_dispatch_grouped_gemm_swiglu(
         in_tokens, in_tokens_scales, expert_x_tokens, expert_x_tokens_scale,
         gate, up, expert_y, scale_gate, scale_up, expert_y_scales,
         indices, global_num_routed, expert_to_token_map, expert_to_slot_map, padded_expert_counts,
@@ -634,12 +636,26 @@ def fused_dispatch_run(
         local_world_size,
         cfg.num_experts, cfg.experts_per_token, cfg.num_comm_sms, cfg.num_comp_sms)
     clean_print("Initialized tensors", print_once=True)
-    fused_dispatch_run()
-    torch.distributed.barrier()
-    torch.cuda.synchronize()
-    clean_print("Fused run completed", print_once=True)
 
-    if cfg.check_dispatch_correctness:
+    if cfg.load_cache:
+        _cache_path = f"{cfg.load_cache}_rank_{local_rank}.pt"
+        _cache = torch.load(_cache_path, map_location=device, weights_only=True)
+        expert_y.copy_(_cache['expert_y'])
+        expert_y_scales.copy_(_cache['expert_y_scales'])
+        padded_expert_counts.copy_(_cache['padded_expert_counts'])
+        src_token_idx.copy_(_cache['src_token_idx'])
+        src_dev_idx.copy_(_cache['src_dev_idx'])
+        src_slot_idx.copy_(_cache['src_slot_idx'])
+        num_recv_tokens.copy_(_cache['num_recv_tokens'])
+        weights = _cache['weights']
+        clean_print(f"Loaded dispatch outputs from {_cache_path}", print_once=False)
+    else:
+        _dispatch_run_fn()
+        torch.distributed.barrier()
+        torch.cuda.synchronize()
+        clean_print("Fused run completed", print_once=True)
+
+    if cfg.check_dispatch_correctness and not cfg.load_cache:
         check_fused_dispatch_correctness(
             cfg=cfg,
             device=device,
@@ -660,7 +676,6 @@ def fused_dispatch_run(
             expert_y_scales=expert_y_scales,
         )
 
-
     # combine step
     out_tokens = moe_cuda.TKParallelTensor(
         shape = (cfg.B * cfg.S, cfg.H),
@@ -670,12 +685,36 @@ def fused_dispatch_run(
         multicast = False
     )
 
-    down_bf16 = torch.rand((cfg.num_experts, cfg.H, cfg.I), dtype=torch.bfloat16, device=device) / (cfg.I ** 0.5)
+    clean_print("NUM RECV TOKENS: ", num_recv_tokens.item())
 
-    down, scale_down = quantize_2d_128(down_bf16)
+    if cfg.load_cache:
+        down = _cache['down']
+        scale_down = _cache['scale_down']
+        C = _cache['C']
+        down_bf16 = None
+    else:
+        down_bf16 = torch.rand((num_experts_per_dev, cfg.H, cfg.I), dtype=torch.bfloat16, device=device) / (cfg.I ** 0.5)
+        down, scale_down = quantize_2d_128(down_bf16)
+        C = torch.rand((max_recv_tokens, cfg.H), dtype=torch.bfloat16, device=device) / (cfg.H ** 0.5)
 
-    C = torch.rand((max_recv_tokens, cfg.H), dtype=torch.bfloat16, device=device) / (cfg.H ** 0.5)
-    clean_print("beginning fused combine run", print_once=True)
+    if cfg.save_cache:
+        _cache_path = f"{cfg.save_cache}_rank_{local_rank}.pt"
+        torch.save({
+            'expert_y': expert_y,
+            'expert_y_scales': expert_y_scales,
+            'padded_expert_counts': padded_expert_counts,
+            'src_token_idx': src_token_idx,
+            'src_dev_idx': src_dev_idx,
+            'src_slot_idx': src_slot_idx,
+            'num_recv_tokens': num_recv_tokens,
+            'weights': weights,
+            'down': down,
+            'scale_down': scale_down,
+            'C': C,
+        }, _cache_path)
+        clean_print(f"Saved cache to {_cache_path}", print_once=False)
+
+    clean_print(expert_y.shape, print_once=True)
     fused_combine_run = lambda : fused_grouped_gemm_combine(
         out_tokens,
         expert_y,
@@ -724,6 +763,16 @@ def fused_dispatch_run(
 if __name__ == "__main__":
     setup()
     local_rank, world_size = init_distributed_environment()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--check_dispatch_correctness", action="store_true")
+    parser.add_argument("--check_correctness", action="store_true")
+    parser.add_argument("--save_cache", type=str, default=None,
+                        help="Base path for saving tensors before combine (e.g. /tmp/moe_cache). "
+                             "Each rank writes <path>_rank_<rank>.pt")
+    parser.add_argument("--load_cache", type=str, default=None,
+                        help="Base path to load cached tensors from (skips dispatch). "
+                             "Each rank reads <path>_rank_<rank>.pt")
+    args = parser.parse_args()
 
     for b, s, h, i, num_experts, experts_per_token, num_comm_sms in enumerate_moe_configs():
         cfg = TestConfig(
@@ -738,8 +787,10 @@ if __name__ == "__main__":
             num_comp_sms=132 - num_comm_sms,
             local_rank=local_rank,
             local_world_size=world_size,
-            check_dispatch_correctness = True,
-            check_correctness = False
+            check_dispatch_correctness = args.check_dispatch_correctness,
+            check_correctness = args.check_correctness,
+            save_cache = args.save_cache,
+            load_cache = args.load_cache,
         )
     # max recv tokens is calculated as the maximum possible number of tokens that could be received by any dp group
     fused_dispatch_run(cfg, cfg.B * cfg.S *

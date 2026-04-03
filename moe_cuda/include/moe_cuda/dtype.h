@@ -92,7 +92,7 @@ inline const DTypeFInfo &get_finfo_from_TDType(c10::ScalarType dtype) {
     return finfo_table[2];
   default:
     // For unsupported types, fallback to FP32
-    return finfo_table[0];
+    HOST_ERROR("Unsupported dtype");
   }
 }
 template <typename T> inline const DTypeFInfo &get_finfo_from_typename() {
@@ -104,7 +104,6 @@ template <typename T> inline const DTypeFInfo &get_finfo_from_typename() {
     return finfo_table[7];
   } else {
     HOST_ERROR("DType is not supported yet");
-    return finfo_table[0];
   }
 }
 template <typename T> inline bool tensordtype_match(c10::ScalarType dtype) {
@@ -125,7 +124,7 @@ template <typename T> inline bool tensordtype_match(c10::ScalarType dtype) {
   } else if (dtype == c10::ScalarType::Float8_e4m3fn) {
     return std::is_same<T, __nv_fp8_e4m3>::value;
   } else {
-    return false;
+    HOST_ERROR("Unsupported dtype");
   }
 }
 
@@ -150,7 +149,7 @@ inline void *dtype_cast_ptr(c10::ScalarType dtype, void *data) {
   case c10::ScalarType::Float8_e4m3fn:
     return reinterpret_cast<__nv_fp8_e4m3 *>(data);
   default:
-    return reinterpret_cast<float *>(data);
+    HOST_ERROR("Unsupported dtype");
   }
 }
 
@@ -166,7 +165,7 @@ inline cudaDataType_t tensorDType_to_cudaDType(c10::ScalarType type) {
     return CUDA_R_32I;
   default:
     // You may want to handle error cases more gracefully
-    return CUDA_R_32F;
+    HOST_ERROR("Unsupported dtype");
   }
 }
 
@@ -180,7 +179,7 @@ template <typename T> inline cudaDataType_t toCudaDType() {
     return CUDA_R_16BF;
   else if constexpr (std::is_same<T, int32_t>::value)
     return CUDA_R_32I;
-  return CUDA_R_32F;
+  HOST_ERROR("Unsupported dtype");
 }
 
 // cuda compute mappings, TO

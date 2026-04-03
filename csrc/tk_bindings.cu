@@ -1,3 +1,4 @@
+#include "runtime/utils.h"
 #include <ATen/cuda/CUDAContext.h>
 #include <kernels/internal_api.hpp>
 #include <pybind11/pybind11.h>
@@ -64,13 +65,15 @@ void bind_fused_grouped_gemm_combine(pybind11::module_ &m) {
       [](kittens::py::TKParallelTensor &out_tokens, at::Tensor &expert_y_tokens,
          at::Tensor &expert_y_tokens_scale, at::Tensor &down,
          at::Tensor &scale_down, at::Tensor &C, at::Tensor &weights,
-         at::Tensor &padded_expert_counts,
-         at::Tensor &src_token_idx, at::Tensor &src_dev_idx,
-         at::Tensor &src_slot_idx, int num_experts, int experts_per_token,
-         at::Tensor &num_recv_tokens, int dp_rank, int rank, int dp_size,
-         int cur_dp_group, int num_dp_groups, int num_comm_sms,
-         int num_comp_sms) {
+         at::Tensor &padded_expert_counts, at::Tensor &src_token_idx,
+         at::Tensor &src_dev_idx, at::Tensor &src_slot_idx, int num_experts,
+         int experts_per_token, at::Tensor &num_recv_tokens, int dp_rank,
+         int rank, int dp_size, int cur_dp_group, int num_dp_groups,
+         int num_comm_sms, int num_comp_sms) {
         auto stream = current_stream();
+        if (get_env<int>("MOE_CUDA_DEBUG") > 0) {
+          printf("beginning fused grouped gemm combine\n");
+        }
         moe_cuda::kernels::fused_grouped_gemm_combine(
             out_tokens, expert_y_tokens, expert_y_tokens_scale, down,
             scale_down, C, weights, padded_expert_counts, src_token_idx,
@@ -81,11 +84,11 @@ void bind_fused_grouped_gemm_combine(pybind11::module_ &m) {
       pybind11::arg("out_tokens"), pybind11::arg("expert_y_tokens"),
       pybind11::arg("expert_y_tokens_scale"), pybind11::arg("down"),
       pybind11::arg("scale_down"), pybind11::arg("C"), pybind11::arg("weights"),
-      pybind11::arg("padded_expert_counts"),
-      pybind11::arg("src_token_idx"), pybind11::arg("src_dev_idx"),
-      pybind11::arg("src_slot_idx"), pybind11::arg("num_experts"),
-      pybind11::arg("experts_per_token"), pybind11::arg("num_recv_tokens"),
-      pybind11::arg("dp_rank"), pybind11::arg("rank"), pybind11::arg("dp_size"),
+      pybind11::arg("padded_expert_counts"), pybind11::arg("src_token_idx"),
+      pybind11::arg("src_dev_idx"), pybind11::arg("src_slot_idx"),
+      pybind11::arg("num_experts"), pybind11::arg("experts_per_token"),
+      pybind11::arg("num_recv_tokens"), pybind11::arg("dp_rank"),
+      pybind11::arg("rank"), pybind11::arg("dp_size"),
       pybind11::arg("cur_dp_group"), pybind11::arg("num_dp_groups"),
       pybind11::arg("num_comm_sms"), pybind11::arg("num_comp_sms"));
 }

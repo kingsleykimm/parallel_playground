@@ -7,6 +7,7 @@
 #include "common/common.cuh"
 #include "kittens.cuh"
 #include "prototype.cuh"
+#include <moe_cuda/error.hpp>
 using namespace kittens;
 using namespace kittens::prototype;
 using namespace kittens::prototype::lcf;

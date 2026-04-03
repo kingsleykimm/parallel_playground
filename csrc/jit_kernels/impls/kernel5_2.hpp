@@ -71,7 +71,7 @@
  #include <moe_cuda/kernels/kernel5_2.cuh>
  
  static void __instantiate_kernel() {{
- auto ptr = reinterpret_cast<void *>(&kernel5_2::global_kernel<
+ auto ptr = reinterpret_cast<void *>(&kernel5_2::kernel5_2_global_kernel<
          {}, {}, {},
          {},
          {},
@@ -93,12 +93,13 @@
                            const LaunchConfigHandle &launch_config,
                            const Args &args) {
      // Build globals via the pre-compiled factory
-     size_t gsize = tk_kernel5_2_globals_size(args.H);
+     size_t gsize = tk_kernel5_2_globals_size(args.H, args.BM, args.BN);
      alignas(128) char globals_buf[4096];
-     assert(gsize <= sizeof(globals_buf));
+     HOST_ASSERT(gsize <= sizeof(globals_buf), "Globals buffer too small");
+     
      
      tk_build_kernel5_2_globals(
-        args.H, globals_buf, *args.out_tokens, *args.expert_y_tokens,
+        args.H, args.BM, args.BN, globals_buf, *args.out_tokens, *args.expert_y_tokens,
          *args.expert_y_tokens_scale, *args.comm_comp_barrier, *args.down,
           *args.scale_down, *args.C, *args.weights, *args.padded_expert_counts,
            *args.src_token_idx, *args.src_dev_idx, *args.src_slot_idx,
@@ -141,9 +142,9 @@
  
    int total_sms = num_comm_sms + num_comp_sms;
 
-   int num_experts_per_dev = C.size(0);
+   int num_experts_per_dev = down.size(0);
    auto gemm_config = search_configs(
-    GemmType::MGroupedMasked, M, H, I, num_experts_per_dev, Major::K, Major::K, Major::K, torch::kFloat8_e4m3fn, torch::kBFloat16, total_sms
+    GemmType::MGroupedMasked, M, H, I, num_experts_per_dev, Major::K, Major::K, Major::K, torch::kFloat8_e4m3fn, torch::kBFloat16, total_sms, true
    );
  
    uint32_t BM = gemm_config.block_m;
@@ -152,6 +153,7 @@
    uint32_t num_producer_warps = gemm_config.num_tma_threads / 32;
    uint32_t num_stages = gemm_config.num_stages;
    uint32_t kernel_smem_size = gemm_config.smem_config.smem_size;
+  //  uint32_t kernel_smem_size = 227 * 1024 - 1024;
    uint32_t super_m = 1;
  
    at::Tensor comm_comp_barrier = at::zeros(std::vector<int64_t>{host_ceil_div(src_token_idx.size(0), BM)}, at::TensorOptions().device(torch::kCUDA).dtype(torch::kInt32));

@@ -47,6 +47,7 @@ export JIT_USE_NVRTC=1
 ```
 
 # Roadmap:
+- [ ] weird bug happening at high K for kernel2 to fix
 - [ ] implement a fused dispatch + swiglu grouped gemm
     - [ ] inside here, enforce transposed sfa majors
     - [ ] keep linking this together, and also remember to zero out the comm_comp_barriers after each dispatch (these are actually initialized inside so it's ok)

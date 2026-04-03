@@ -67,9 +67,9 @@ void tk_build_kernel5_1_globals(
     int num_dp_groups, int num_comm_sms, int num_comp_sms);
 
 // kernel5_2 globals (kernel5_2::globals) — Fused Dispatch + FC1 of SwiGLU MLP
-size_t tk_kernel5_2_globals_size(int H_);
+size_t tk_kernel5_2_globals_size(int H_, int BM_, int BN_);
 void tk_build_kernel5_2_globals(
-    int H_, void *out, kittens::py::TKParallelTensor &out_tokens,
+    int H_, int BM_, int BN_, void *out, kittens::py::TKParallelTensor &out_tokens,
     at::Tensor &expert_y_tokens, at::Tensor &expert_y_tokens_scale,
     at::Tensor &comm_comp_barrier, at::Tensor &down, at::Tensor &scale_down,
     at::Tensor &C, at::Tensor &weights, at::Tensor &padded_expert_counts,

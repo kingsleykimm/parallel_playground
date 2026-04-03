@@ -832,11 +832,11 @@ static constexpr int K5_2SUPER_M = 12;
 static constexpr int K5_2M = 128;
 static constexpr int K5_2I = 256;
 
-template <int _H> struct fp8_kernel5_2_factory {
+template <int _H, int _BM, int _BN> struct fp8_kernel5_2_factory {
   using globals_t =
-      kernel5_2::globals<K5_2M, K5_2I, _H, K5_2BM, K5_2BN,
-                         K5_2NUM_CONSUMER_WARPS, K5_2NUM_PRODUCER_WARPS,
-                         K5_2NUM_STAGES, K5_2KERNEL_SMEM_SIZE, K5_2NUM_EXPERTS,
+      kernel5_2::globals<K5_2M, K5_2I, _H, _BM, _BN, K5_2NUM_CONSUMER_WARPS,
+                         K5_2NUM_PRODUCER_WARPS, K5_2NUM_STAGES,
+                         K5_2KERNEL_SMEM_SIZE, K5_2NUM_EXPERTS,
                          K5_2EXPERTS_PER_TOKEN, K5_2SUPER_M>;
 
   static size_t size() { return sizeof(globals_t); }
@@ -846,11 +846,11 @@ template <int _H> struct fp8_kernel5_2_factory {
                     at::Tensor &expert_y_tokens_scale,
                     at::Tensor &comm_comp_barrier, at::Tensor &down,
                     at::Tensor &scale_down, at::Tensor &C, at::Tensor &weights,
-                    at::Tensor &padded_expert_counts,
-                    at::Tensor &src_token_idx, at::Tensor &src_dev_idx,
-                    at::Tensor &src_slot_idx, int *num_recv_tokens, int dp_rank,
-                    int rank, int dp_size, int cur_dp_group, int num_dp_groups,
-                    int num_comm_sms, int num_comp_sms) {
+                    at::Tensor &padded_expert_counts, at::Tensor &src_token_idx,
+                    at::Tensor &src_dev_idx, at::Tensor &src_slot_idx,
+                    int *num_recv_tokens, int dp_rank, int rank, int dp_size,
+                    int cur_dp_group, int num_dp_groups, int num_comm_sms,
+                    int num_comp_sms) {
 
     globals_t G{
         .out_tokens = kittens::py::parallel_tensor_to_pgl<
@@ -896,34 +896,169 @@ template <int _H> struct fp8_kernel5_2_factory {
   }
 };
 
-#define TK_KERNEL5_2_SIZE_CASE(h)                                              \
-  if (H_ == h)                                                                 \
-    return fp8_kernel5_2_factory<h>::size();
+#define TK_KERNEL5_2_SIZE_CASE(h, bm, bn)                                      \
+  if (H_ == h && BM_ == bm && BN_ == bn)                                       \
+    return fp8_kernel5_2_factory<h, bm, bn>::size();
 
-#define TK_KERNEL5_2_BUILD_CASE(h)                                             \
-  if (H_ == h) {                                                               \
-    fp8_kernel5_2_factory<h>::build(                                           \
+#define TK_KERNEL5_2_BUILD_CASE(h, bm, bn)                                     \
+  if (H_ == h && BM_ == bm && BN_ == bn) {                                     \
+    fp8_kernel5_2_factory<h, bm, bn>::build(                                   \
         out, out_tokens, expert_y_tokens, expert_y_tokens_scale,               \
-        comm_comp_barrier, down, scale_down, C, weights,                       \
-        padded_expert_counts, src_token_idx,                                   \
-        src_dev_idx, src_slot_idx, num_recv_tokens, dp_rank, rank, dp_size,    \
-        cur_dp_group, num_dp_groups, num_comm_sms, num_comp_sms);              \
+        comm_comp_barrier, down, scale_down, C, weights, padded_expert_counts, \
+        src_token_idx, src_dev_idx, src_slot_idx, num_recv_tokens, dp_rank,    \
+        rank, dp_size, cur_dp_group, num_dp_groups, num_comm_sms,              \
+        num_comp_sms);                                                         \
     return;                                                                    \
   }
 
 #define TK_ALL_KERNEL5_2_H_CONFIGS(MACRO)                                      \
-  MACRO(512)                                                                   \
-  MACRO(1024)                                                                  \
-  MACRO(2048)                                                                  \
-  MACRO(3072)                                                                  \
-  MACRO(4096)                                                                  \
-  MACRO(5120)                                                                  \
-  MACRO(6144)                                                                  \
-  MACRO(7168)                                                                  \
-  MACRO(8192)                                                                  \
+  MACRO(512, 64, 32)                                                           \
+  MACRO(512, 64, 64)                                                           \
+  MACRO(512, 64, 96)                                                           \
+  MACRO(512, 64, 128)                                                          \
+  MACRO(512, 64, 160)                                                          \
+  MACRO(512, 64, 192)                                                          \
+  MACRO(512, 64, 224)                                                          \
+  MACRO(512, 64, 256)                                                          \
+  MACRO(512, 128, 32)                                                          \
+  MACRO(512, 128, 64)                                                          \
+  MACRO(512, 128, 96)                                                          \
+  MACRO(512, 128, 128)                                                         \
+  MACRO(512, 128, 160)                                                         \
+  MACRO(512, 128, 192)                                                         \
+  MACRO(512, 128, 224)                                                         \
+  MACRO(512, 128, 256)                                                         \
+  MACRO(1024, 64, 32)                                                          \
+  MACRO(1024, 64, 64)                                                          \
+  MACRO(1024, 64, 96)                                                          \
+  MACRO(1024, 64, 128)                                                         \
+  MACRO(1024, 64, 160)                                                         \
+  MACRO(1024, 64, 192)                                                         \
+  MACRO(1024, 64, 224)                                                         \
+  MACRO(1024, 64, 256)                                                         \
+  MACRO(1024, 128, 32)                                                         \
+  MACRO(1024, 128, 64)                                                         \
+  MACRO(1024, 128, 96)                                                         \
+  MACRO(1024, 128, 128)                                                        \
+  MACRO(1024, 128, 160)                                                        \
+  MACRO(1024, 128, 192)                                                        \
+  MACRO(1024, 128, 224)                                                        \
+  MACRO(1024, 128, 256)                                                        \
+  MACRO(2048, 64, 32)                                                          \
+  MACRO(2048, 64, 64)                                                          \
+  MACRO(2048, 64, 96)                                                          \
+  MACRO(2048, 64, 128)                                                         \
+  MACRO(2048, 64, 160)                                                         \
+  MACRO(2048, 64, 192)                                                         \
+  MACRO(2048, 64, 224)                                                         \
+  MACRO(2048, 64, 256)                                                         \
+  MACRO(2048, 128, 32)                                                         \
+  MACRO(2048, 128, 64)                                                         \
+  MACRO(2048, 128, 96)                                                         \
+  MACRO(2048, 128, 128)                                                        \
+  MACRO(2048, 128, 160)                                                        \
+  MACRO(2048, 128, 192)                                                        \
+  MACRO(2048, 128, 224)                                                        \
+  MACRO(2048, 128, 256)                                                        \
+  MACRO(3072, 64, 32)                                                          \
+  MACRO(3072, 64, 64)                                                          \
+  MACRO(3072, 64, 96)                                                          \
+  MACRO(3072, 64, 128)                                                         \
+  MACRO(3072, 64, 160)                                                         \
+  MACRO(3072, 64, 192)                                                         \
+  MACRO(3072, 64, 224)                                                         \
+  MACRO(3072, 64, 256)                                                         \
+  MACRO(3072, 128, 32)                                                         \
+  MACRO(3072, 128, 64)                                                         \
+  MACRO(3072, 128, 96)                                                         \
+  MACRO(3072, 128, 128)                                                        \
+  MACRO(3072, 128, 160)                                                        \
+  MACRO(3072, 128, 192)                                                        \
+  MACRO(3072, 128, 224)                                                        \
+  MACRO(3072, 128, 256)                                                        \
+  MACRO(4096, 64, 32)                                                          \
+  MACRO(4096, 64, 64)                                                          \
+  MACRO(4096, 64, 96)                                                          \
+  MACRO(4096, 64, 128)                                                         \
+  MACRO(4096, 64, 160)                                                         \
+  MACRO(4096, 64, 192)                                                         \
+  MACRO(4096, 64, 224)                                                         \
+  MACRO(4096, 64, 256)                                                         \
+  MACRO(4096, 128, 32)                                                         \
+  MACRO(4096, 128, 64)                                                         \
+  MACRO(4096, 128, 96)                                                         \
+  MACRO(4096, 128, 128)                                                        \
+  MACRO(4096, 128, 160)                                                        \
+  MACRO(4096, 128, 192)                                                        \
+  MACRO(4096, 128, 224)                                                        \
+  MACRO(4096, 128, 256)                                                        \
+  MACRO(5120, 64, 32)                                                          \
+  MACRO(5120, 64, 64)                                                          \
+  MACRO(5120, 64, 96)                                                          \
+  MACRO(5120, 64, 128)                                                         \
+  MACRO(5120, 64, 160)                                                         \
+  MACRO(5120, 64, 192)                                                         \
+  MACRO(5120, 64, 224)                                                         \
+  MACRO(5120, 64, 256)                                                         \
+  MACRO(5120, 128, 32)                                                         \
+  MACRO(5120, 128, 64)                                                         \
+  MACRO(5120, 128, 96)                                                         \
+  MACRO(5120, 128, 128)                                                        \
+  MACRO(5120, 128, 160)                                                        \
+  MACRO(5120, 128, 192)                                                        \
+  MACRO(5120, 128, 224)                                                        \
+  MACRO(5120, 128, 256)                                                        \
+  MACRO(6144, 64, 32)                                                          \
+  MACRO(6144, 64, 64)                                                          \
+  MACRO(6144, 64, 96)                                                          \
+  MACRO(6144, 64, 128)                                                         \
+  MACRO(6144, 64, 160)                                                         \
+  MACRO(6144, 64, 192)                                                         \
+  MACRO(6144, 64, 224)                                                         \
+  MACRO(6144, 64, 256)                                                         \
+  MACRO(6144, 128, 32)                                                         \
+  MACRO(6144, 128, 64)                                                         \
+  MACRO(6144, 128, 96)                                                         \
+  MACRO(6144, 128, 128)                                                        \
+  MACRO(6144, 128, 160)                                                        \
+  MACRO(6144, 128, 192)                                                        \
+  MACRO(6144, 128, 224)                                                        \
+  MACRO(6144, 128, 256)                                                        \
+  MACRO(7168, 64, 32)                                                          \
+  MACRO(7168, 64, 64)                                                          \
+  MACRO(7168, 64, 96)                                                          \
+  MACRO(7168, 64, 128)                                                         \
+  MACRO(7168, 64, 160)                                                         \
+  MACRO(7168, 64, 192)                                                         \
+  MACRO(7168, 64, 224)                                                         \
+  MACRO(7168, 64, 256)                                                         \
+  MACRO(7168, 128, 32)                                                         \
+  MACRO(7168, 128, 64)                                                         \
+  MACRO(7168, 128, 96)                                                         \
+  MACRO(7168, 128, 128)                                                        \
+  MACRO(7168, 128, 160)                                                        \
+  MACRO(7168, 128, 192)                                                        \
+  MACRO(7168, 128, 224)                                                        \
+  MACRO(7168, 128, 256)                                                        \
+  MACRO(8192, 64, 32)                                                          \
+  MACRO(8192, 64, 64)                                                          \
+  MACRO(8192, 64, 96)                                                          \
+  MACRO(8192, 64, 128)                                                         \
+  MACRO(8192, 64, 160)                                                         \
+  MACRO(8192, 64, 192)                                                         \
+  MACRO(8192, 64, 224)                                                         \
+  MACRO(8192, 64, 256)                                                         \
+  MACRO(8192, 128, 32)                                                         \
+  MACRO(8192, 128, 64)                                                         \
+  MACRO(8192, 128, 96)                                                         \
+  MACRO(8192, 128, 128)                                                        \
+  MACRO(8192, 128, 160)                                                        \
+  MACRO(8192, 128, 192)                                                        \
+  MACRO(8192, 128, 224)                                                        \
+  MACRO(8192, 128, 256)                                                        \
   HOST_ERROR("Unsupported Hidden Dimension Type");
 
-size_t tk_kernel5_2_globals_size(int H_) {
+size_t tk_kernel5_2_globals_size(int H_, int BM_, int BN_) {
   TK_ALL_KERNEL5_2_H_CONFIGS(TK_KERNEL5_2_SIZE_CASE);
   fprintf(stderr,
           "tk_kernel5_2_globals_size: unsupported H=%d (add to "
@@ -933,10 +1068,11 @@ size_t tk_kernel5_2_globals_size(int H_) {
 }
 
 void tk_build_kernel5_2_globals(
-    int H_, void *out, kittens::py::TKParallelTensor &out_tokens,
-    at::Tensor &expert_y_tokens, at::Tensor &expert_y_tokens_scale,
-    at::Tensor &comm_comp_barrier, at::Tensor &down, at::Tensor &scale_down,
-    at::Tensor &C, at::Tensor &weights, at::Tensor &padded_expert_counts,
+    int H_, int BM_, int BN_, void *out,
+    kittens::py::TKParallelTensor &out_tokens, at::Tensor &expert_y_tokens,
+    at::Tensor &expert_y_tokens_scale, at::Tensor &comm_comp_barrier,
+    at::Tensor &down, at::Tensor &scale_down, at::Tensor &C,
+    at::Tensor &weights, at::Tensor &padded_expert_counts,
     at::Tensor &src_token_idx, at::Tensor &src_dev_idx,
     at::Tensor &src_slot_idx, int *num_recv_tokens, int dp_rank, int rank,
     int dp_size, int cur_dp_group, int num_dp_groups, int num_comm_sms,
